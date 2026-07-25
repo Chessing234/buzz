@@ -13,8 +13,27 @@ mod setup_mode;
 mod silent_reply;
 mod usage;
 
-/// Grace window before posting a silent-reply notice so a late ws echo can land (#2459).
-const SILENT_REPLY_GRACE: Duration = Duration::from_secs(3);
+/// Default grace before posting a silent-reply notice so a late ws echo can
+/// land (#2459). Relay resubscribe bursts can spread ≈6s under REQ pacing, so
+/// the default sits above that; override with `BUZZ_SILENT_REPLY_GRACE_SECS`.
+const DEFAULT_SILENT_REPLY_GRACE_SECS: u64 = 8;
+
+fn silent_reply_grace() -> Duration {
+    std::env::var("BUZZ_SILENT_REPLY_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_SILENT_REPLY_GRACE_SECS))
+}
+
+/// Deferred silent-reply check payload: batch plus the watch generation armed
+/// when the Ok turn completed.
+#[derive(Clone)]
+struct SilentReplyCheck {
+    batch: FlushBatch,
+    generation: u64,
+}
 
 pub use usage::TurnUsage;
 
@@ -1931,7 +1950,7 @@ async fn tokio_main() -> Result<()> {
     let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel::<SteerAckEvent>();
     // Deferred silent-reply checks: Ok mention turns wait a grace window so a
     // late ws echo can clear the "couldn't publish" notice (#2459).
-    let (silent_reply_tx, mut silent_reply_rx) = mpsc::unbounded_channel::<FlushBatch>();
+    let (silent_reply_tx, mut silent_reply_rx) = mpsc::unbounded_channel::<SilentReplyCheck>();
 
     // ── Step 7: Shutdown signal ───────────────────────────────────────────────
     let (shutdown_tx, mut shutdown_rx) = watch::channel(());
@@ -2006,7 +2025,7 @@ async fn tokio_main() -> Result<()> {
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
-        SilentReplyDue(FlushBatch),
+        SilentReplyDue(SilentReplyCheck),
         Wake(u32, Result<AgentPool, String>),
     }
 
@@ -2154,8 +2173,8 @@ async fn tokio_main() -> Result<()> {
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
                 }
-                Some(batch) = silent_reply_rx.recv() => {
-                    Some(PoolEvent::SilentReplyDue(batch))
+                Some(check) = silent_reply_rx.recv() => {
+                    Some(PoolEvent::SilentReplyDue(check))
                 }
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
@@ -2904,22 +2923,24 @@ async fn tokio_main() -> Result<()> {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
-            Some(PoolEvent::SilentReplyDue(batch)) => {
-                let Some(publishes) = queue.take_silent_reply_watch(batch.channel_id) else {
-                    // Already consumed (e.g. a later Ok on the same channel
-                    // re-armed / raced); nothing to do.
+            Some(PoolEvent::SilentReplyDue(check)) => {
+                let Some(publishes) =
+                    queue.take_silent_reply_watch(check.batch.channel_id, check.generation)
+                else {
+                    // Already consumed or superseded by a later Ok on the same
+                    // channel; nothing to do.
                     continue;
                 };
                 if let Some(content) = silent_reply::silent_reply_loss_notice(
                     &PromptOutcome::Ok(StopReason::EndTurn),
-                    Some(&batch),
+                    Some(&check.batch),
                     publishes,
                 ) {
                     tracing::warn!(
-                        channel_id = %batch.channel_id,
+                        channel_id = %check.batch.channel_id,
                         "mention turn completed Ok with no agent channel publish — posting failure notice"
                     );
-                    spawn_failure_notice(Some(&ctx.rest_client), &batch, content);
+                    spawn_failure_notice(Some(&ctx.rest_client), &check.batch, content);
                 }
             }
             Some(PoolEvent::Wake(attempt, result)) => {
@@ -3434,7 +3455,7 @@ fn handle_prompt_result(
     respawn_tasks: &mut tokio::task::JoinSet<()>,
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
-    silent_reply_tx: Option<&mpsc::UnboundedSender<FlushBatch>>,
+    silent_reply_tx: Option<&mpsc::UnboundedSender<SilentReplyCheck>>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
@@ -3468,18 +3489,23 @@ fn handle_prompt_result(
                     // and is not ordered vs pool completion. Arm a watch so
                     // counts survive mark_complete, then re-check after a
                     // short grace window.
-                    queue.arm_silent_reply_watch(batch.channel_id);
+                    let generation = queue.arm_silent_reply_watch(batch.channel_id);
                     if let Some(tx) = silent_reply_tx {
                         let tx = tx.clone();
-                        let batch_for_check = batch.clone();
+                        let check = SilentReplyCheck {
+                            batch: batch.clone(),
+                            generation,
+                        };
+                        let grace = silent_reply_grace();
                         tokio::spawn(async move {
-                            tokio::time::sleep(SILENT_REPLY_GRACE).await;
-                            let _ = tx.send(batch_for_check);
+                            tokio::time::sleep(grace).await;
+                            let _ = tx.send(check);
                         });
                     } else {
                         // Tests / callers without a deferred channel: decide now.
-                        let publishes =
-                            queue.take_silent_reply_watch(batch.channel_id).unwrap_or(0);
+                        let publishes = queue
+                            .take_silent_reply_watch(batch.channel_id, generation)
+                            .unwrap_or(0);
                         if let Some(content) = silent_reply::silent_reply_loss_notice(
                             &result.outcome,
                             Some(&batch),

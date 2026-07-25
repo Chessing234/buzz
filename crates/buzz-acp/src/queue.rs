@@ -146,10 +146,13 @@ pub struct EventQueue {
     /// Used to detect silent reply loss when ACP reports Ok but
     /// `buzz messages send` never landed (#2459).
     in_flight_self_publishes: HashMap<Uuid, u64>,
-    /// Channels whose Ok turn is waiting on a deferred silent-reply check.
-    /// Counts in [`in_flight_self_publishes`] survive [`mark_complete`] while
-    /// a watch is armed so a late ws echo can still clear the notice.
-    silent_reply_watches: HashSet<Uuid>,
+    /// Channels whose Ok turn is waiting on a deferred silent-reply check,
+    /// keyed by a per-channel generation. Counts in
+    /// [`in_flight_self_publishes`] survive [`mark_complete`] while a watch is
+    /// armed so a late ws echo can still clear the notice. Generation IDs stop
+    /// a stale grace timer from consuming a newer turn's watch on the same
+    /// channel (#2459).
+    silent_reply_watches: HashMap<Uuid, u64>,
     retry_after: HashMap<Uuid, Instant>,
     /// Per-channel retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<Uuid, u32>,
@@ -192,7 +195,7 @@ impl EventQueue {
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
             in_flight_self_publishes: HashMap::new(),
-            silent_reply_watches: HashSet::new(),
+            silent_reply_watches: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             dedup_mode,
@@ -407,7 +410,7 @@ impl EventQueue {
         self.in_flight_batch_sizes.remove(&channel_id);
         // Keep publish counts while a silent-reply grace watch is armed so a
         // late echo can still arrive after turn completion (#2459).
-        if !self.silent_reply_watches.contains(&channel_id) {
+        if !self.silent_reply_watches.contains_key(&channel_id) {
             self.in_flight_self_publishes.remove(&channel_id);
         }
         let now = Instant::now();
@@ -673,7 +676,7 @@ impl EventQueue {
     /// channel turn, or during a deferred silent-reply grace watch.
     pub fn note_self_publish(&mut self, channel_id: Uuid) {
         if self.in_flight_channels.contains(&channel_id)
-            || self.silent_reply_watches.contains(&channel_id)
+            || self.silent_reply_watches.contains_key(&channel_id)
         {
             *self.in_flight_self_publishes.entry(channel_id).or_insert(0) += 1;
         }
@@ -688,17 +691,33 @@ impl EventQueue {
 
     /// Arm a post-Ok silent-reply watch so publish counts survive
     /// [`mark_complete`] until [`take_silent_reply_watch`].
-    pub fn arm_silent_reply_watch(&mut self, channel_id: Uuid) {
-        self.silent_reply_watches.insert(channel_id);
+    ///
+    /// Returns the watch generation. Callers must pass that generation back to
+    /// [`take_silent_reply_watch`] so a stale grace timer cannot consume a
+    /// newer turn's watch on the same channel.
+    pub fn arm_silent_reply_watch(&mut self, channel_id: Uuid) -> u64 {
+        let next = self
+            .silent_reply_watches
+            .get(&channel_id)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.silent_reply_watches.insert(channel_id, next);
+        next
     }
 
     /// End a silent-reply watch and take the accumulated publish count.
-    /// Returns `None` if no watch was armed (already consumed / never armed).
-    pub fn take_silent_reply_watch(&mut self, channel_id: Uuid) -> Option<u64> {
-        if !self.silent_reply_watches.remove(&channel_id) {
-            return None;
+    ///
+    /// Returns `None` if no matching generation is armed (already consumed,
+    /// never armed, or superseded by a later Ok on the same channel).
+    pub fn take_silent_reply_watch(&mut self, channel_id: Uuid, generation: u64) -> Option<u64> {
+        match self.silent_reply_watches.get(&channel_id).copied() {
+            Some(current) if current == generation => {
+                self.silent_reply_watches.remove(&channel_id);
+                Some(self.take_self_publishes(channel_id))
+            }
+            _ => None,
         }
-        Some(self.take_self_publishes(channel_id))
     }
 
     // ── Goose-native steer withhold (side table) ──────────────────────────
@@ -4823,17 +4842,39 @@ mod tests {
         // Re-note during in-flight, arm watch, then complete — count must survive.
         q.in_flight_channels.insert(ch);
         q.note_self_publish(ch);
-        q.arm_silent_reply_watch(ch);
+        let gen = q.arm_silent_reply_watch(ch);
         q.mark_complete(ch);
         assert!(!q.is_channel_in_flight(ch));
         // Late echo after completion still counts.
         q.note_self_publish(ch);
-        assert_eq!(q.take_silent_reply_watch(ch), Some(2));
+        assert_eq!(q.take_silent_reply_watch(ch, gen), Some(2));
         // Second take is a no-op.
-        assert_eq!(q.take_silent_reply_watch(ch), None);
+        assert_eq!(q.take_silent_reply_watch(ch, gen), None);
         // Without a watch, post-complete echoes are ignored.
         q.note_self_publish(ch);
         assert_eq!(q.take_self_publishes(ch), 0);
+    }
+
+    #[test]
+    fn silent_reply_watch_generation_ignores_stale_timer() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.in_flight_channels.insert(ch);
+        q.note_self_publish(ch);
+        let first = q.arm_silent_reply_watch(ch);
+        q.mark_complete(ch);
+
+        // A second Ok on the same channel re-arms with a new generation.
+        q.in_flight_channels.insert(ch);
+        let second = q.arm_silent_reply_watch(ch);
+        assert_ne!(first, second);
+        q.mark_complete(ch);
+        q.note_self_publish(ch);
+
+        // Stale first timer must not consume the newer watch (count still
+        // includes the earlier turn's publish — generations only gate take).
+        assert_eq!(q.take_silent_reply_watch(ch, first), None);
+        assert_eq!(q.take_silent_reply_watch(ch, second), Some(2));
     }
 
     #[test]
