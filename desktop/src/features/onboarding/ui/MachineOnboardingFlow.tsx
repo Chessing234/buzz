@@ -158,9 +158,9 @@ export function MachineOnboardingFlow({
                   type="button"
                 >
                   {isPending
-                    ? "Saving identity…"
+                    ? "Loading identity…"
                     : selectedPubkey
-                      ? "Continue with existing identity key"
+                      ? "Continue setup"
                       : "Create a new identity key"}
                 </Button>
                 <Button
@@ -170,7 +170,9 @@ export function MachineOnboardingFlow({
                   type="button"
                   variant="ghost"
                 >
-                  Use an existing key
+                  {selectedPubkey
+                    ? "Use a different key instead"
+                    : "Use an existing key"}
                 </Button>
               </div>
               <IdentityKeyHelpDialog />
