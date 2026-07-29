@@ -36,6 +36,11 @@ pub(super) fn propagate_persona_name_rename(
 /// instance's `respond_to`. Without this, "Who can talk to this agent" on a
 /// definition never reaches buzz-acp.
 ///
+/// `respond_to: None` on the definition means unset — leave instance gates
+/// alone. Coercing to owner-only would silently downgrade instances that were
+/// set independently (or repaired by hand) whenever an unrelated persona edit
+/// re-saved the definition.
+///
 /// Allowlist entries are replaced only when the definition mode is allowlist
 /// (mirrors `update_managed_agent` preserve-across-toggle semantics).
 pub(super) fn propagate_persona_respond_to(
@@ -43,10 +48,10 @@ pub(super) fn propagate_persona_respond_to(
     persona_id: &str,
     definition: &AgentDefinition,
 ) -> Result<usize, String> {
-    let mode = match definition.respond_to.as_deref() {
-        Some(wire) => RespondTo::parse_wire(wire)?,
-        None => RespondTo::default(),
+    let Some(wire) = definition.respond_to.as_deref() else {
+        return Ok(0);
     };
+    let mode = RespondTo::parse_wire(wire)?;
     let allowlist = if mode == RespondTo::Allowlist {
         validate_respond_to_allowlist(&definition.respond_to_allowlist)?
     } else {

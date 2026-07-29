@@ -146,3 +146,19 @@ fn respond_to_skips_empty_pubkey_definition_rows() {
     .expect("propagate");
     assert_eq!(updated, 0);
 }
+
+#[test]
+fn respond_to_unset_on_definition_leaves_instances_alone() {
+    let mut records = vec![agent("persona-1", "Scout")];
+    records[0].respond_to = RespondTo::Anyone;
+
+    let updated = propagate_persona_respond_to(
+        &mut records,
+        "persona-1",
+        &definition(None, vec![]),
+    )
+    .expect("propagate");
+
+    assert_eq!(updated, 0);
+    assert_eq!(records[0].respond_to, RespondTo::Anyone);
+}

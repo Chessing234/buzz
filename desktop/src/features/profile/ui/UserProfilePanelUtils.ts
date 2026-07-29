@@ -292,13 +292,18 @@ export function personaManagedAgentUpdate(
     hasChanges = true;
   }
 
-  const personaRespondTo = persona.respondTo ?? "owner-only";
-  if (personaRespondTo !== agent.respondTo) {
-    input.respondTo = personaRespondTo;
+  // Unset on the definition means "leave the instance alone" — never coerce
+  // null/undefined to owner-only, or an unrelated persona edit (prompt, model)
+  // silently downgrades an instance that was set to anyone/allowlist.
+  if (
+    persona.respondTo != null &&
+    persona.respondTo !== agent.respondTo
+  ) {
+    input.respondTo = persona.respondTo;
     hasChanges = true;
   }
   if (
-    personaRespondTo === "allowlist" &&
+    persona.respondTo === "allowlist" &&
     persona.respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
   ) {
     input.respondToAllowlist = [...persona.respondToAllowlist];

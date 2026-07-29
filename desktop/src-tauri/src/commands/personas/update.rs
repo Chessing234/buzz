@@ -117,8 +117,16 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             // Propagate definition edits that instances must mirror (avatar,
             // display name, respond-to gate) and collect relay profile sync
             // params for the async phase.
-            let sync_params: ProfileSyncParams =
-                if avatar_changed || name_changed || behavior_present {
+            //
+            // Also enter when the definition already carries an explicit gate:
+            // unrelated edits (prompt, model, …) must still reconcile that gate
+            // onto instances so a prior broken owner-only instance can heal
+            // without toggling the behavior control.
+            let sync_params: ProfileSyncParams = if avatar_changed
+                || name_changed
+                || behavior_present
+                || result.respond_to.is_some()
+            {
                 let mut records = load_managed_agents(&app)?;
                 let mut params: ProfileSyncParams = Vec::new();
                 let mut agents_modified = false;
@@ -139,7 +147,8 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     Vec::new()
                 };
 
-                if behavior_present
+                // Explicit definition gate only — unset leaves instances alone.
+                if result.respond_to.is_some()
                     && propagate_persona_respond_to(&mut records, &result.id, &result)? > 0
                 {
                     agents_modified = true;
