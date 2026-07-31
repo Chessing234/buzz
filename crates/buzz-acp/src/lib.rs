@@ -2354,7 +2354,7 @@ async fn tokio_main() -> Result<()> {
                 if let PromptSource::Channel(ch) = &result.source {
                     typing_channels.remove(ch);
                 }
-                if handle_prompt_result(
+                match handle_prompt_result(
                     &mut pool,
                     &mut queue,
                     &config,
@@ -2366,9 +2366,33 @@ async fn tokio_main() -> Result<()> {
                     &mut respawn_tasks,
                     observer.clone(),
                     Some(&ctx.rest_client),
-                ) == LoopAction::Exit
-                {
-                    break;
+                ) {
+                    LoopAction::Exit => break,
+                    LoopAction::PresenceOffline => {
+                        // Stop renewing online presence and advertise offline so
+                        // the sidebar stops treating this agent as reachable
+                        // after Claude/Codex credentials expire (#3831).
+                        presence_heartbeat = None;
+                        if let Some(h) = presence_task.take() {
+                            h.abort();
+                        }
+                        if config.presence_enabled {
+                            let pp = presence_publisher.clone();
+                            let pk = presence_keys.clone();
+                            presence_task = Some(tokio::spawn(async move {
+                                if let Err(e) = publish_presence(&pp, &pk, "offline").await {
+                                    tracing::warn!(
+                                        "failed to set presence offline after auth expiry: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "presence set to offline after auth expiry"
+                                    );
+                                }
+                            }));
+                        }
+                    }
+                    LoopAction::Continue => {}
                 }
                 if drain_ready_join_results(
                     &mut pool,
