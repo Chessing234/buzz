@@ -6267,6 +6267,18 @@ mod error_outcome_emission_tests {
     }
 
     #[test]
+    fn is_auth_error_matches_authentication_required_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required".to_string(),
+        };
+        assert!(
+            is_auth_error(&e),
+            "headless 'Authentication required' must be classified as auth error"
+        );
+    }
+
+    #[test]
     fn is_auth_error_rejects_other_agent_error_message() {
         let e = acp::AcpError::AgentError {
             code: -32601,
