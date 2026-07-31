@@ -1113,6 +1113,11 @@ pub enum NotesCmd {
 #[derive(Subcommand)]
 pub enum ReposCmd {
     /// Announce a git repository (NIP-34)
+    #[command(
+        after_help = "The relay git read gate requires a buzz-channel binding. Always pass --channel.\n\n\
+Examples:\n  \
+buzz repos create --id demo --channel <UUID> --clone https://<relay>/git/<pubkey>/demo"
+    )]
     Create {
         /// Repository identifier: [a-zA-Z0-9._-]{1,64}
         #[arg(long)]
