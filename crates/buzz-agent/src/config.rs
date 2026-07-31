@@ -1349,6 +1349,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_provider_ollama_cloud_requires_api_key() {
+        let err = resolve_provider(Some("ollama-cloud"), None, None, None).unwrap_err();
+        assert!(
+            err.contains("OPENAI_COMPAT_API_KEY"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_ollama_cloud_maps_to_openai() {
+        assert_eq!(
+            resolve_provider(Some("ollama-cloud"), None, Some("sk-test"), None).unwrap(),
+            Provider::OpenAi
+        );
+        assert_eq!(
+            resolve_provider(Some("ollama_cloud"), None, Some("sk-test"), None).unwrap(),
+            Provider::OpenAi
+        );
+    }
+
+    #[test]
+    fn ollama_cloud_default_base_url() {
+        assert_eq!(
+            resolve_openai_base_url_for_provider(Some("ollama-cloud"), None),
+            OLLAMA_CLOUD_DEFAULT_BASE_URL
+        );
+        assert_eq!(
+            resolve_openai_base_url_for_provider(Some("openai"), None),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            resolve_openai_base_url_for_provider(
+                Some("ollama-cloud"),
+                Some("https://custom.example/v1".into())
+            ),
+            "https://custom.example/v1"
+        );
+    }
+
+    #[test]
     fn is_openai_host_matrix() {
         // Lookalike-safe: `api.openai.com.evil.example` and malformed URLs
         // are treated as non-OpenAI (which falls back to Chat Completions).
