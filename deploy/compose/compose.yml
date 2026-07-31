@@ -20,6 +20,9 @@ services:
       BUZZ_GIT_REPO_PATH: /data/git
       BUZZ_AUTO_MIGRATE: ${BUZZ_AUTO_MIGRATE:-false}
       BUZZ_GIT_CONFORMANCE_PROBE: ${BUZZ_GIT_CONFORMANCE_PROBE:-true}
+      # Advertise the pairing sidecar in NIP-11 so clients don't fall back to a
+      # non-existent legacy /pair path on the main relay (see #3842).
+      BUZZ_PAIRING_RELAY_URL: ${BUZZ_PAIRING_RELAY_URL:?set BUZZ_PAIRING_RELAY_URL}
     ports:
       - "${BUZZ_HTTP_PORT:-3000}:3000"
     volumes:
