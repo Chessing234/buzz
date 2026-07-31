@@ -3216,6 +3216,8 @@ fn handle_prompt_result(
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
+    let auth_expired =
+        matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e));
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
     // moved into match arms below. `desired_model` reflects the config/persona
@@ -3422,6 +3424,13 @@ fn handle_prompt_result(
                 pool.return_agent(result.agent);
             }
         }
+    }
+    if auth_expired {
+        tracing::error!(
+            agent = agent_index,
+            "agent authentication expired — taking presence offline until restart"
+        );
+        return LoopAction::PresenceOffline;
     }
     LoopAction::Continue
 }
