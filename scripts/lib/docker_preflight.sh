@@ -25,7 +25,7 @@ docker_preflight_classify() {
 docker_preflight_or_die() {
   local docker_info_err code
   set +e
-  docker_info_err="$(docker info 2>&1 >/dev/null)"
+  docker_info_err="$(docker info 2>&1)"
   code=$?
   set -e
 
