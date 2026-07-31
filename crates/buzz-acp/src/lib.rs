@@ -3020,15 +3020,19 @@ fn dispatch_pending(
 ///   Specific to the auth-expiry flow; does not appear in unrelated errors.
 /// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
 ///   the standard auth-failure status and does not arise from network blips.
+/// - `"Authentication required"` — ACP `-32000` surface when the CLI reports
+///   `loggedIn: false` with no remaining credentials (headless expiry).
 ///
 /// False positives (misclassifying a transient error as non-retryable) silently
 /// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
+/// an auth error). These patterns are therefore chosen for high precision.
 fn is_auth_error(error: &acp::AcpError) -> bool {
     let acp::AcpError::AgentError { message, .. } = error else {
         return false;
     };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+    message.contains("Re-authenticate")
+        || message.contains("API Error: 401")
+        || message.contains("Authentication required")
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
