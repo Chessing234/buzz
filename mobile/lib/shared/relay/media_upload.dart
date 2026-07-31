@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -28,9 +27,6 @@ const _readClipboardImageMethod = 'readClipboardImage';
 const _clipboardHasImageMethod = 'clipboardHasImage';
 const _uploadAuthKind = 24242;
 const _uploadAuthLifetimeSeconds = 300;
-const _imageUploadTimeout = Duration(seconds: 120);
-const _videoUploadTimeout = Duration(seconds: 300);
-const _fileUploadTimeout = Duration(seconds: 180);
 const _heicBrands = {
   'heic',
   'heix',
@@ -84,26 +80,6 @@ class MediaPolicyUploadException implements Exception {
 
   @override
   String toString() => _mediaPolicyUploadMessage;
-}
-
-/// Thrown when the user cancels an in-flight attachment upload.
-class MediaUploadCancelledException implements Exception {
-  const MediaUploadCancelledException();
-
-  @override
-  String toString() => 'Upload cancelled';
-}
-
-/// Thrown when an attachment upload exceeds its bounded timeout.
-class MediaUploadTimeoutException implements Exception {
-  final Duration timeout;
-
-  const MediaUploadTimeoutException(this.timeout);
-
-  @override
-  String toString() =>
-      'Upload timed out after ${timeout.inSeconds}s. Check your connection '
-      'and try again.';
 }
 
 @immutable
@@ -209,8 +185,6 @@ class MediaUploadService {
   final DateTime Function() _now;
   final http.Client _http;
   final bool _ownsHttpClient;
-  final Set<http.Client> _activeUploadClients = {};
-  final Set<http.Client> _cancelledUploadClients = {};
 
   MediaUploadService({
     required String baseUrl,
@@ -246,17 +220,8 @@ class MediaUploadService {
        _ownsHttpClient = httpClient == null;
 
   void dispose() {
-    cancelActiveUploads();
     if (_ownsHttpClient) {
       _http.close();
-    }
-  }
-
-  /// Abort every in-flight Blossom upload started by this service instance.
-  void cancelActiveUploads() {
-    for (final client in _activeUploadClients.toList()) {
-      _cancelledUploadClients.add(client);
-      client.close();
     }
   }
 
@@ -317,11 +282,7 @@ class MediaUploadService {
         );
       }
       final bytes = await transcodedFile.readAsBytes();
-      return uploadBytes(
-        bytes,
-        mimeType: 'video/mp4',
-        timeout: _videoUploadTimeout,
-      );
+      return uploadBytes(bytes, mimeType: 'video/mp4');
     } finally {
       if (transcodedPath != null) {
         try {
@@ -364,7 +325,6 @@ class MediaUploadService {
       bytes,
       mimeType: 'application/octet-stream',
       allowGenericFile: true,
-      timeout: _fileUploadTimeout,
     );
     return descriptor.withFilename(_safeAttachmentFilename(pickedFile.name));
   }
@@ -378,7 +338,6 @@ class MediaUploadService {
   Future<BlobDescriptor> uploadBytes(
     Uint8List bytes, {
     required String mimeType,
-    Duration timeout = _imageUploadTimeout,
   }) async {
     if (mimeType == 'image/gif' ||
         (mimeType == 'image/png' && _isAnimatedPng(bytes)) ||
@@ -389,14 +348,13 @@ class MediaUploadService {
         throw Exception('failed to sanitize image for upload');
       }
     }
-    return _uploadPreparedBytes(bytes, mimeType: mimeType, timeout: timeout);
+    return _uploadPreparedBytes(bytes, mimeType: mimeType);
   }
 
   Future<BlobDescriptor> _uploadPreparedBytes(
     Uint8List bytes, {
     required String mimeType,
     bool allowGenericFile = false,
-    Duration timeout = _imageUploadTimeout,
   }) async {
     if (!allowGenericFile &&
         !_allowedImageMimeTypes.contains(mimeType) &&
@@ -405,64 +363,40 @@ class MediaUploadService {
     }
 
     final sha256 = _sha256Hex(bytes);
-    final uploadClient = http.Client();
-    _activeUploadClients.add(uploadClient);
-    try {
-      var request = _buildUploadRequest(
+    var request = _buildUploadRequest(
+      bytes: bytes,
+      mimeType: mimeType,
+      sha256: sha256,
+      path: _mediaUploadPath,
+    );
+
+    var streamed = await _http.send(request);
+    var response = await http.Response.fromStream(streamed);
+    if (response.statusCode == HttpStatus.notFound ||
+        response.statusCode == HttpStatus.methodNotAllowed) {
+      request = _buildUploadRequest(
         bytes: bytes,
         mimeType: mimeType,
         sha256: sha256,
-        path: _mediaUploadPath,
+        path: _legacyMediaUploadPath,
       );
-
-      var streamed = await uploadClient
-          .send(request)
-          .timeout(timeout, onTimeout: () {
-            throw MediaUploadTimeoutException(timeout);
-          });
-      var response = await http.Response.fromStream(streamed);
-      if (response.statusCode == HttpStatus.notFound ||
-          response.statusCode == HttpStatus.methodNotAllowed) {
-        request = _buildUploadRequest(
-          bytes: bytes,
-          mimeType: mimeType,
-          sha256: sha256,
-          path: _legacyMediaUploadPath,
-        );
-        streamed = await uploadClient
-            .send(request)
-            .timeout(timeout, onTimeout: () {
-              throw MediaUploadTimeoutException(timeout);
-            });
-        response = await http.Response.fromStream(streamed);
-      }
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        if (_allowedImageMimeTypes.contains(mimeType) &&
-            (response.statusCode == HttpStatus.unsupportedMediaType ||
-                response.statusCode == HttpStatus.unprocessableEntity)) {
-          throw const MediaPolicyUploadException();
-        }
-        throw Exception(
-          'upload failed (${response.statusCode}): ${response.body}',
-        );
-      }
-
-      return BlobDescriptor.fromJson(
-        jsonDecode(response.body) as Map<String, dynamic>,
-      );
-    } on MediaUploadTimeoutException {
-      rethrow;
-    } on MediaUploadCancelledException {
-      rethrow;
-    } on http.ClientException {
-      if (_cancelledUploadClients.remove(uploadClient)) {
-        throw const MediaUploadCancelledException();
-      }
-      rethrow;
-    } finally {
-      _activeUploadClients.remove(uploadClient);
-      uploadClient.close();
+      streamed = await _http.send(request);
+      response = await http.Response.fromStream(streamed);
     }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      if (_allowedImageMimeTypes.contains(mimeType) &&
+          (response.statusCode == HttpStatus.unsupportedMediaType ||
+              response.statusCode == HttpStatus.unprocessableEntity)) {
+        throw const MediaPolicyUploadException();
+      }
+      throw Exception(
+        'upload failed (${response.statusCode}): ${response.body}',
+      );
+    }
+
+    return BlobDescriptor.fromJson(
+      jsonDecode(response.body) as Map<String, dynamic>,
+    );
   }
 
   http.Request _buildUploadRequest({
