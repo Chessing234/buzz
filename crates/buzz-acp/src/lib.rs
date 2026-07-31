@@ -6392,6 +6392,83 @@ mod error_outcome_emission_tests {
         );
     }
 
+    /// Auth expiry must also signal PresenceOffline so the event loop can stop
+    /// advertising the agent as online (#3831).
+    #[tokio::test]
+    async fn auth_error_returns_presence_offline_loop_action() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let auth_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required".to_string(),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(auth_error),
+            batch: Some(batch),
+        };
+        let action = handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+        assert_eq!(
+            action,
+            LoopAction::PresenceOffline,
+            "auth expiry must take presence offline so the agent stops looking online"
+        );
+    }
+
     /// A non-auth application error (e.g. usage credits) must still follow the
     /// standard requeue path so today's behavior is unchanged.
     #[tokio::test]
