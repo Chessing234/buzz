@@ -2385,9 +2385,7 @@ async fn tokio_main() -> Result<()> {
                                         "failed to set presence offline after auth expiry: {e}"
                                     );
                                 } else {
-                                    tracing::info!(
-                                        "presence set to offline after auth expiry"
-                                    );
+                                    tracing::info!("presence set to offline after auth expiry");
                                 }
                             }));
                         }
@@ -3191,7 +3189,7 @@ fn handle_prompt_result(
                 );
                 let content = "⚠️ I couldn't process the last request: authentication failed. \
                     Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
+                    and restart this agent. I'll stay offline until then."
                     .to_string();
                 spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
@@ -3240,8 +3238,7 @@ fn handle_prompt_result(
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
     };
-    let auth_expired =
-        matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e));
+    let auth_expired = matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e));
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
     // moved into match arms below. `desired_model` reflects the config/persona
