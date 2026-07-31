@@ -550,8 +550,10 @@ export function HostedCommunityOnboarding({
                 This account uses a different Buzz identity
               </DialogTitle>
               <DialogDescription className="mt-2 text-sm leading-6 text-foreground">
-                This account is connected to another Buzz identity. Reconnect
-                this device, or sign out to use a different email.
+                This Builderlab account is already linked to a different Buzz
+                identity. Use this device&apos;s key (rebinds the account), sign
+                in with a different email, or switch the local Buzz identity
+                under Settings → Account before reconnecting.
               </DialogDescription>
               <p className="mt-4 w-full break-all rounded-xl bg-[rgb(var(--buzz-hosted-community-identity-bg)/0.5)] px-4 py-3 text-left font-mono text-xs text-foreground">
                 Account: {identity.npub ?? boundPubkey}
