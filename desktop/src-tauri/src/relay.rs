@@ -433,6 +433,14 @@ fn build_profile_event(
 
 // ── Managed-agent profile sync ──────────────────────────────────────────────
 
+/// True when the relay rejected the request because membership is missing.
+#[allow(dead_code)]
+fn is_relay_membership_required_error(status: reqwest::StatusCode, message: &str) -> bool {
+    status == reqwest::StatusCode::FORBIDDEN
+        && (message.contains("relay_membership_required")
+            || message.contains("relay member"))
+}
+
 /// Sync a managed agent's kind:0 profile event to the relay using NIP-98 auth.
 ///
 /// The agent signs its own profile event and the NIP-98 HTTP-auth event, so no
@@ -604,12 +612,35 @@ pub async fn submit_signed_event_with_keys(
 mod tests {
     use super::{
         build_profile_event, classify_intercepted_response, effective_agent_relay_url,
-        extract_retry_in_hint, parse_command_response, relay_http_base_url,
+        extract_retry_in_hint, is_relay_membership_required_error, parse_command_response,
+        relay_http_base_url,
         MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
 
     // ── extract_retry_in_hint ────────────────────────────────────────────────
+
+    #[test]
+    fn membership_required_matches_relay_error_code_and_message() {
+        use reqwest::StatusCode;
+
+        assert!(is_relay_membership_required_error(
+            StatusCode::FORBIDDEN,
+            "relay returned 403 Forbidden: relay_membership_required",
+        ));
+        assert!(is_relay_membership_required_error(
+            StatusCode::FORBIDDEN,
+            "You must be a relay member to access this relay",
+        ));
+        assert!(!is_relay_membership_required_error(
+            StatusCode::FORBIDDEN,
+            "relay returned 403 Forbidden: forbidden",
+        ));
+        assert!(!is_relay_membership_required_error(
+            StatusCode::UNAUTHORIZED,
+            "relay_membership_required",
+        ));
+    }
 
     #[test]
     fn extracts_hint_from_429_body() {
