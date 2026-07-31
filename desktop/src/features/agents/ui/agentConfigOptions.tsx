@@ -43,6 +43,7 @@ const KNOWN_LLM_PROVIDER_IDS = [
   "openai",
   "openai-compat",
   "openrouter",
+  "ollama-cloud",
 ] as const;
 
 type PersonaLlmProviderId = (typeof KNOWN_LLM_PROVIDER_IDS)[number];
@@ -114,6 +115,10 @@ const PROVIDER_CREDENTIAL_CONFIG: Partial<
     requiredEnvKeys: ["OPENROUTER_API_KEY"],
     secretEnvVar: "OPENROUTER_API_KEY",
   },
+  "ollama-cloud": {
+    requiredEnvKeys: ["OPENAI_COMPAT_API_KEY"],
+    secretEnvVar: "OPENAI_COMPAT_API_KEY",
+  },
 };
 
 const DEFAULT_MODEL_OPTION: PersonaModelOption = {
@@ -126,6 +131,7 @@ export const PERSONA_LLM_PROVIDER_OPTIONS: readonly PersonaModelOption[] = [
   { id: "openai", label: "OpenAI" },
   { id: "openai-compat", label: "OpenAI-compatible" },
   { id: "openrouter", label: "OpenRouter" },
+  { id: "ollama-cloud", label: "Ollama Cloud" },
   { id: "relay-mesh", label: "Buzz shared compute" },
   { id: "databricks", label: "Databricks" },
   { id: "databricks_v2", label: "Databricks v2" },
@@ -286,7 +292,8 @@ export function providerRequiresExplicitModel(
     trimmedProvider === "anthropic" ||
     trimmedProvider === "openai" ||
     trimmedProvider === "openai-compat" ||
-    trimmedProvider === "openrouter"
+    trimmedProvider === "openrouter" ||
+    trimmedProvider === "ollama-cloud"
   );
 }
 
