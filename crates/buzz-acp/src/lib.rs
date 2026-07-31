@@ -2723,10 +2723,13 @@ async fn tokio_main() -> Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum LoopAction {
     Continue,
     Exit,
+    /// Auth is permanently broken for this process — stop advertising online
+    /// presence so operators/sidebar stop treating the agent as reachable.
+    PresenceOffline,
 }
 
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
