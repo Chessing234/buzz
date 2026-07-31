@@ -48,6 +48,31 @@ test("global back and forward move across channel routes", async ({ page }) => {
   await expect(page.getByTestId("chat-title")).toHaveText("random");
 });
 
+test("back and forward keyboard chords work while the composer is focused", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+
+  const composer = page.getByTestId("message-composer");
+  await composer.click();
+  await expect(composer).toBeFocused();
+
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+[" : "Alt+ArrowLeft");
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  await composer.click();
+  await page.keyboard.press(
+    process.platform === "darwin" ? "Meta+]" : "Alt+ArrowRight",
+  );
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+});
+
 // FIXME: the forum post "Back to posts" header renders under the fixed top
 // chrome drag region, which intercepts the click. Pre-existing breakage —
 // this spec file was never registered in playwright.config.ts until now.
