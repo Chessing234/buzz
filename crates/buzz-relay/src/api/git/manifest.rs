@@ -147,7 +147,7 @@ pub fn is_safe_refname(s: &str) -> bool {
         return false;
     }
     s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-' | '+' | '@'))
 }
 
 /// Hex-OID predicate. Accepts both SHA-1 (40 chars) and SHA-256 (64 chars) —
