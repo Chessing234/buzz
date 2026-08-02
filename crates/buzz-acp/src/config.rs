@@ -2456,6 +2456,39 @@ channels = "ALL"
     }
 
     #[test]
+    fn test_summary_mention_filter_on_by_default() {
+        let config = test_config(SubscribeMode::Mentions);
+        let s = config.summary();
+        assert!(
+            s.contains("mention_filter=on"),
+            "default config should show mention_filter=on, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_summary_mention_filter_off_when_no_mention_filter() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.no_mention_filter = true;
+        let s = config.summary();
+        assert!(
+            s.contains("mention_filter=off"),
+            "--no-mention-filter should show mention_filter=off, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_summary_mention_filter_distinguishes_no_mention_filter() {
+        let mut gated = test_config(SubscribeMode::Mentions);
+        let mut ungated = test_config(SubscribeMode::Mentions);
+        ungated.no_mention_filter = true;
+        assert_ne!(
+            gated.summary(),
+            ungated.summary(),
+            "gated and ungated mentions mode must produce distinct summary lines"
+        );
+    }
+
+    #[test]
     fn test_validate_allowlist_valid_entries() {
         let entries = vec!["ab".repeat(32), "cd".repeat(32)];
         let result = validate_allowlist(&entries).unwrap();
