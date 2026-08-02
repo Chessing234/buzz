@@ -1112,6 +1112,9 @@ impl Config {
     }
 
     /// Human-readable summary (no secrets).
+    ///
+    /// Includes `mention_filter=on|off` so `--no-mention-filter` deployments are
+    /// distinguishable from gated `subscribe=mentions` in journal logs (#4228).
     pub fn summary(&self) -> String {
         let respond_to_detail = match &self.respond_to {
             RespondTo::Allowlist => {
