@@ -488,6 +488,8 @@ mod tests {
         assert!(is_safe_refname("refs/heads/main"));
         assert!(is_safe_refname("refs/tags/v1.0.0"));
         assert!(is_safe_refname("refs/heads/feat/cas-publish"));
+        assert!(is_safe_refname("refs/heads/test/842+841-devnet"));
+        assert!(is_safe_refname("refs/heads/feature@workspace"));
         assert!(!is_safe_refname("refs/heads/../escape"));
         assert!(!is_safe_refname("HEAD"));
         assert!(!is_safe_refname("refs/heads/"));
