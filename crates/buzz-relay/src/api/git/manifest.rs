@@ -134,8 +134,8 @@ pub enum ManifestError {
 /// `api::git::hydrate`, before writing the ref to disk).
 ///
 /// Refuses traversal (`..`), null/newline/control chars, non-`refs/` prefixes,
-/// and leading/trailing/double slashes. Allowed alphabet:
-/// `[a-zA-Z0-9_./-]`.
+/// and leading/trailing/double slashes. Allowed alphabet is a conservative
+/// subset of git-legal ref characters: `[a-zA-Z0-9_./-+@]`.
 ///
 /// Sharing one predicate is load-bearing: any divergence creates the
 /// "valid CAS, un-clone-able output" hazard.
