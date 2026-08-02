@@ -335,7 +335,11 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_CHANNELS", value_delimiter = ',')]
     pub channels: Option<Vec<String>>,
 
-    #[arg(long, env = "BUZZ_ACP_NO_MENTION_FILTER")]
+    #[arg(
+        long,
+        env = "BUZZ_ACP_NO_MENTION_FILTER",
+        help = "Disable the #p mention gate (logged as mention_filter=off in the startup summary)"
+    )]
     pub no_mention_filter: bool,
 
     #[arg(long, env = "BUZZ_ACP_CONFIG", default_value = "./buzz-acp.toml")]
