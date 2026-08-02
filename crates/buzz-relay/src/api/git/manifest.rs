@@ -361,6 +361,22 @@ mod tests {
         sample().validate().expect("sample manifest must validate");
     }
 
+    #[test]
+    fn validate_accepts_git_legal_plus_refname() {
+        let oid = "a".repeat(40);
+        let mut refs = BTreeMap::new();
+        refs.insert("refs/heads/test/842+841-devnet".into(), oid.clone());
+        let m = Manifest {
+            version: MANIFEST_VERSION,
+            head: "refs/heads/test/842+841-devnet".into(),
+            refs,
+            packs: vec![pack_key('c')],
+            parent: None,
+        };
+        m.validate()
+            .expect("git-legal plus refname must validate (#4194)");
+    }
+
     /// The empty manifest is the announce-time seed (`side_effects.rs::
     /// seed_manifest_pointer`). It must validate — otherwise repo announce
     /// would fail before the pointer can be seeded, and the read path would
