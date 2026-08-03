@@ -467,6 +467,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_fallback_skip_budget_is_sixteen_mebibytes() {
+        assert_eq!(MediaStorage::MAX_STREAM_FALLBACK_SKIP, 16 * 1024 * 1024);
+        // Near-tail ranges past the budget must fail closed (no full-object scan).
+        assert!(32 * 1024 * 1024 > MediaStorage::MAX_STREAM_FALLBACK_SKIP);
+    }
+
+    #[test]
+    fn stream_fallback_only_for_range_incompatibility_statuses() {
+        assert!(MediaStorage::is_range_incompatibility_status(400));
+        assert!(MediaStorage::is_range_incompatibility_status(416));
+        assert!(!MediaStorage::is_range_incompatibility_status(401));
+        assert!(!MediaStorage::is_range_incompatibility_status(403));
+        assert!(!MediaStorage::is_range_incompatibility_status(500));
+        assert!(!MediaStorage::is_range_incompatibility_status(503));
+        assert!(!MediaStorage::is_range_incompatibility_status(404));
+    }
 }
 
 /// Metadata returned by HEAD — just enough for BUD-01 response headers.
