@@ -24,9 +24,8 @@ export function safeNpub(pubkey: string): string | null {
   }
 }
 
-const HEX_PUBKEY_REGEX = /^[0-9a-f]{64}$/;
-/** 32-byte secret as 64 hex chars — what `buzz-admin generate-key` prints. */
-const HEX_SECRET_REGEX = /^[0-9a-fA-F]{64}$/;
+/** 32-byte key material as 64 hex chars (pubkey or secret; case-insensitive). */
+export const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/;
 
 /**
  * Parse user-entered public key input — either a 64-character hex pubkey or
@@ -38,7 +37,7 @@ const HEX_SECRET_REGEX = /^[0-9a-fA-F]{64}$/;
  */
 export function parsePubkeyInput(input: string): string | null {
   const trimmed = input.trim().toLowerCase();
-  if (HEX_PUBKEY_REGEX.test(trimmed)) {
+  if (HEX_64_REGEX.test(trimmed)) {
     return trimmed;
   }
   if (trimmed.startsWith("npub1")) {
@@ -74,7 +73,7 @@ export function normalizePrivateKeyToNsec(input: string): string | null {
       return null;
     }
   }
-  if (HEX_SECRET_REGEX.test(trimmed)) {
+  if (HEX_64_REGEX.test(trimmed)) {
     try {
       return nsecEncode(hexToBytes(trimmed.toLowerCase()));
     } catch {
