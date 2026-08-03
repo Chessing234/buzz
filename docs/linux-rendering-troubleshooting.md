@@ -102,7 +102,7 @@ export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
 
 ```bash
 export GDK_BACKEND=x11
-export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1
 export WEBKIT_SKIA_ENABLE_CPU_RENDERING=1
 ./Buzz_*.AppImage
 # or for native:
@@ -111,7 +111,7 @@ buzz-desktop
 
 - `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1` forces Skia to use CPU rendering, bypassing the RDNA4 Skia/radv paint failure.
 - `GDK_BACKEND=x11` avoids the blank window that appears when running under a Plasma-Wayland compositor.
-- `WEBKIT_DISABLE_DMABUF_RENDERER=1` prevents post-first-paint transparency from the dmabuf renderer.
+- `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` keeps shared-memory transport without the #3654 empty-mode crash from `WEBKIT_DISABLE_DMABUF_RENDERER`.
 
 A dedicated fix for RDNA4 detection is being tracked in [#2643](https://github.com/block/buzz/issues/2643).
 
