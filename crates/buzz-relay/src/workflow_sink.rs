@@ -581,6 +581,14 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_names_dedupe_across_repeated_mentions() {
+        let members = vec![m("Fizz", &pk('6')), m("Fizz", &pk('7')), m("Max", &pk('b'))];
+        let resolved = resolve_mentions("@Fizz then @Max then @Fizz again", &members);
+        assert_eq!(resolved.pubkeys, vec![pk('b')]);
+        assert_eq!(resolved.ambiguous_names, vec!["Fizz".to_string()]);
+    }
+
+    #[test]
     fn duplicate_name_same_pubkey_is_not_ambiguous() {
         // Same identity listed twice (e.g. two channels) is not a conflict.
         let members = vec![m("Fizz", &pk('6')), m("Fizz", &pk('6'))];
