@@ -138,9 +138,22 @@ fn plan(
             true => Plan::Fatal {
                 diagnostic: conflict(&user_set),
             },
-            false => Plan::Leave {
-                why: format!("{} set in the environment", describe(&user_set)),
-            },
+            false => {
+                let mut why = format!("{} set in the environment", describe(&user_set));
+                // Older docs told people to export DISABLE_DMABUF=1; on current
+                // WebKitGTK that empties the transport and SIGSEGVs (#3654).
+                // Leave the takeover alone, but point survivors at FORCE_SHM.
+                if user_set.iter().any(|(key, value)| {
+                    *key == DISABLE_DMABUF && value.as_os_str() != "0"
+                }) {
+                    why.push_str(&format!(
+                        "; warning: {DISABLE_DMABUF} (other than =0) empties the \
+                         transport on current WebKitGTK and SIGSEGVs — prefer \
+                         {FORCE_SHM}=1 (see #3654)"
+                    ));
+                }
+                Plan::Leave { why }
+            }
         };
     }
 

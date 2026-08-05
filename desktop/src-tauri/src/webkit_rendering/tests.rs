@@ -154,6 +154,34 @@ fn test_a_user_set_variable_disables_the_heuristic_wholesale() {
 }
 
 #[test]
+fn test_a_user_set_force_shm_also_stands_the_heuristic_down() {
+    // FORCE_SHM joined OWNED in the #3654 swap; a user export must take the
+    // whole decision away, same as the older DISABLE_DMABUF takeover.
+    let drm = drm(&["0x10de"]);
+    let env = env_from(&[(FORCE_SHM, "1")]);
+    let plan = plan(NO_ARGS, &env, drm.path());
+
+    let Plan::Leave { why } = &plan else {
+        panic!("a user FORCE_SHM assignment must not be overwritten: {plan:?}");
+    };
+    assert!(why.contains("WEBKIT_DMABUF_RENDERER_FORCE_SHM=1"), "{why}");
+}
+
+#[test]
+fn test_user_set_disable_dmabuf_one_warns_about_the_crashy_var() {
+    let drm = drm(&["0x10de"]);
+    let env = env_from(&[(DISABLE_DMABUF, "1")]);
+    let plan = plan(NO_ARGS, &env, drm.path());
+
+    let Plan::Leave { why } = &plan else {
+        panic!("expected Leave: {plan:?}");
+    };
+    assert!(why.contains("WEBKIT_DISABLE_DMABUF_RENDERER=1"), "{why}");
+    assert!(why.contains("WEBKIT_DMABUF_RENDERER_FORCE_SHM"), "{why}");
+    assert!(why.contains("#3654"), "{why}");
+}
+
+#[test]
 fn test_an_empty_assignment_is_still_a_user_assignment() {
     let drm = drm(&["0x10de"]);
     let env = env_from(&[(DISABLE_DMABUF, "")]);
