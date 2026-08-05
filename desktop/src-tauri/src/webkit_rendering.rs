@@ -64,7 +64,6 @@ const SAFE_VARS: [&str; 2] = [FORCE_SHM, DISABLE_COMPOSITING];
 /// down for operators who need the old path or an explicit override.
 const OWNED: [&str; 3] = [FORCE_SHM, DISABLE_DMABUF, DISABLE_COMPOSITING];
 
-
 /// Reads one environment variable. Injected so the decision is testable without
 /// mutating the process environment. `OsString` rather than `String` because
 /// presence is the test — a non-UTF-8 assignment is still the user's.
