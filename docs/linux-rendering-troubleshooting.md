@@ -7,7 +7,7 @@ This guide covers the most common rendering failures on Linux and how to resolve
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | Blank or transparent window, then `SIGABRT` with `colrv1_configure_skpaint` in the output | COLRv1 color emoji font (AppImage only) | Upgrade to the latest AppImage (v0.5.2+) |
-| Blank window on startup / SIGSEGV when switching workspaces | dmabuf renderer incompatibility (NVIDIA or AppImage) | Prefer `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` (shipped automatically) or `--safe-rendering`. Do **not** set `WEBKIT_DISABLE_DMABUF_RENDERER=1` on current WebKitGTK — see [#3654](https://github.com/block/buzz/issues/3654). |
+| Blank window on startup / SIGSEGV when switching workspaces | dmabuf renderer incompatibility (NVIDIA or AppImage) | Prefer `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` (shipped automatically) or `--safe-rendering`. Do **not** set `WEBKIT_DISABLE_DMABUF_RENDERER=1` on current WebKitGTK — see [#3654](https://github.com/block/buzz/issues/3654). On Debian/Ubuntu with the proprietary NVIDIA driver the crash can persist (distro WebKit patch) — [#3654](https://github.com/block/buzz/issues/3654) stays open for that path. |
 | Blank window on any hardware, no crash output | Unknown GPU/driver combination | `--safe-rendering` flag (see below) |
 
 ---
@@ -69,7 +69,7 @@ FONTCONFIG_FILE=~/.config/buzz-fontconfig/fonts.conf ./Buzz_*.AppImage
 
 **Root cause:** WebKitGTK's dmabuf zero-copy buffer path is incompatible with some GPU/driver/compositor combinations. The WebKit child process silently fails to paint.
 
-**Fix (shipped automatically starting with the first release containing [#3271](https://github.com/block/buzz/pull/3271) (v0.5.1), updated for [#3654](https://github.com/block/buzz/issues/3654)):** Buzz sets `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` automatically before WebKit initializes when it detects an NVIDIA GPU (`/sys/class/drm` vendor ID `0x10de`) or when running as an AppImage. That keeps SharedMemory in WebKit's transport set while skipping the hardware dmabuf path. `WEBKIT_DMABUF_RENDERER_FORCE_SHM` exists in WebKitGTK ≥ 2.44 (absent at 2.42); on older system WebKit the export is a silent no-op.
+**Fix (shipped automatically starting with the first release containing [#3271](https://github.com/block/buzz/pull/3271) (v0.5.1), updated for [#3654](https://github.com/block/buzz/issues/3654)):** Buzz sets `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` automatically before WebKit initializes when it detects an NVIDIA GPU (`/sys/class/drm` vendor ID `0x10de`) or when running as an AppImage. That keeps SharedMemory in WebKit's transport set while skipping the hardware dmabuf path (upstream WebKitGTK; Debian/Ubuntu's NVIDIA dmabuf patch can bypass this, so the crash can persist there — [#3654](https://github.com/block/buzz/issues/3654) stays open for that path). `WEBKIT_DMABUF_RENDERER_FORCE_SHM` exists in WebKitGTK ≥ 2.44 (absent at 2.42); on older system WebKit the export is a silent no-op.
 
 **Do not use `WEBKIT_DISABLE_DMABUF_RENDERER=1` on current WebKitGTK** (2.52+): that variable no longer falls back to shared memory. It empties the transport mode, `AcceleratedBackingStore::create()` returns null, and the UI SIGSEGVs the first time compositing is needed (often on workspace switch). See [#3654](https://github.com/block/buzz/issues/3654).
 
