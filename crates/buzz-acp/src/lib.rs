@@ -3044,6 +3044,9 @@ fn dispatch_pending(
 ///   the standard auth-failure status and does not arise from network blips.
 /// - `"Authentication required"` — ACP `-32000` surface when the CLI reports
 ///   `loggedIn: false` with no remaining credentials (headless expiry).
+/// - `"OAuth session expired and could not be refreshed"` — macOS managed-agent
+///   surface for the same expiry, worded differently from the CLI variants
+///   above; observed as `-32000` alongside "Failed to authenticate:".
 ///
 /// False positives (misclassifying a transient error as non-retryable) silently
 /// drop a user message, which is worse than a false negative (extra retries on
@@ -3055,6 +3058,7 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate")
         || message.contains("API Error: 401")
         || message.contains("Authentication required")
+        || message.contains("OAuth session expired and could not be refreshed")
 }
 
 /// Spawn a task that posts a user-visible failure notice to the relay.
@@ -6272,6 +6276,19 @@ mod error_outcome_emission_tests {
         assert!(
             is_auth_error(&e),
             "headless 'Authentication required' must be classified as auth error"
+        );
+    }
+
+    #[test]
+    fn is_auth_error_matches_oauth_session_expired_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Failed to authenticate: OAuth session expired and could not be refreshed"
+                .to_string(),
+        };
+        assert!(
+            is_auth_error(&e),
+            "macOS managed-agent 'OAuth session expired' variant must be classified as auth error"
         );
     }
 
