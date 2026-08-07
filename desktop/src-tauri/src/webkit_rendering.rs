@@ -143,9 +143,10 @@ fn plan(
                 // Older docs told people to export DISABLE_DMABUF=1; on current
                 // WebKitGTK that empties the transport and SIGSEGVs (#3654).
                 // Leave the takeover alone, but point survivors at FORCE_SHM.
-                if user_set.iter().any(|(key, value)| {
-                    *key == DISABLE_DMABUF && value.as_os_str() != "0"
-                }) {
+                if user_set
+                    .iter()
+                    .any(|(key, value)| *key == DISABLE_DMABUF && value.as_os_str() != "0")
+                {
                     why.push_str(&format!(
                         "; warning: {DISABLE_DMABUF} (other than =0) empties the \
                          transport on current WebKitGTK and SIGSEGVs — prefer \
