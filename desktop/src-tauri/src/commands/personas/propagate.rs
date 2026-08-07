@@ -58,6 +58,18 @@ pub(super) fn propagate_persona_respond_to(
         Vec::new()
     };
 
+    // A stored definition can end up in `allowlist` mode with zero pubkeys —
+    // `validate_respond_to_allowlist` accepts an empty list rather than
+    // erroring, and the write path that should stop that combination from
+    // reaching storage is tracked separately (#2501). Every other consumer of
+    // this state rejects it outright: `build_respond_to_env`'s mint guard and
+    // `apply_persona_behavior`'s request validation both refuse an empty
+    // allowlist. Skip instead of propagating it, so an unrelated persona save
+    // can't push a doomed respond_to onto instances that were working.
+    if mode == RespondTo::Allowlist && allowlist.is_empty() {
+        return Ok(0);
+    }
+
     let mut updated = 0;
     for record in records.iter_mut() {
         if record.persona_id.as_deref() != Some(persona_id) {

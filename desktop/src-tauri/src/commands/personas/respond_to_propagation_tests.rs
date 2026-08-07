@@ -51,8 +51,10 @@ fn agent(persona_id: &str, name: &str) -> ManagedAgentRecord {
         name_pool: vec![],
         is_builtin: false,
         is_active: true,
+        shared: false,
         source_team: None,
         source_team_persona_slug: None,
+        catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
@@ -72,8 +74,10 @@ fn definition(respond_to: Option<&str>, allowlist: Vec<&str>) -> AgentDefinition
         name_pool: vec![],
         is_builtin: false,
         is_active: true,
+        shared: false,
         source_team: None,
         source_team_persona_slug: None,
+        catalog_source: None,
         env_vars: Default::default(),
         respond_to: respond_to.map(str::to_string),
         respond_to_allowlist: allowlist.into_iter().map(str::to_string).collect(),
@@ -145,6 +149,29 @@ fn respond_to_skips_empty_pubkey_definition_rows() {
     )
     .expect("propagate");
     assert_eq!(updated, 0);
+}
+
+#[test]
+fn respond_to_allowlist_with_no_pubkeys_skips_propagation() {
+    // A stored definition can end up `allowlist` mode with an empty list
+    // (validate_respond_to_allowlist accepts that combination rather than
+    // erroring). Every other consumer of respond_to state rejects it — the
+    // mint guard in build_respond_to_env and apply_persona_behavior's request
+    // validation both refuse it — so propagation must skip it too rather than
+    // pushing an unspawnable state onto instances that were working.
+    let mut records = vec![agent("persona-1", "Scout")];
+    records[0].respond_to = RespondTo::Anyone;
+
+    let updated = propagate_persona_respond_to(
+        &mut records,
+        "persona-1",
+        &definition(Some("allowlist"), vec![]),
+    )
+    .expect("propagate");
+
+    assert_eq!(updated, 0);
+    assert_eq!(records[0].respond_to, RespondTo::Anyone);
+    assert!(records[0].respond_to_allowlist.is_empty());
 }
 
 #[test]
