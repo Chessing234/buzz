@@ -1428,12 +1428,13 @@ async fn steer_rejected_on_empty_prompt() {
     .await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
-    let p_id = h
-        .send(
-            "session/prompt",
-            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
-        )
-        .await;
+    // The prompt response is no longer inspected, but the request still has to
+    // be sent to start the run the steer targets.
+    h.send(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+    )
+    .await;
     let run_id = recv_active_run_id(&mut h).await;
     let s_id = h
         .send(
