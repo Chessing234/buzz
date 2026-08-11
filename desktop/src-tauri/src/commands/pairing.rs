@@ -607,21 +607,8 @@ where
         Err(_) => return Ok(()),
     };
 
-    // The relay's NIP-42 AUTH expects the bare WS origin (scheme://host[:port]),
-    // not the full connection URL. The legacy /pair fallback connects to
-    // wss://<host>/pair but must sign the AUTH event against wss://<host>, or
-    // the relay rejects it with "relay url mismatch" and closes the
-    // connection within its 5s auth window. Strip the path before signing;
-    // for path-less URLs (the modern pairing_relay_url path) this is a no-op.
-    let parsed =
-        url::Url::parse(relay_url).map_err(|e| format!("invalid relay URL: {e}"))?;
-    let bare_origin = match (parsed.host_str(), parsed.port()) {
-        (Some(host), Some(port)) => format!("{}://{}:{}", parsed.scheme(), host, port),
-        (Some(host), None) => format!("{}://{}", parsed.scheme(), host),
-        _ => relay_url.to_string(),
-    };
-    let relay_url_parsed =
-        nostr::RelayUrl::parse(&bare_origin).map_err(|e| format!("invalid relay URL: {e}"))?;
+    let relay_url_parsed = nostr::RelayUrl::parse(&nip42_auth_origin(relay_url)?)
+        .map_err(|e| format!("invalid relay URL: {e}"))?;
     let auth_json = {
         let guard = session.lock().await;
         let s = guard.as_ref().ok_or("session gone during auth")?;
@@ -795,6 +782,32 @@ where
     })
     .await
     .map_err(|_| "timeout waiting for EOSE".to_string())?
+}
+
+/// The bare WS origin a NIP-42 AUTH event must be signed against.
+///
+/// The relay derives its expected value as the bare WS origin
+/// (`scheme://host[:port]`) of the tenant host, not the full connection URL.
+/// The legacy fallback connects to `wss://<host>/pair` when NIP-11 carries no
+/// `pairing_relay_url`, so signing the connection URL verbatim produced a
+/// "relay url mismatch" and the relay closed the socket inside its 5s auth
+/// window — every legacy-path pairing failed. Strip the path before signing;
+/// for the modern origin-only `pairing_relay_url` this is a no-op.
+///
+/// The origin is serialized by the `url` crate rather than reassembled from
+/// `host_str()`, which drops the brackets an IPv6 literal needs — `ws://[::1]:7777/pair`
+/// would otherwise become `ws://::1:7777` and fail to parse. Leaving it to the
+/// serializer also handles default-port elision and host normalization.
+fn nip42_auth_origin(relay_url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(relay_url).map_err(|e| format!("invalid relay URL: {e}"))?;
+    let origin = parsed.origin();
+    if origin.is_tuple() {
+        Ok(origin.ascii_serialization())
+    } else {
+        // Opaque origin (a scheme the URL spec does not treat as special).
+        // Nothing meaningful to strip; leave it for RelayUrl to reject.
+        Ok(relay_url.to_string())
+    }
 }
 
 #[cfg(test)]
