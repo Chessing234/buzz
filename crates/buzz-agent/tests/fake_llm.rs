@@ -1357,11 +1357,15 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     // before the acknowledgement so the ordering assertion still holds.
     let (frames_before_cancel_ack, cancel_ack) =
         recv_until_with_drain(&mut h, |v| v["id"] == json!(c_id)).await;
-    assert_eq!(cancel_ack["id"], json!(c_id), "session/cancel was not acknowledged");
+    assert_eq!(
+        cancel_ack["id"],
+        json!(c_id),
+        "session/cancel was not acknowledged"
+    );
     let _ = gate_tx.send(()); // unblock round 2
 
     let mut saw_usage_before_prompt_response = false;
-    let mut saw_usage = frames_before_cancel_ack.iter().any(|v| is_usage_update(v));
+    let mut saw_usage = frames_before_cancel_ack.iter().any(is_usage_update);
     if saw_usage {
         saw_usage_before_prompt_response = true;
     }
