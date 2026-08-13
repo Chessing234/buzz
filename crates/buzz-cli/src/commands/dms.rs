@@ -4,44 +4,69 @@ use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::{parse_uuid, sdk_err, validate_hex64};
 
-/// List DM conversations by querying kind:41001 (relay-confirmed DMs) filtered by our pubkey.
+/// Build the filter that finds the caller's DM conversations.
+///
+/// DMs are discoverable through their kind:39000 channel metadata, which the
+/// relay signs on creation with `t=dm`, `hidden`, and one `p` tag per
+/// participant (`emit_group_discovery_events`). Filtering that kind by our own
+/// pubkey therefore returns exactly the DMs we are a party to — `p` tags are
+/// only attached to DM discovery, and channel-scoped storage keeps other
+/// people's DMs unreadable regardless.
+fn dm_discovery_filter(my_pubkey: &str, limit: u32) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": [39000],
+        "#p": [my_pubkey],
+        "limit": limit
+    })
+}
+
+/// Read every value of a single-letter tag off an event.
+fn tag_values(event: &serde_json::Value, name: &str) -> Vec<String> {
+    event
+        .get("tags")
+        .and_then(|t| t.as_array())
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| {
+                    let arr = tag.as_array()?;
+                    if arr.first()?.as_str()? == name {
+                        arr.get(1)?.as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Project a kind:39000 discovery event into a `dms list` row.
+///
+/// Returns `None` for anything that is not a DM. The filter cannot express
+/// "has a `p` tag *and* is a DM" any more precisely than `#p`, so the type
+/// check happens here against the `t` tag the relay always writes.
+fn dm_summary(event: &serde_json::Value) -> Option<serde_json::Value> {
+    if !tag_values(event, "t").iter().any(|t| t == "dm") {
+        return None;
+    }
+    let dm_id = extract_d_tag(event);
+    if dm_id.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "dm_id": dm_id,
+        "participants": tag_values(event, "p"),
+        "created_at": event.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
+    }))
+}
+
+/// List the DM conversations the authenticated identity is a party to.
 pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
     let my_pk = client.keys().public_key().to_hex();
     let limit = limit.unwrap_or(50).min(200);
-    let filter = serde_json::json!({
-        "kinds": [41001],
-        "#p": [my_pk],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
+    let resp = client.query(&dm_discovery_filter(&my_pk, limit)).await?;
     let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let dms: Vec<serde_json::Value> = events
-        .iter()
-        .map(|e| {
-            let dm_id = extract_d_tag(e);
-            let participants: Vec<String> = e
-                .get("tags")
-                .and_then(|t| t.as_array())
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(|tag| {
-                            let arr = tag.as_array()?;
-                            if arr.first()?.as_str()? == "p" {
-                                arr.get(1)?.as_str().map(|s| s.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            serde_json::json!({
-                "dm_id": dm_id,
-                "participants": participants,
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-            })
-        })
-        .collect();
+    let dms: Vec<serde_json::Value> = events.iter().filter_map(dm_summary).collect();
     let output = serde_json::to_string(&dms).unwrap_or_default();
     println!("{output}");
     Ok(())
