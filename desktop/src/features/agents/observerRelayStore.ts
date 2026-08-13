@@ -27,6 +27,13 @@ import {
 } from "./ui/agentSessionTranscript";
 
 const MAX_OBSERVER_EVENTS = 3000;
+// Length the per-agent journal is evicted back down to when it exceeds
+// MAX_OBSERVER_EVENTS. Eviction rebuilds the transcript from the retained
+// window (see appendAgentEvents), so evicting back to exactly the cap means an
+// agent parked at the cap evicts — and therefore replays its whole history — on
+// every single append. Leaving headroom amortizes one rebuild across the
+// appends that refill it, while keeping the journal within the cap.
+const OBSERVER_EVENTS_LOW_WATER = MAX_OBSERVER_EVENTS - 500;
 const MAX_PENDING_UNKNOWN_AGENT_FRAMES = 100;
 
 export type ObserverSnapshot = {
@@ -219,7 +226,7 @@ function appendAgentEvents(
   const sorted = [...current, ...sortedAdded].sort(compareObserverEvents);
   const trimmed = sorted.length > MAX_OBSERVER_EVENTS;
   const final = trimmed
-    ? sorted.slice(sorted.length - MAX_OBSERVER_EVENTS)
+    ? sorted.slice(sorted.length - OBSERVER_EVENTS_LOW_WATER)
     : sorted;
   eventsByAgent.set(key, final);
 
