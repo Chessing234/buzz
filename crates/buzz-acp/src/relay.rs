@@ -4065,6 +4065,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn without_a_hint_the_rest_schedule_is_unchanged() {
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), None),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn a_longer_hint_wins_over_the_rest_schedule() {
+        // The schedule tops out at 2s, so a relay asking for 4s means retrying
+        // on schedule is a guaranteed second rejection.
+        assert_eq!(
+            retry_delay(Duration::from_millis(2000), Some(Duration::from_secs(4))),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn a_shorter_hint_does_not_shorten_the_backoff() {
+        assert_eq!(
+            retry_delay(Duration::from_millis(2000), Some(Duration::from_secs(1))),
+            Duration::from_millis(2000)
+        );
+    }
+
+    #[test]
+    fn a_pathological_hint_is_capped() {
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), Some(Duration::from_secs(3600))),
+            RETRY_HINT_MAX
+        );
+    }
+
+    #[test]
+    fn the_relays_own_429_body_yields_a_delay() {
+        // The shape enforce_http_admission actually sends
+        // (crates/buzz-relay/src/api/bridge.rs).
+        let body = r#"{"error":"rate-limited: quota exceeded; retry in 6s"}"#;
+        let hint = parse_rate_limit_retry_secs(body).map(Duration::from_secs);
+        assert_eq!(hint, Some(Duration::from_secs(6)));
+        assert_eq!(
+            retry_delay(Duration::from_millis(500), hint),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
     fn relay_ws_to_http_plain() {
         assert_eq!(
             relay_ws_to_http("ws://localhost:3000"),
