@@ -159,3 +159,72 @@ pub async fn dispatch(cmd: crate::DmsCmd, client: &BuzzClient) -> Result<(), Cli
         DmsCmd::Hide { channel } => cmd_hide_dm(client, &channel).await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dm_discovery_filter, dm_summary};
+    use serde_json::json;
+
+    const ME: &str = "4c619afde8bb468423c541af450121aec954e9adc8e8d33daea957e281272125";
+    const THEM: &str = "f95f47023f13e605778566950e2ce795676930c5db06a2cb7f6e35cae73c2f84";
+    const DM_ID: &str = "1da3e67e-3626-4ec1-8e13-59345cafcb93";
+
+    fn dm_discovery_event() -> serde_json::Value {
+        // Shape written by emit_group_discovery_events for a DM channel.
+        json!({
+            "kind": 39000,
+            "created_at": 1_754_000_000u64,
+            "tags": [
+                ["d", DM_ID],
+                ["public"],
+                ["hidden"],
+                ["p", ME],
+                ["p", THEM],
+                ["closed"],
+                ["t", "dm"],
+            ],
+        })
+    }
+
+    #[test]
+    fn the_filter_asks_for_dm_discovery_by_participant() {
+        // kind:41001 is never published by the relay, so the old filter could
+        // only ever return an empty list.
+        let filter = dm_discovery_filter(ME, 50);
+        assert_eq!(filter["kinds"], json!([39000]));
+        assert_eq!(filter["#p"], json!([ME]));
+        assert_eq!(filter["limit"], json!(50));
+    }
+
+    #[test]
+    fn a_dm_projects_to_its_id_and_participants() {
+        let row = dm_summary(&dm_discovery_event()).expect("a dm must be listed");
+        assert_eq!(row["dm_id"], json!(DM_ID));
+        assert_eq!(row["participants"], json!([ME, THEM]));
+        assert_eq!(row["created_at"], json!(1_754_000_000u64));
+    }
+
+    #[test]
+    fn a_non_dm_channel_is_not_listed() {
+        // A stream channel we are p-tagged on must not appear in dms list.
+        let mut event = dm_discovery_event();
+        event["tags"] = json!([["d", DM_ID], ["p", ME], ["t", "stream"]]);
+        assert!(dm_summary(&event).is_none());
+    }
+
+    #[test]
+    fn an_untyped_event_is_not_listed() {
+        let mut event = dm_discovery_event();
+        event["tags"] = json!([["d", DM_ID], ["p", ME]]);
+        assert!(dm_summary(&event).is_none());
+    }
+
+    #[test]
+    fn a_dm_with_no_d_tag_is_skipped_rather_than_listed_without_an_id() {
+        // An id-less row is worse than a missing one: the caller cannot act on
+        // it and cannot tell it apart from a real DM.
+        let mut event = dm_discovery_event();
+        event["tags"] = json!([["p", ME], ["t", "dm"]]);
+        assert!(dm_summary(&event).is_none());
+    }
+}
