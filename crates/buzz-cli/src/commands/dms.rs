@@ -2,12 +2,20 @@ use uuid::Uuid;
 
 use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
+use crate::limits::{effective_limit, truncation_notice};
 use crate::validate::{parse_uuid, sdk_err, validate_hex64};
 
+/// Default and maximum `--limit` for `dms list`.
+const LIST_LIMIT_DEFAULT: u32 = 50;
+const LIST_LIMIT_MAX: u32 = 200;
+
 /// List DM conversations by querying kind:41001 (relay-confirmed DMs) filtered by our pubkey.
-pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
+pub async fn cmd_list_dms(
+    client: &BuzzClient,
+    requested_limit: Option<u32>,
+) -> Result<(), CliError> {
     let my_pk = client.keys().public_key().to_hex();
-    let limit = limit.unwrap_or(50).min(200);
+    let limit = effective_limit(requested_limit, LIST_LIMIT_DEFAULT, LIST_LIMIT_MAX);
     let filter = serde_json::json!({
         "kinds": [41001],
         "#p": [my_pk],
@@ -44,6 +52,14 @@ pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(),
         .collect();
     let output = serde_json::to_string(&dms).unwrap_or_default();
     println!("{output}");
+    if let Some(notice) = truncation_notice(
+        dms.len(),
+        requested_limit,
+        LIST_LIMIT_DEFAULT,
+        LIST_LIMIT_MAX,
+    ) {
+        eprintln!("{notice}");
+    }
     Ok(())
 }
 
