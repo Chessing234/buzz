@@ -78,3 +78,13 @@ test("the generic channel fallback also requires a leading boundary", () => {
   ]);
   assert.deepEqual(matches(pattern, "issue-42#general"), []);
 });
+
+test("a possessive apostrophe closes a mention, so it still renders", () => {
+  const pattern = buildMentionPattern(["alice"]);
+  assert.deepEqual(matches(pattern, "@alice's PR"), [
+    { text: "@alice", index: 0 },
+  ]);
+  assert.deepEqual(matches(pattern, "@alice’s PR"), [
+    { text: "@alice", index: 0 },
+  ]);
+});
