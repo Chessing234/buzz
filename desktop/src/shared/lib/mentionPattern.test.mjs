@@ -88,3 +88,14 @@ test("a possessive apostrophe closes a mention, so it still renders", () => {
     { text: "@alice", index: 0 },
   ]);
 });
+
+test("a bracket opens a mention, matching what autocomplete accepts", () => {
+  const pattern = buildMentionPattern(["alice"]);
+  for (const [text, index] of [
+    ["(@alice)", 1],
+    ["[@alice]", 1],
+    ["{@alice}", 1],
+  ]) {
+    assert.deepEqual(matches(pattern, text), [{ text: "@alice", index }], text);
+  }
+});

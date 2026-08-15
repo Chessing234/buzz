@@ -17,15 +17,16 @@ export const PREFIX_LEAD_GROUP = 1;
 
 /**
  * A prefix only opens a mention or channel link at the start of the text or
- * after whitespace or an opening paren — `bob@alice.dev` is an address, not a
- * mention of `@alice`, and the composer's own highlighter already draws the
- * line in the same place.
+ * after whitespace or an opening bracket — `bob@alice.dev` is an address, not
+ * a mention of `@alice`. The bracket set matches `detectPrefixQuery`, which
+ * decides what opens an autocomplete query, so a name picked from the
+ * autocomplete always renders as the mention it was tagged as.
  *
  * The boundary is a capture group rather than a lookbehind on purpose: WebKit
  * before Safari 16.4 fails to parse lookbehind and blanks the whole app
  * (#5547).
  */
-const LEADING_BOUNDARY = "(^|[\\s(])";
+const LEADING_BOUNDARY = "(^|[\\s([{])";
 
 /**
  * Build a regex that matches a given prefix followed by known multi-word names
