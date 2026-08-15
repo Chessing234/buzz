@@ -2306,9 +2306,51 @@ fn kill_process_group(pid: u32) -> bool {
     killpg(Pid::from_raw(pid as i32), Signal::SIGKILL).is_ok()
 }
 
-/// Fallback for non-Unix: process-group kill not available.
-/// Returns `false` so the caller falls back to `child.start_kill()`.
-#[cfg(not(unix))]
+/// Terminate the child's whole tree on Windows.
+///
+/// `start_kill()` ends only the direct child, so a harness that spawns its own
+/// workers (hermes-acp's python processes, MCP servers, tool subprocesses)
+/// leaves them running. Every cancel-drain timeout then leaks one tree, and
+/// they accumulate until the machine notices (#5849).
+///
+/// Windows has no process groups to signal, and the job-object API would need
+/// `unsafe`, which this crate denies. `taskkill /T /F` is the documented
+/// tree-terminating tool, ships with every supported Windows, and needs no
+/// privileges beyond the ones required to kill the child itself.
+#[cfg(windows)]
+fn kill_process_group(pid: u32) -> bool {
+    let (program, args) = taskkill_tree_command(pid);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The `taskkill` invocation that ends `pid` and every descendant.
+///
+/// Split out so the flags are asserted on every platform: `/T` is what makes
+/// it a tree kill and `/F` is what makes it unconditional — a drain timeout
+/// means the agent already ignored a polite stop.
+#[cfg(any(windows, test))]
+fn taskkill_tree_command(pid: u32) -> (&'static str, [String; 4]) {
+    (
+        "taskkill",
+        [
+            "/PID".to_string(),
+            pid.to_string(),
+            "/T".to_string(),
+            "/F".to_string(),
+        ],
+    )
+}
+
+/// Fallback for platforms that are neither Unix nor Windows: no tree kill
+/// available, so the caller falls back to `child.start_kill()`.
+#[cfg(not(any(unix, windows)))]
 fn kill_process_group(_pid: u32) -> bool {
     false
 }
@@ -4956,5 +4998,19 @@ mod tests {
             msg.contains("sandbox_workspace_write"),
             "error must mention sandbox_workspace_write"
         );
+    }
+}
+
+#[cfg(test)]
+mod process_tree_kill_tests {
+    #[test]
+    fn taskkill_targets_the_whole_tree_forcibly() {
+        // `/T` is what turns this into a tree kill — without it the harness's
+        // own workers survive, which is the leak in #5849. `/F` is what makes
+        // it unconditional: a drain timeout means the agent already ignored a
+        // polite stop.
+        let (program, args) = super::taskkill_tree_command(4242);
+        assert_eq!(program, "taskkill");
+        assert_eq!(args, ["/PID", "4242", "/T", "/F"]);
     }
 }
