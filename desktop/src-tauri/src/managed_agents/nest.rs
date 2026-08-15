@@ -39,6 +39,20 @@ const NEST_DIRS: &[&str] = &[
 /// Fully static — no runtime interpolation, no secrets, no user paths.
 pub(crate) const AGENTS_MD: &str = include_str!("nest_agents.md");
 
+/// Content of the nest's `CLAUDE.md`.
+///
+/// Claude Code auto-loads `CLAUDE.md`, not `AGENTS.md`, and buzz-acp only
+/// *names* AGENTS.md in the system prompt — `workspace_section()` never
+/// injects its contents. Everything the orientation file says is therefore
+/// inert for that runtime unless the agent decides to read the file, which
+/// includes the Git Commit Identity rules that name the human operator.
+///
+/// `@./AGENTS.md` is Claude Code's own include syntax: the file's contents
+/// reach the context window without a tool call. One line, so a user who
+/// wants to say more can edit it — the write below never clobbers an
+/// existing file.
+pub(crate) const CLAUDE_MD: &str = "@./AGENTS.md\n";
+
 /// Default SKILL.md content for the buzz-cli skill.
 /// Written to ~/.buzz/.agents/skills/buzz-cli/SKILL.md on first init.
 const BUZZ_CLI_SKILL_MD: &str = include_str!("nest_skill.md");
@@ -182,6 +196,25 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
         }
         Err(e) => {
             return Err(format!("create {}: {e}", agents_md.display()));
+        }
+    }
+
+    // Point Claude Code at the orientation file. Same create_new posture as
+    // AGENTS.md above: written once, never clobbering a user's own file.
+    let claude_md = root.join("CLAUDE.md");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claude_md)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(CLAUDE_MD.as_bytes())
+                .map_err(|e| format!("write {}: {e}", claude_md.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(format!("create {}: {e}", claude_md.display()));
         }
     }
 

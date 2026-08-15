@@ -923,3 +923,33 @@ fn refresh_skill_overwrites_on_version_bump() {
         "SKILL.md must be refreshed on version bump"
     );
 }
+
+#[test]
+fn nest_writes_a_claude_md_pointing_at_agents_md() {
+    // Claude Code loads CLAUDE.md, not AGENTS.md, and buzz-acp only names the
+    // orientation file in the prompt — without this pointer everything in it
+    // (including the commit-identity rules) is inert for that runtime.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("nest");
+    ensure_nest_at(&root).unwrap();
+
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+    assert_eq!(claude_md.trim(), "@./AGENTS.md");
+    assert!(root.join("AGENTS.md").exists());
+}
+
+#[test]
+fn nest_never_clobbers_an_existing_claude_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("nest");
+    ensure_nest_at(&root).unwrap();
+
+    std::fs::write(root.join("CLAUDE.md"), "@./AGENTS.md\n\nmine\n").unwrap();
+    ensure_nest_at(&root).unwrap();
+
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+    assert!(
+        claude_md.contains("mine"),
+        "user content must survive: {claude_md}"
+    );
+}
