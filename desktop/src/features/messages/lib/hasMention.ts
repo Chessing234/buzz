@@ -132,7 +132,8 @@ function maskMarkdownCode(text: string): string {
  * Check whether `text` contains an @mention of `name`.
  *
  * Matches `@Name` preceded by start-of-string, whitespace, an opening
- * parenthesis (for team expansions), markdown
+ * bracket of any kind — `(`, `[`, `{`, which is exactly what
+ * `detectPrefixQuery` lets open an autocomplete query — markdown
  * bold/italic markers (`*`, `**`, `***`, `_`, `__`, `___`), or spoiler
  * delimiters (`||`). This handles the case where a mention is pasted from the
  * chat area and TipTap's Bold extension wraps it in bold marks (font-weight >=
@@ -148,7 +149,7 @@ function maskMarkdownCode(text: string): string {
 export function getMentionOffsets(text: string, name: string): number[] {
   const escaped = escapeRegExp(name);
   const pattern = new RegExp(
-    `(^|\\s|\\(|[*_]{1,3}|\\|\\|)(@${escaped})(?=\\|\\||[\\s,;.!?:)\\]}*_'\u2019]|$)`,
+    `(^|\\s|[([{]|[*_]{1,3}|\\|\\|)(@${escaped})(?=\\|\\||[\\s,;.!?:)\\]}*_'\u2019]|$)`,
     "gi",
   );
   const maskedText = maskMarkdownCode(text);

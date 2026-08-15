@@ -54,3 +54,16 @@ test("every occurrence gets an offset, in order", () => {
 test("no mention yields no offsets", () => {
   assert.deepEqual(getMentionOffsets("nothing here", "Alice"), []);
 });
+
+test("a bracket opens a mention, matching what autocomplete accepts", () => {
+  // `detectPrefixQuery` fires an autocomplete after `(`, `[` and `{`, so a
+  // name picked there has to be tagged — otherwise the pick silently
+  // produces no p tag.
+  for (const text of ["(@Alice", "[@Alice", "{@Alice"]) {
+    assert.equal(hasMention(text, "Alice"), true, text);
+  }
+});
+
+test("an ordinary character before the @ still opens nothing", () => {
+  assert.equal(hasMention("x@Alice", "Alice"), false);
+});
