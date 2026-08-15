@@ -21,8 +21,9 @@ use std::time::Duration;
 use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use buzz_core::kind::{
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+    KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -3515,9 +3516,17 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
 }
 
 /// Event kinds `--subscribe mentions` listens to by default.
+///
+/// A forum channel carries its conversation as kind:45001 posts and kind:45003
+/// comments, not kind:9 — so an agent left on the default subscription was
+/// deaf in exactly the channels built for threaded discussion: it joined, it
+/// showed online, and an `@mention` in a forum post produced no inbound event
+/// at all (#5268).
 fn default_mention_kinds() -> Vec<u32> {
     vec![
         KIND_STREAM_MESSAGE,
+        KIND_FORUM_POST,
+        KIND_FORUM_COMMENT,
         KIND_WORKFLOW_APPROVAL_REQUESTED,
         KIND_STREAM_REMINDER,
     ]
@@ -8685,8 +8694,18 @@ mod observer_payload_trim_tests {
 mod default_mention_kinds_tests {
     use super::default_mention_kinds;
     use buzz_core::kind::{
-        KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
+        KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
+
+    #[test]
+    fn mentions_cover_forum_channels() {
+        // A forum channel's conversation is 45001/45003, so leaving them out
+        // makes the default subscription deaf there (#5268).
+        let kinds = default_mention_kinds();
+        assert!(kinds.contains(&KIND_FORUM_POST), "{kinds:?}");
+        assert!(kinds.contains(&KIND_FORUM_COMMENT), "{kinds:?}");
+    }
 
     #[test]
     fn mentions_still_cover_the_stream_kinds_they_always_did() {
