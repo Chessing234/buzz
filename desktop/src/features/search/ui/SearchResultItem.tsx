@@ -19,6 +19,7 @@ import {
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { Badge } from "@/shared/ui/badge";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { truncateByCharacters } from "@/shared/lib/truncateByCharacters";
 
 export type SearchResult =
   | {
@@ -186,7 +187,7 @@ function truncateContent(content: string) {
     return trimmed;
   }
 
-  return `${trimmed.slice(0, 177)}...`;
+  return `${truncateByCharacters(trimmed, 177)}...`;
 }
 
 function formatRelativeTime(unixSeconds: number) {

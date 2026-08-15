@@ -18,6 +18,7 @@ import { useNow } from "@/shared/lib/useNow";
 import { Markdown } from "@/shared/ui/markdown";
 import { Popover, PopoverAnchor, PopoverContent } from "@/shared/ui/popover";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import { truncateByCharacters } from "@/shared/lib/truncateByCharacters";
 
 const HOVER_OPEN_DELAY_MS = 250;
 const HOVER_CLOSE_DELAY_MS = 180;
@@ -437,7 +438,7 @@ export function ChannelActivityPopover({
                         authorPubkey: item.item.pubkey,
                         channelId: channel.id,
                         eventId: item.id,
-                        preview: item.preview.slice(0, 100),
+                        preview: truncateByCharacters(item.preview, 100),
                       });
                     }}
                   />
