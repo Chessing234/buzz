@@ -139,6 +139,42 @@ const AUTH_COMPLETE_HTML: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
+/// Keyring key holding the Builderlab session credential.
+///
+/// The credential used to live only in `BuilderlabSession`, i.e. in process
+/// memory, so quitting the app signed the Hosted communities page out while
+/// the Buzz identity itself — which *is* persisted — came back fine. Keep it
+/// beside that identity in the OS keyring instead.
+const SESSION_CREDENTIAL_KEY: &str = "builderlab.session";
+
+fn credential_store() -> &'static crate::secret_store::SecretStore {
+    crate::secret_store::SecretStore::shared(crate::app_state::keyring_service())
+}
+
+/// Persist the credential. Best-effort: a machine whose keyring is unreachable
+/// still gets a working session for this run, which is what it had before.
+fn persist_credential(credential: &str) {
+    if let Err(error) = credential_store().store(SESSION_CREDENTIAL_KEY, credential) {
+        tracing::warn!(%error, "builderlab: could not persist the session credential");
+    }
+}
+
+fn forget_credential() {
+    if let Err(error) = credential_store().delete(SESSION_CREDENTIAL_KEY) {
+        tracing::debug!(%error, "builderlab: could not delete the session credential");
+    }
+}
+
+fn stored_credential() -> Option<String> {
+    match credential_store().load(SESSION_CREDENTIAL_KEY) {
+        Ok(credential) => credential,
+        Err(error) => {
+            tracing::warn!(%error, "builderlab: could not read the session credential");
+            None
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct BuilderlabSession(Mutex<Option<StoredSession>>);
 
@@ -358,6 +394,7 @@ pub(crate) async fn start_builderlab_login(
         }
         *pending = None;
     }
+    persist_credential(&exchanged.session_credential);
     *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
         credential: exchanged.session_credential,
     });
@@ -369,14 +406,25 @@ pub(crate) async fn get_builderlab_auth(
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
 ) -> Result<Option<BuilderlabAuthInfo>, String> {
-    let stored = session
+    let in_memory = session
         .0
         .lock()
         .map_err(|error| error.to_string())?
         .as_ref()
         .map(|stored| stored.credential.clone());
-    let Some(credential) = stored else {
-        return Ok(None);
+    // A fresh process has nothing in memory; the credential from the last run
+    // is in the keyring. Hydrate before deciding the page is signed out.
+    let credential = match in_memory {
+        Some(credential) => credential,
+        None => {
+            let Some(credential) = stored_credential() else {
+                return Ok(None);
+            };
+            *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
+                credential: credential.clone(),
+            });
+            credential
+        }
     };
     match authenticated_user(&app_state.http_client, &credential).await {
         Ok(me) => Ok(Some(BuilderlabAuthInfo {
@@ -385,10 +433,14 @@ pub(crate) async fn get_builderlab_auth(
             name: me.name,
         })),
         Err(error) => {
+            // The credential is no longer good (expired, revoked, or the
+            // account changed). Drop it from both stores so the next launch
+            // asks for a sign-in instead of failing this call again.
             *session
                 .0
                 .lock()
                 .map_err(|lock_error| lock_error.to_string())? = None;
+            forget_credential();
             Err(error)
         }
     }
@@ -409,6 +461,7 @@ pub(crate) fn clear_builderlab_auth(
     session: tauri::State<'_, BuilderlabSession>,
 ) -> Result<(), String> {
     *session.0.lock().map_err(|error| error.to_string())? = None;
+    forget_credential();
     Ok(())
 }
 
