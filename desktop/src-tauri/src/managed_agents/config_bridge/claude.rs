@@ -1,12 +1,27 @@
 use super::types::{ExtensionEntry, RuntimeFileConfig};
+use std::path::Path;
 
-/// Read Claude Code config from `~/.claude/settings.json` and `~/.claude.json`.
-pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
+/// Read Claude Code config from `~/.claude/settings.json` and `~/.claude.json`,
+/// with `<workdir>/.claude/settings.json` layered on top.
+///
+/// Claude Code itself reads both files and lets the project one win, so the
+/// panel showed values that were not the ones in effect: an agent whose nest
+/// sets `effortLevel: medium` really does run at medium, while the panel
+/// reported the user-level `low` (#5826).
+pub(super) fn read_config_file(workdir: Option<&Path>) -> Option<RuntimeFileConfig> {
     let home = dirs::home_dir()?;
     let settings_path = home.join(".claude").join("settings.json");
     let mcp_path = home.join(".claude.json");
 
-    let settings = read_json_file(&settings_path);
+    let user_settings = read_json_file(&settings_path);
+    let project_settings = workdir
+        .map(|dir| dir.join(".claude").join("settings.json"))
+        // A project file that *is* the user file (agent workdir == $HOME, the
+        // fallback in `default_agent_workdir`) must not be read twice.
+        .filter(|path| path != &settings_path)
+        .as_deref()
+        .and_then(read_json_file);
+    let settings = merge_settings(user_settings, project_settings);
     let mcp_config = read_json_file(&mcp_path);
 
     if settings.is_none() && mcp_config.is_none() {
@@ -35,6 +50,41 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
     cfg.extensions = extensions;
 
     Some(cfg)
+}
+
+/// Layer project settings over user settings, project winning.
+///
+/// Objects merge key by key rather than replacing wholesale, so a project file
+/// that sets one `env` var does not erase the rest of the user's `env`. Any
+/// non-object value replaces its counterpart outright.
+fn merge_settings(
+    user: Option<serde_json::Value>,
+    project: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (user, project) {
+        (Some(mut user), Some(project)) => {
+            merge_into(&mut user, project);
+            Some(user)
+        }
+        (user, None) => user,
+        (None, project) => project,
+    }
+}
+
+fn merge_into(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_into(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 /// Project the fields Buzz surfaces out of a Claude `settings.json` object.
@@ -189,6 +239,63 @@ mod tests {
         let cfg = parse_settings(r#"{"model": "claude-opus-4", "effortLevel": "high"}"#);
         assert!(!cfg.extra.contains_key("model"));
         assert!(!cfg.extra.contains_key("effortLevel"));
+    }
+
+    fn merged(user: &str, project: &str) -> RuntimeFileConfig {
+        let merged = merge_settings(
+            serde_json::from_str(user).ok(),
+            serde_json::from_str(project).ok(),
+        )
+        .expect("merged settings");
+        let mut cfg = RuntimeFileConfig::default();
+        apply_settings(&mut cfg, &merged);
+        cfg
+    }
+
+    #[test]
+    fn project_settings_win_over_user_settings() {
+        // The reported case: the agent really runs at medium, the panel said low.
+        let cfg = merged(r#"{"effortLevel": "low"}"#, r#"{"effortLevel": "medium"}"#);
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn user_settings_survive_keys_the_project_does_not_set() {
+        let cfg = merged(
+            r#"{"model": "claude-opus-4", "effortLevel": "low"}"#,
+            r#"{"effortLevel": "high"}"#,
+        );
+        assert_eq!(cfg.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn objects_merge_rather_than_replace() {
+        // A project file that sets one env var must not erase the others.
+        let cfg = merged(
+            r#"{"env": {"A": "user-a", "B": "user-b"}}"#,
+            r#"{"env": {"B": "project-b"}}"#,
+        );
+        assert_eq!(cfg.extra.get("env.A").map(|s| s.as_str()), Some("user-a"));
+        assert_eq!(
+            cfg.extra.get("env.B").map(|s| s.as_str()),
+            Some("project-b")
+        );
+    }
+
+    #[test]
+    fn either_file_alone_is_used_as_is() {
+        let only_user = merge_settings(serde_json::from_str(r#"{"model": "u"}"#).ok(), None);
+        assert_eq!(
+            only_user.as_ref().and_then(|v| v.get("model")),
+            Some(&serde_json::Value::from("u"))
+        );
+        let only_project = merge_settings(None, serde_json::from_str(r#"{"model": "p"}"#).ok());
+        assert_eq!(
+            only_project.as_ref().and_then(|v| v.get("model")),
+            Some(&serde_json::Value::from("p"))
+        );
+        assert!(merge_settings(None, None).is_none());
     }
 
     #[test]
