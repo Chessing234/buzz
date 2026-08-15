@@ -37,6 +37,25 @@ use nostr::{FromBech32, PublicKey};
 /// inline implementation.
 pub const MENTION_CAP: usize = 50;
 
+/// Whether an `@` at this position opens a mention.
+///
+/// Start-of-string or whitespace, plus the markdown punctuation Buzz Desktop
+/// treats as an opener (`hasMention.ts`): an opening parenthesis, a bold or
+/// italic marker, and the spoiler delimiter. Desktop renders `**@fizz**`,
+/// `_@fizz_`, `(@fizz)` and `||@fizz||` as mentions, and agents are told to
+/// write GitHub-flavored Markdown, so a mention that only the renderer
+/// recognises produces a message that *looks* addressed to an agent and
+/// carries no `p` tag to wake it.
+///
+/// Anything else — most importantly an alphanumeric, as in `user@host` — is
+/// not an opener.
+fn opens_mention(preceding: Option<char>) -> bool {
+    match preceding {
+        None => true,
+        Some(c) => c.is_ascii_whitespace() || matches!(c, '(' | '*' | '_' | '|'),
+    }
+}
+
 /// A channel-member profile, as needed for name matching.
 ///
 /// `pubkey` is the lowercase hex public key. `content_json` is the raw
@@ -56,8 +75,8 @@ pub struct MentionProfile<'a> {
 /// available — it correctly handles multi-word display names.
 ///
 /// Returns lowercased names found after `@` tokens. An `@name` only matches
-/// when the `@` is at start-of-string or preceded by an ASCII whitespace
-/// character — this excludes things like email addresses (`user@host`).
+/// when the `@` opens a mention (see [`opens_mention`]) — this excludes
+/// things like email addresses (`user@host`).
 ///
 /// Allowed name characters: ASCII alphanumerics, `.`, `-`, `_`.
 /// Duplicates are removed; first-seen order is preserved.
@@ -72,8 +91,8 @@ pub fn extract_at_names(content: &str) -> Vec<String> {
     let mut i = 0;
     while i < len {
         if chars[i] == '@' {
-            let preceded_by_ws = i == 0 || chars[i - 1].is_ascii_whitespace();
-            if preceded_by_ws && i + 1 < len {
+            let opens = opens_mention(if i == 0 { None } else { Some(chars[i - 1]) });
+            if opens && i + 1 < len {
                 let start = i + 1;
                 let mut end = start;
                 while end < len {
@@ -100,7 +119,7 @@ pub fn extract_at_names(content: &str) -> Vec<String> {
 
 /// Extract `@mention` names from message content using known member names.
 ///
-/// At each `@` preceded by whitespace or start-of-string, tries known names
+/// At each `@` that opens a mention (see [`opens_mention`]), tries known names
 /// longest-first (case-insensitive, word-boundary-checked), then falls back
 /// to single-word tokenization. Returns lowercased names in first-seen order,
 /// deduplicated. Empty/whitespace-only entries in `known_names` are ignored.
@@ -120,8 +139,8 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     let mut seen = HashSet::new();
 
     for (i, _) in content.match_indices('@') {
-        let preceded = i == 0 || content.as_bytes()[i - 1].is_ascii_whitespace();
-        if !preceded {
+        let preceding = content[..i].chars().next_back();
+        if !opens_mention(preceding) {
             continue;
         }
         let rest = &content[i + 1..];
@@ -151,9 +170,20 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     names
 }
 
+/// Whether a known name ends here.
+///
+/// Includes the markdown markers Buzz Desktop closes a mention on
+/// (`hasMention.ts`), so `**@Will Pfleger**` and `_@Will Pfleger_` resolve to
+/// the member rather than to a name with a marker glued on. `_` is a legal
+/// name character, so it only ends a *known* name — the fallback tokenizer
+/// still reads `@fizz_` as `fizz_`, which is the name that was typed.
 fn is_word_boundary(s: &str) -> bool {
     s.chars().next().is_none_or(|c| {
-        c.is_ascii_whitespace() || matches!(c, ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}')
+        c.is_ascii_whitespace()
+            || matches!(
+                c,
+                ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}' | '*' | '_' | '|'
+            )
     })
 }
 
