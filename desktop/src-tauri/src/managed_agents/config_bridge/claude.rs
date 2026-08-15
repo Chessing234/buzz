@@ -16,14 +16,7 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
     let mut cfg = RuntimeFileConfig::default();
 
     if let Some(ref s) = settings {
-        cfg.model = json_string(s, "model");
-
-        // effortLevel → thinking_effort (direct mapping per spec)
-        cfg.thinking_effort = json_string(s, "effortLevel");
-
-        // Config-driven extra fields — skip normalized keys to avoid double-counting.
-        let skip = &["model", "effortLevel"];
-        cfg.extra = super::schema_walker::extract_config_fields(s, skip);
+        apply_settings(&mut cfg, s);
     }
 
     // MCP servers from ~/.claude.json
@@ -44,6 +37,18 @@ pub(super) fn read_config_file() -> Option<RuntimeFileConfig> {
     Some(cfg)
 }
 
+/// Project the fields Buzz surfaces out of a Claude `settings.json` object.
+fn apply_settings(cfg: &mut RuntimeFileConfig, settings: &serde_json::Value) {
+    cfg.model = json_string(settings, "model");
+
+    // effortLevel → thinking_effort (direct mapping per spec)
+    cfg.thinking_effort = json_string(settings, "effortLevel");
+
+    // Config-driven extra fields — skip normalized keys to avoid double-counting.
+    let skip = &["model", "effortLevel"];
+    cfg.extra = super::schema_walker::extract_config_fields(settings, skip);
+}
+
 fn read_json_file(path: &std::path::Path) -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -61,17 +66,13 @@ fn json_string(val: &serde_json::Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Parse a settings JSON string into a RuntimeFileConfig using the same
-    /// logic as read_config_file but without touching the filesystem.
+    /// Parse a settings JSON string into a RuntimeFileConfig through the same
+    /// projection `read_config_file` uses, without touching the filesystem.
     fn parse_settings(json: &str) -> RuntimeFileConfig {
         let val: serde_json::Value = serde_json::from_str(json).unwrap();
-        let skip = &["model", "effortLevel"];
-        RuntimeFileConfig {
-            model: json_string(&val, "model"),
-            thinking_effort: json_string(&val, "effortLevel"),
-            extra: super::super::schema_walker::extract_config_fields(&val, skip),
-            ..Default::default()
-        }
+        let mut cfg = RuntimeFileConfig::default();
+        apply_settings(&mut cfg, &val);
+        cfg
     }
 
     #[test]
