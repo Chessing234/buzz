@@ -361,7 +361,18 @@ pub fn run() {
             // memberships, DMs, and relay identity.
             let state = app_handle.state::<AppState>();
             if let Err(e) = resolve_persisted_identity(&app_handle, &state) {
-                eprintln!("buzz-desktop: fatal: identity resolution failed: {e}");
+                let message = crate::secret_store::fatal_identity_message(&e);
+                eprintln!("buzz-desktop: fatal: {message}");
+                // On Windows this binary has no console, so stderr goes
+                // nowhere and the app looks like it died for no reason. Leave
+                // the reason on disk next to the data it failed to read.
+                if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                    let _ = std::fs::create_dir_all(&data_dir);
+                    let _ = std::fs::write(
+                        data_dir.join("startup-error.log"),
+                        format!("buzz-desktop: fatal: {message}\n"),
+                    );
+                }
                 std::process::exit(1);
             }
 

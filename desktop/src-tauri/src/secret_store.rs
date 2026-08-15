@@ -48,6 +48,19 @@ pub fn keyring_failure_advice(error: &str) -> Option<&'static str> {
     None
 }
 
+/// Compose the fatal-startup message for a failed identity resolution.
+///
+/// `buzz-desktop.exe` is a GUI-subsystem binary on Windows, so it has no
+/// console and this text is invisible unless the user knows to redirect
+/// stderr — which is why it has to be worth reading when they finally do, and
+/// why the caller also writes it to a file (#5956).
+pub fn fatal_identity_message(error: &str) -> String {
+    match keyring_failure_advice(error) {
+        Some(advice) => format!("identity resolution failed: {error}\n{advice}"),
+        None => format!("identity resolution failed: {error}"),
+    }
+}
+
 /// Result of probing the keyring before a migration: distinguishes "reachable
 /// but holds no entry" (safe to migrate into) from "unreachable this boot"
 /// (must NOT migrate — re-importing from a leftover plaintext file could
@@ -1362,5 +1375,31 @@ mod keyring_failure_advice_tests {
         ] {
             assert_eq!(keyring_failure_advice(error), None, "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod fatal_identity_message_tests {
+    use super::fatal_identity_message;
+
+    #[test]
+    fn a_recognised_failure_carries_its_advice() {
+        let message = fatal_identity_message(
+            "keyring write: Platform secure storage failure: Windows error code 8",
+        );
+        assert!(
+            message.starts_with("identity resolution failed: "),
+            "{message}"
+        );
+        assert!(message.contains("Credential Manager"), "{message}");
+    }
+
+    #[test]
+    fn an_unrecognised_failure_is_reported_as_is() {
+        let message = fatal_identity_message("app data dir: permission denied");
+        assert_eq!(
+            message,
+            "identity resolution failed: app data dir: permission denied"
+        );
     }
 }
