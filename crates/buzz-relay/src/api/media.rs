@@ -46,7 +46,18 @@ enum UploadRouteMode {
     LegacyMedia,
 }
 
+/// Whether an upload should take the streaming video path.
+///
+/// An audio-only container is excluded even though it is ISO-BMFF: it has no
+/// video track, so the video validator can only reject it — and it rejects a
+/// normal (non-fast-start) voice memo with "moov atom not at front of file",
+/// a 422 about a detail the user cannot act on. Sending it down the generic
+/// path instead produces the honest answer, `415 disallowed content type:
+/// audio/m4a`, which is what audio support actually being absent looks like.
 fn should_stream_as_video(sniff: &[u8]) -> bool {
+    if buzz_media::looks_like_audio_iso_bmff(sniff) {
+        return false;
+    }
     infer::get(sniff).is_some_and(|kind| kind.mime_type() == "video/mp4")
         || buzz_media::looks_like_iso_bmff(sniff)
 }
@@ -977,6 +988,34 @@ mod tests {
             upload_route_mode("/media"),
             Err(MediaError::NotFound)
         ));
+    }
+
+    /// `ftyp` box: size, "ftyp", major brand, minor version, compatible brands.
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let size = 16 + 4 * compatible.len();
+        let mut bytes = (size as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(major);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        for brand in compatible {
+            bytes.extend_from_slice(*brand);
+        }
+        bytes
+    }
+
+    #[test]
+    fn audio_only_container_does_not_use_video_pipeline() {
+        // An Apple Voice Memo: major brand M4A, but isom/mp42 among its
+        // compatible brands, which is why it used to read as video.
+        let memo = ftyp(b"M4A ", &[b"M4A ", b"mp42", b"isom"]);
+        assert!(buzz_media::looks_like_iso_bmff(&memo));
+        assert!(!should_stream_as_video(&memo));
+    }
+
+    #[test]
+    fn mp4_video_still_uses_video_pipeline() {
+        let video = ftyp(b"isom", &[b"isom", b"mp42", b"avc1"]);
+        assert!(should_stream_as_video(&video));
     }
 
     #[test]
