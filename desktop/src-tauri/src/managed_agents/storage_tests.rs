@@ -830,3 +830,39 @@ fn install_log_filename_accepts_ordinary_runtime_ids() {
         );
     }
 }
+
+#[test]
+fn refusal_names_an_unreadable_keyring_when_the_key_may_still_exist() {
+    // Default and outage case: the keyring did not answer, so the key may be
+    // sitting there behind a locked keychain. Retrying is the right advice.
+    let message = super::key_refusal_message("agentpubkey", false);
+    assert!(message.contains("keyring may be unreachable"), "{message}");
+    assert!(message.contains("retry"), "{message}");
+}
+
+#[test]
+fn refusal_says_the_key_is_gone_when_the_keyring_answered_empty() {
+    // The failure #5837 reports: the keyring was fine and simply had no key,
+    // but the message pointed the user at the keyring. It must not suggest a
+    // retry, and it must say where the key is not (managed-agents.json).
+    let message = super::key_refusal_message("agentpubkey", true);
+    assert!(message.contains("none in the OS keyring"), "{message}");
+    assert!(message.contains("managed-agents.json"), "{message}");
+    assert!(message.contains("recreate the agent"), "{message}");
+    assert!(
+        !message.contains("retry once the keyring is reachable"),
+        "a key the keyring says is absent does not come back on retry: {message}"
+    );
+}
+
+#[test]
+fn a_missing_key_mark_is_cleared_when_the_key_turns_up() {
+    let pubkey = "clearedagentpubkey";
+    super::note_key_missing(pubkey);
+    assert!(super::key_known_missing(pubkey));
+    super::forget_key_missing(pubkey);
+    assert!(
+        !super::key_known_missing(pubkey),
+        "a stale mark would tell the user to recreate an agent whose key is intact"
+    );
+}

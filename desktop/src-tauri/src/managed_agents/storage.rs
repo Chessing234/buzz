@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read as _, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use tauri::{AppHandle, Manager};
@@ -225,13 +226,66 @@ fn migrate_inline_key(store: &impl KeyStore, record: &ManagedAgentRecord) -> Key
 /// `BUZZ_PRIVATE_KEY`/`NOSTR_PRIVATE_KEY`, launching with no identity. Callers
 /// (the spawn path) must fail closed (Wes storage.rs:158).
 pub(crate) fn spawn_key_refusal(record: &ManagedAgentRecord) -> Option<String> {
-    record.private_key_nsec.is_empty().then(|| {
+    record
+        .private_key_nsec
+        .is_empty()
+        .then(|| key_refusal_message(&record.pubkey, key_known_missing(&record.pubkey)))
+}
+
+/// Agents whose key the keyring positively reported as absent this session.
+///
+/// Hydration is the only place that learns the difference between "the keyring
+/// has no key for this agent" and "the keyring could not be read", and the
+/// record it fills carries no room for it — `managed-agents.json` is the file
+/// format, and every construction site would have to grow a field. A session
+/// side table keeps the distinction where it is produced.
+fn keys_known_missing() -> &'static Mutex<HashSet<String>> {
+    static KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn note_key_missing(pubkey: &str) {
+    if let Ok(mut keys) = keys_known_missing().lock() {
+        keys.insert(pubkey.to_string());
+    }
+}
+
+/// Clear the mark — the key was found, or the keyring could not be read and we
+/// no longer know. A stale mark would tell the user to recreate an agent whose
+/// key is sitting in a keyring that was merely locked a moment ago.
+pub(crate) fn forget_key_missing(pubkey: &str) {
+    if let Ok(mut keys) = keys_known_missing().lock() {
+        keys.remove(pubkey);
+    }
+}
+
+pub(crate) fn key_known_missing(pubkey: &str) -> bool {
+    keys_known_missing()
+        .lock()
+        .map(|keys| keys.contains(pubkey))
+        .unwrap_or(false)
+}
+
+/// Word the refusal for the condition that actually holds.
+///
+/// When the keyring answered and had nothing, "retry once the keyring is
+/// reachable" sends the user to inspect a keyring that is working fine while
+/// the key is gone for good: `managed-agents.json` never carries the secret,
+/// so there is nothing left to recover from. Pure, so both wordings are
+/// unit-tested.
+pub(crate) fn key_refusal_message(pubkey: &str, known_missing: bool) -> String {
+    if known_missing {
         format!(
-            "agent {} has no private key available — the OS keyring may be unreachable. \
-             Refusing to start without an identity; retry once the keyring is reachable.",
-            record.pubkey
+            "agent {pubkey} has no private key: none inline and none in the OS keyring. \
+             The key is not recoverable from managed-agents.json, which never holds it — \
+             recreate the agent to mint a new identity."
         )
-    })
+    } else {
+        format!(
+            "agent {pubkey} has no private key available — the OS keyring may be unreachable. \
+             Refusing to start without an identity; retry once the keyring is reachable."
+        )
+    }
 }
 
 /// Read the raw unified store — keyed instances AND key-less definitions —
@@ -326,12 +380,16 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
         }
         if record.private_key_nsec.is_empty() {
             match store.load(&agent_keyring_name(&record.pubkey)) {
-                Ok(Some(nsec)) => record.private_key_nsec = nsec,
+                Ok(Some(nsec)) => {
+                    record.private_key_nsec = nsec;
+                    forget_key_missing(&record.pubkey);
+                }
                 Ok(None) => {
                     eprintln!(
                         "buzz-desktop: agent {} has no key in JSON or keyring",
                         record.pubkey
                     );
+                    note_key_missing(&record.pubkey);
                 }
                 // Outage, NOT absence: the key may exist in the keyring but is
                 // unreadable this boot. Leave it empty so the spawn path
@@ -342,6 +400,8 @@ fn hydrate_keys_with(store: &impl KeyStore, records: &mut [ManagedAgentRecord]) 
                          agent will be refused until the keyring is reachable",
                         record.pubkey
                     );
+                    // Not "missing": the key may well be there, unread.
+                    forget_key_missing(&record.pubkey);
                 }
             }
         } else {
