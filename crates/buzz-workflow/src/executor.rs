@@ -1377,6 +1377,70 @@ mod tests {
         assert_eq!(out, "abc123def456 said: P1 incident in production");
     }
 
+    /// A webhook trigger populates `channel_id` from the workflow and leaves
+    /// every other built-in empty; the body lands in `webhook_fields`.
+    fn make_webhook_trigger(body: &[(&str, &str)]) -> TriggerContext {
+        TriggerContext {
+            channel_id: "channel-uuid-here".to_owned(),
+            webhook_fields: body
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_webhook_field_named_after_a_builtin() {
+        let ctx = make_webhook_trigger(&[("text", "hello world")]);
+        let out = resolve_template("{{trigger.text}}", &ctx, &HashMap::new()).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn webhook_body_cannot_shadow_a_populated_builtin() {
+        let mut ctx = make_trigger();
+        ctx.webhook_fields
+            .insert("author".to_owned(), "spoofed".to_owned());
+        ctx.webhook_fields
+            .insert("text".to_owned(), "spoofed".to_owned());
+        let out =
+            resolve_template("{{trigger.author}}/{{trigger.text}}", &ctx, &HashMap::new()).unwrap();
+        assert_eq!(out, "abc123def456/P1 incident in production");
+    }
+
+    #[test]
+    fn builtin_with_no_webhook_field_still_resolves_empty() {
+        let ctx = make_webhook_trigger(&[]);
+        let out = resolve_template("[{{trigger.text}}]", &ctx, &HashMap::new()).unwrap();
+        assert_eq!(out, "[]");
+    }
+
+    #[tokio::test]
+    async fn condition_reads_webhook_field_named_after_a_builtin() {
+        let ctx = make_webhook_trigger(&[("text", "P1 incident")]);
+        let result =
+            evaluate_condition("str_contains(trigger_text, \"P1\")", &ctx, &HashMap::new())
+                .await
+                .unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn condition_keeps_a_populated_builtin_over_the_webhook_body() {
+        let mut ctx = make_trigger();
+        ctx.webhook_fields
+            .insert("text".to_owned(), "P1 incident".to_owned());
+        let result = evaluate_condition(
+            "str_contains(trigger_text, \"production\")",
+            &ctx,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result);
+    }
+
     #[test]
     fn resolve_webhook_field() {
         let mut ctx = make_trigger();
