@@ -449,7 +449,9 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
 
 fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        pubkey: String::new(),
+        // A provisioned agent always has a pubkey — that is what makes it
+        // addressable.
+        pubkey: format!("{name}-pubkey"),
         name: name.to_string(),
         persona_id: persona_id.map(|s| s.to_string()),
         private_key_nsec: String::new(),
