@@ -174,8 +174,11 @@ fn reconcile_inbound_persona_event_blocking(
         }
         KIND_TEAM => {
             let mut teams = load_teams(&app)?;
-            // Parsed and validated above, before retention.
-            apply_inbound_team(&mut teams, d_tag, inbound_team.expect("team parsed above"));
+            // Parsed and validated above, before retention. Mirrors the
+            // managed-agent branch below rather than asserting the invariant.
+            let team = inbound_team
+                .ok_or_else(|| "team content was not parsed before retention".to_string())?;
+            apply_inbound_team(&mut teams, d_tag, team);
             save_teams(&app, &teams)?;
         }
         KIND_MANAGED_AGENT => {
