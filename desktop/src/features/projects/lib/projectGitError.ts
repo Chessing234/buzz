@@ -67,6 +67,19 @@ export function projectCloneErrorPresentation(
         "Buzz clones over HTTPS only. Use the repository’s HTTPS clone URL instead of an SSH or git:// one.",
     };
   }
+  // A proxy or self-signed certificate in front of the host. "Try again"
+  // never resolves it; the certificate chain has to be trusted first.
+  if (
+    /ssl certificate problem|unable to get local issuer certificate|certificate verify failed|self[- ]signed certificate|gnutls_handshake|schannel: /.test(
+      message,
+    )
+  ) {
+    return {
+      title: "Couldn’t verify the server’s certificate",
+      description:
+        "The TLS certificate for this host could not be verified — often a corporate proxy or a self-signed certificate. Trust the certificate on this machine, then try again.",
+    };
+  }
   if (/\b404\b|repository not found|repository does not exist/.test(message)) {
     return {
       title: "Repository not found",

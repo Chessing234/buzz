@@ -100,3 +100,23 @@ test("names the transport for a git:// URL too", () => {
   );
 });
 
+test("explains a TLS certificate that could not be verified", () => {
+  const presentation = projectCloneErrorPresentation(
+    new Error(
+      "fatal: unable to access 'https://git.corp.example/app.git/': SSL certificate problem: self signed certificate in certificate chain",
+    ),
+    "https://git.corp.example/app.git",
+  );
+  assert.equal(presentation.title, "Couldn’t verify the server’s certificate");
+  assert.match(presentation.description, /proxy|self-signed/);
+});
+
+test("a certificate failure is not mistaken for an auth failure", () => {
+  assert.notEqual(
+    projectCloneErrorPresentation(
+      new Error("fatal: unable to access: certificate verify failed"),
+      "https://example.com/app.git",
+    ).title,
+    "Repository access required",
+  );
+});
