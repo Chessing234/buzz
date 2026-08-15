@@ -561,6 +561,64 @@ fn match_profiles_by_name(events: &[serde_json::Value], name: &str) -> Vec<(Stri
     matches
 }
 
+/// Channel type recorded on the relay's kind:39000 discovery event (`t` tag).
+fn channel_type_from_metadata(event: &serde_json::Value) -> Option<&str> {
+    event
+        .get("tags")?
+        .as_array()?
+        .iter()
+        .find_map(|tag| {
+            let tag = tag.as_array()?;
+            (tag.first()?.as_str()? == "t").then(|| tag.get(1)?.as_str())
+        })
+        .flatten()
+}
+
+/// Kind to publish when `--kind` was not given.
+///
+/// Desktop's forum surface lists kind:45001 topics and kind:45003 comments; a
+/// kind:9 event in a forum channel is accepted by the relay and then never
+/// appears in the topic list, so the send looks successful while the content
+/// is invisible where people read it. Match the channel's canonical surface
+/// instead of always defaulting to the stream kind.
+///
+/// `--broadcast` stays on kind:9: it is a stream-only concept, and an explicit
+/// flag should not be silently redirected to a different event kind.
+fn default_message_kind(channel_type: Option<&str>, is_reply: bool, broadcast: bool) -> u16 {
+    match channel_type {
+        Some("forum") if !broadcast => {
+            if is_reply {
+                45003
+            } else {
+                45001
+            }
+        }
+        _ => 9,
+    }
+}
+
+/// Read a channel's type from its kind:39000 discovery event.
+///
+/// Returns `None` when the relay has no metadata for the channel or the event
+/// carries no `t` tag — the caller then keeps the stream default rather than
+/// failing a send over a missing discovery event.
+async fn resolve_channel_type(
+    client: &BuzzClient,
+    channel_id: &str,
+) -> Result<Option<String>, CliError> {
+    let filter = serde_json::json!({
+        "kinds": [39000],
+        "#d": [channel_id],
+        "limit": 1,
+    });
+    let raw = client.query(&filter).await?;
+    let events: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+    Ok(events
+        .first()
+        .and_then(channel_type_from_metadata)
+        .map(str::to_owned))
+}
+
 pub struct SendMessageParams {
     pub channel_id: String,
     pub content: String,
@@ -643,7 +701,22 @@ pub async fn cmd_send_message(
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
 
-    let builder = match p.kind {
+    // Without an explicit --kind, follow the channel's canonical surface: a
+    // forum shows kind:45001 topics and kind:45003 comments, so a kind:9 event
+    // published there is accepted and then never listed.
+    let kind = match p.kind {
+        Some(k) => Some(k),
+        None => {
+            let channel_type = resolve_channel_type(client, &p.channel_id).await?;
+            Some(default_message_kind(
+                channel_type.as_deref(),
+                thread_ref.is_some(),
+                p.broadcast,
+            ))
+        }
+    };
+
+    let builder = match kind {
         Some(45001) => {
             buzz_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
                 .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
