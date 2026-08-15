@@ -1446,3 +1446,53 @@ mod tests {
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
     }
 }
+
+#[cfg(test)]
+mod default_kind_tests {
+    use super::{channel_type_from_metadata, default_message_kind};
+
+    fn metadata(tags: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "kind": 39000, "tags": tags })
+    }
+
+    #[test]
+    fn reads_the_channel_type_from_the_t_tag() {
+        let event = metadata(serde_json::json!([
+            ["d", "2cf6cfd0-b917-4ea0-b2d8-a29dea949b77"],
+            ["closed"],
+            ["t", "forum"],
+        ]));
+        assert_eq!(channel_type_from_metadata(&event), Some("forum"));
+    }
+
+    #[test]
+    fn missing_t_tag_reads_as_unknown() {
+        let event = metadata(serde_json::json!([["d", "x"], ["closed"]]));
+        assert_eq!(channel_type_from_metadata(&event), None);
+    }
+
+    #[test]
+    fn forum_root_defaults_to_a_topic() {
+        assert_eq!(default_message_kind(Some("forum"), false, false), 45001);
+    }
+
+    #[test]
+    fn forum_reply_defaults_to_a_comment() {
+        assert_eq!(default_message_kind(Some("forum"), true, false), 45003);
+    }
+
+    #[test]
+    fn stream_and_dm_keep_kind_nine() {
+        for channel_type in [Some("stream"), Some("dm"), Some("workflow"), None] {
+            assert_eq!(default_message_kind(channel_type, false, false), 9);
+            assert_eq!(default_message_kind(channel_type, true, false), 9);
+        }
+    }
+
+    #[test]
+    fn broadcast_stays_on_the_stream_kind() {
+        // --broadcast is stream-only; redirecting it to a forum kind would
+        // change what the flag does rather than where the message lands.
+        assert_eq!(default_message_kind(Some("forum"), false, true), 9);
+    }
+}
