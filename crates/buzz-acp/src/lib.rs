@@ -232,6 +232,31 @@ async fn is_owner_or_sibling(
 /// siblings may fire a turn — the explicit allowlist and `anyone` mode do
 /// NOT apply inside DMs. `Nobody` still drops everything. Callers must
 /// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
+/// Remembers which (channel, author) pairs have already been reported as
+/// dropped by the inbound author gate.
+///
+/// The gate is the quietest way an agent can ignore you: the event arrives,
+/// the agent is online, the mention is correct, and nothing happens. That drop
+/// was logged at `debug!`, which is off under the default `buzz_acp=info`
+/// filter — so from the operator's side there was no record at all, and
+/// diagnosing it meant reading the source (#5965, and the same silence in
+/// #1743 / #3015).
+///
+/// Report the first drop for each author in each channel at `info!` and keep
+/// the rest at `debug!`, so a chatty channel cannot turn a diagnostic into a
+/// flood.
+#[derive(Default)]
+struct AuthorGateReporter {
+    reported: HashSet<(Uuid, String)>,
+}
+
+impl AuthorGateReporter {
+    /// Whether this drop is the first for `author` in `channel_id`.
+    fn should_report(&mut self, channel_id: Uuid, author: &str) -> bool {
+        self.reported.insert((channel_id, author.to_string()))
+    }
+}
+
 async fn author_allowed(
     respond_to: &RespondTo,
     allowlist: &HashSet<String>,
@@ -2024,6 +2049,9 @@ async fn tokio_main() -> Result<()> {
         }
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
+    // First-drop-per-author reporting for the inbound author gate; see
+    // `AuthorGateReporter`.
+    let mut author_gate_reporter = AuthorGateReporter::default();
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -2852,13 +2880,27 @@ async fn tokio_main() -> Result<()> {
                                 )
                                 .await;
                                 if !allowed {
-                                    tracing::debug!(
-                                        channel_id = %buzz_event.channel_id,
-                                        author = %buzz_event.event.pubkey.to_hex(),
-                                        mode = %config.respond_to,
-                                        is_dm,
-                                        "inbound author gate — dropping event"
-                                    );
+                                    if author_gate_reporter
+                                        .should_report(buzz_event.channel_id, &author)
+                                    {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %author,
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "inbound author gate — dropping event; this author \
+                                             is not permitted to instruct the agent under the \
+                                             current --respond-to mode"
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            channel_id = %buzz_event.channel_id,
+                                            author = %author,
+                                            mode = %config.respond_to,
+                                            is_dm,
+                                            "inbound author gate — dropping event"
+                                        );
+                                    }
                                     continue;
                                 }
                             }
@@ -8672,5 +8714,44 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod author_gate_reporter_tests {
+    use super::AuthorGateReporter;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_first_drop_for_an_author_is_reported_once() {
+        let mut reporter = AuthorGateReporter::default();
+        let channel = Uuid::new_v4();
+        let author = "a".repeat(64);
+
+        assert!(reporter.should_report(channel, &author));
+        assert!(
+            !reporter.should_report(channel, &author),
+            "a chatty author must not turn one diagnostic into a flood"
+        );
+    }
+
+    #[test]
+    fn each_author_is_reported_on_its_own() {
+        let mut reporter = AuthorGateReporter::default();
+        let channel = Uuid::new_v4();
+
+        assert!(reporter.should_report(channel, &"a".repeat(64)));
+        assert!(reporter.should_report(channel, &"b".repeat(64)));
+    }
+
+    #[test]
+    fn the_same_author_is_reported_again_in_another_channel() {
+        // The gate's answer can differ per channel — a DM is resolved
+        // fail-closed — so a drop elsewhere is news.
+        let mut reporter = AuthorGateReporter::default();
+        let author = "a".repeat(64);
+
+        assert!(reporter.should_report(Uuid::new_v4(), &author));
+        assert!(reporter.should_report(Uuid::new_v4(), &author));
     }
 }
