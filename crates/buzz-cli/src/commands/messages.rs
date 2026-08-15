@@ -391,6 +391,46 @@ pub async fn cmd_get_messages(
     Ok(())
 }
 
+/// The channel an event says it belongs to, from its `h` tag.
+fn event_channel_id(event: &serde_json::Value) -> Option<&str> {
+    event
+        .get("tags")?
+        .as_array()?
+        .iter()
+        .find_map(|tag| {
+            let tag = tag.as_array()?;
+            (tag.first()?.as_str()? == "h").then(|| tag.get(1)?.as_str())
+        })
+        .flatten()
+}
+
+/// Fail when the thread root does not live in the requested channel.
+///
+/// Only the reply filter is scoped by `#h`; the root is fetched by id alone,
+/// so a `--channel` that does not match the event returns the root with none
+/// of its replies and exits 0. That is indistinguishable from a real thread
+/// with no replies, and reads as "nobody answered". Writes already reject the
+/// same mismatch ("parent event belongs to a different channel"); this makes
+/// the read say so too.
+fn check_thread_channel(
+    events: &[serde_json::Value],
+    event_id: &str,
+    channel_id: &str,
+) -> Result<(), CliError> {
+    let root = events
+        .iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(event_id));
+    let Some(actual) = root.and_then(event_channel_id) else {
+        return Ok(());
+    };
+    if actual == channel_id {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "event belongs to a different channel: --channel is {channel_id}, event {event_id} is in {actual}"
+    )))
+}
+
 pub async fn cmd_get_thread(
     client: &BuzzClient,
     channel_id: &str,
@@ -421,6 +461,7 @@ pub async fn cmd_get_thread(
     });
     let resp = client.query_multi(&[reply_filter, root_filter]).await?;
     let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    check_thread_channel(&events, event_id, channel_id)?;
     events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
