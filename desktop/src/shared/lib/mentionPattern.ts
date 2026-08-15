@@ -73,7 +73,11 @@ export function buildPrefixPattern(
   }
 
   const nameAlternatives = sorted.map((name) => escapeRegExp(name)).join("|");
-  const boundary = "(?=[\\s,;.!?:)\\]}]|$)";
+  // A possessive still mentions the person, so the apostrophe closes a
+  // mention — both the straight one and the curly U+2019 that macOS
+  // substitutes while you type. `hasMention` (which decides the p-tag) uses
+  // the same set; the two must agree or a tagged mention renders unstyled.
+  const boundary = "(?=[\\s,;.!?:)\\]}'\u2019]|$)";
   return new RegExp(
     `${lead}${escapedPrefix}(?:${nameAlternatives})${boundary}`,
     "gi",
