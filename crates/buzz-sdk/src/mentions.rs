@@ -457,6 +457,47 @@ mod tests {
     }
 
     #[test]
+    fn markdown_wrapped_mentions_are_extracted() {
+        // Agents are instructed to write GitHub-flavored Markdown, and Buzz
+        // Desktop renders every one of these as a mention. Extracting nothing
+        // here publishes a message that reads as addressed to the agent and
+        // carries no `p` tag to wake it.
+        assert_eq!(extract_at_names("**@fizz** please look"), vec!["fizz"]);
+        assert_eq!(extract_at_names("(@fizz can you check?)"), vec!["fizz"]);
+        assert_eq!(extract_at_names("||@fizz||"), vec!["fizz"]);
+    }
+
+    #[test]
+    fn markdown_wrapped_known_names_are_extracted() {
+        let known = ["Will Pfleger"];
+        assert_eq!(
+            extract_at_mentions_with_known("**@Will Pfleger** ping", &known),
+            vec!["will pfleger"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("(@Will Pfleger)", &known),
+            vec!["will pfleger"]
+        );
+        assert_eq!(
+            extract_at_mentions_with_known("_@Will Pfleger_ ping", &known),
+            vec!["will pfleger"]
+        );
+        // `_` is a legal name character, so an unknown name keeps it — the
+        // member list is what disambiguates.
+        assert_eq!(extract_at_names("_@fizz_"), vec!["fizz_"]);
+    }
+
+    #[test]
+    fn an_at_inside_a_word_is_still_not_a_mention() {
+        // The opener set gains markdown punctuation only — an alphanumeric or
+        // any other character before the `@` still means "not a mention".
+        assert!(extract_at_names("user@example.com").is_empty());
+        assert!(extract_at_names("path/to@thing").is_empty());
+        assert!(extract_at_names("a-@fizz").is_empty());
+        assert!(extract_at_mentions_with_known("user@fizz", &["fizz"]).is_empty());
+    }
+
+    #[test]
     fn known_multiword_name_matches_fully() {
         // "Will Pfleger" should match @Will Pfleger, not just @Will.
         let result = extract_at_mentions_with_known("hello @Will Pfleger!", &["Will Pfleger"]);
