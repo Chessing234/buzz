@@ -23,6 +23,24 @@ export function projectCloneErrorPresentation(
   const message = errorText(error);
   const github = isGitHubUrl(cloneUrl);
 
+  // Buzz runs git with `credential.helper` cleared, `GIT_CONFIG_GLOBAL`
+  // pointed at /dev/null and `GIT_TERMINAL_PROMPT=0` (`project_git_exec.rs`)
+  // — deliberately, because every process git spawns inherits an environment
+  // holding NOSTR_PRIVATE_KEY. A private HTTPS remote therefore fails with
+  // git's non-interactive credential error, which matches none of the auth
+  // patterns below and lands on "try again" — advice that can never work.
+  if (
+    /could not read (?:username|password)|terminal prompts disabled|no such device or address|device not configured/.test(
+      message,
+    )
+  ) {
+    return {
+      title: "Repository needs credentials Buzz can’t supply",
+      description: github
+        ? "Buzz clones with credential helpers disabled, so a private GitHub repository over HTTPS cannot authenticate. Use the SSH clone URL, or announce the repository on your Buzz relay."
+        : "Buzz clones with credential helpers disabled, so this repository cannot authenticate over HTTPS. Use an SSH clone URL, or announce the repository on your Buzz relay.",
+    };
+  }
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied|ssh certificate/.test(
       message,

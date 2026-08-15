@@ -37,3 +37,44 @@ test("uses a concise fallback", () => {
       "Try again. If the problem continues, contact the repository owner.",
   });
 });
+
+test("explains git's non-interactive credential failure instead of 'try again'", () => {
+  // Buzz clears credential.helper and sets GIT_TERMINAL_PROMPT=0, so a private
+  // HTTPS remote fails here — not with a 401/403 the auth branch would catch.
+  const presentation = projectCloneErrorPresentation(
+    new Error(
+      "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    ),
+    "https://github.com/example/private.git",
+  );
+  assert.equal(
+    presentation.title,
+    "Repository needs credentials Buzz can’t supply",
+  );
+  assert.match(presentation.description, /SSH clone URL/);
+  assert.doesNotMatch(presentation.description, /Try again/);
+});
+
+test("covers the no-tty wording git uses without GIT_TERMINAL_PROMPT", () => {
+  const presentation = projectCloneErrorPresentation(
+    new Error(
+      "fatal: could not read Username for 'https://example.com': No such device or address",
+    ),
+    "https://example.com/team/app.git",
+  );
+  assert.equal(
+    presentation.title,
+    "Repository needs credentials Buzz can’t supply",
+  );
+  assert.match(presentation.description, /SSH clone URL/);
+});
+
+test("still routes a real 403 to the access-required message", () => {
+  assert.equal(
+    projectCloneErrorPresentation(
+      new Error("fatal: requested URL returned error: 403"),
+      "https://github.com/example/app.git",
+    ).title,
+    "Repository access required",
+  );
+});
