@@ -1414,3 +1414,60 @@ mod tests {
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
     }
 }
+
+#[cfg(test)]
+mod thread_channel_tests {
+    use super::check_thread_channel;
+
+    const ROOT: &str = "0a9882747d0029df3fc9742b0755068a4ae24426b7e1f18cf44800409fdb437f";
+    const CHANNEL_A: &str = "2cf6cfd0-b917-4ea0-b2d8-a29dea949b77";
+    const CHANNEL_B: &str = "17c553b9-363f-461a-8f46-ae11f765ea3b";
+
+    fn root_event(channel: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": ROOT,
+            "tags": [["h", channel], ["p", "abc"]],
+        })
+    }
+
+    #[test]
+    fn accepts_a_root_in_the_requested_channel() {
+        assert!(check_thread_channel(&[root_event(CHANNEL_A)], ROOT, CHANNEL_A).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_root_from_another_channel() {
+        let err = check_thread_channel(&[root_event(CHANNEL_A)], ROOT, CHANNEL_B).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(CHANNEL_A),
+            "error must name the real channel: {msg}"
+        );
+        assert!(
+            msg.contains(CHANNEL_B),
+            "error must name the requested channel: {msg}"
+        );
+    }
+
+    #[test]
+    fn ignores_replies_when_locating_the_root() {
+        // Only the event whose id matches is checked; a reply carrying some
+        // other channel tag must not decide the outcome.
+        let events = vec![
+            serde_json::json!({"id": "deadbeef", "tags": [["h", CHANNEL_B]]}),
+            root_event(CHANNEL_A),
+        ];
+        assert!(check_thread_channel(&events, ROOT, CHANNEL_A).is_ok());
+    }
+
+    #[test]
+    fn passes_through_when_the_root_was_not_returned() {
+        assert!(check_thread_channel(&[], ROOT, CHANNEL_A).is_ok());
+    }
+
+    #[test]
+    fn passes_through_when_the_root_has_no_h_tag() {
+        let event = serde_json::json!({"id": ROOT, "tags": [["p", "abc"]]});
+        assert!(check_thread_channel(&[event], ROOT, CHANNEL_A).is_ok());
+    }
+}
