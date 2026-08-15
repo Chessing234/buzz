@@ -290,8 +290,9 @@ pub fn build_eval_context(
     )
     .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
 
-    // Register webhook fields first as `trigger_FIELD` so that standard trigger
-    // fields inserted below always take precedence and cannot be spoofed.
+    // Register webhook fields first as `trigger_FIELD` so that populated
+    // standard trigger fields inserted below take precedence and cannot be
+    // spoofed.
     for (key, val) in &trigger_ctx.webhook_fields {
         // Skip any key that would collide with a standard trigger_ or steps_ variable.
         if key.starts_with("trigger_") || key.starts_with("steps_") {
@@ -303,16 +304,21 @@ pub fn build_eval_context(
     }
 
     let trigger_fields = [
-        ("trigger_text", trigger_ctx.text.as_str()),
-        ("trigger_author", trigger_ctx.author.as_str()),
-        ("trigger_channel_id", trigger_ctx.channel_id.as_str()),
-        ("trigger_timestamp", trigger_ctx.timestamp.as_str()),
-        ("trigger_emoji", trigger_ctx.emoji.as_str()),
-        ("trigger_message_id", trigger_ctx.message_id.as_str()),
+        ("trigger_text", "text"),
+        ("trigger_author", "author"),
+        ("trigger_channel_id", "channel_id"),
+        ("trigger_timestamp", "timestamp"),
+        ("trigger_emoji", "emoji"),
+        ("trigger_message_id", "message_id"),
     ];
 
-    for (name, val) in &trigger_fields {
-        ctx.set_value((*name).into(), Value::String((*val).to_owned()))
+    // Resolved through `get_field`, so a condition sees the same value a
+    // template does: a populated built-in still overwrites the webhook entry
+    // registered above, but an empty one no longer blanks a body key that
+    // happens to share its name.
+    for (var_name, field) in &trigger_fields {
+        let val = trigger_ctx.get_field(field).unwrap_or_default();
+        ctx.set_value((*var_name).into(), Value::String(val.to_owned()))
             .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
     }
 
