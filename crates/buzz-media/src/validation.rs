@@ -19,6 +19,15 @@ const MP4_BRANDS: &[[u8; 4]] = &[
     *b"mp41", *b"mp42", *b"avc1", *b"dash", *b"M4V ",
 ];
 
+/// ISO-BMFF major brands that declare an audio-only container.
+///
+/// An Apple Voice Memo is `M4A ` with `isom`/`mp42` among its *compatible*
+/// brands, so the compatible-brand list cannot distinguish it from video —
+/// only the major brand can.
+const AUDIO_ONLY_BRANDS: &[[u8; 4]] = &[
+    *b"M4A ", *b"M4B ", *b"M4P ", *b"M4R ", *b"F4A ", *b"F4B ", *b"mp4a",
+];
+
 fn iso_bmff_ftyp_payload(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
         return None;
@@ -47,6 +56,21 @@ fn iso_bmff_ftyp_payload(bytes: &[u8]) -> Option<&[u8]> {
 /// `ftyp` box, independent of the request MIME type or `infer`'s brand list.
 pub fn looks_like_iso_bmff(bytes: &[u8]) -> bool {
     iso_bmff_ftyp_payload(bytes).is_some()
+}
+
+/// Return whether the leading bytes are an ISO-BMFF container whose *major*
+/// brand declares audio-only content (`M4A `, `M4B `, …).
+///
+/// Such a file has no video track, so putting it through the video validator
+/// can only fail — and fails with a message about the moov atom that says
+/// nothing about the real problem.
+pub fn looks_like_audio_iso_bmff(bytes: &[u8]) -> bool {
+    let Some(payload) = iso_bmff_ftyp_payload(bytes) else {
+        return false;
+    };
+    payload[..4]
+        .try_into()
+        .is_ok_and(|brand: [u8; 4]| AUDIO_ONLY_BRANDS.contains(&brand))
 }
 
 pub(crate) fn looks_like_mp4_iso_bmff(bytes: &[u8]) -> bool {
@@ -1531,6 +1555,7 @@ mod tests {
         assert!(infer::get(proprietary_major).is_none());
         assert!(looks_like_iso_bmff(proprietary_major));
         assert!(looks_like_mp4_iso_bmff(proprietary_major));
+        assert!(!looks_like_audio_iso_bmff(proprietary_major));
         assert!(
             matches!(validate_file_content(proprietary_major, &config), Err(MediaError::DisallowedContentType(m)) if m == "application/iso-bmff")
         );
@@ -2682,5 +2707,62 @@ mod tests {
         assert!(!serve_inline("application/octet-stream"));
         assert!(!serve_inline("audio/mpeg"));
         assert!(!serve_inline("text/plain"));
+    }
+}
+
+#[cfg(test)]
+mod audio_iso_bmff_tests {
+    use super::{looks_like_audio_iso_bmff, looks_like_iso_bmff};
+
+    /// `ftyp` box: size, "ftyp", major brand, minor version, compatible brands.
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let size = 16 + 4 * compatible.len();
+        let mut bytes = (size as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(major);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        for brand in compatible {
+            bytes.extend_from_slice(*brand);
+        }
+        bytes
+    }
+
+    #[test]
+    fn an_apple_voice_memo_is_recognised_as_audio() {
+        // A Voice Memo carries isom/mp42 as *compatible* brands, so only the
+        // major brand tells it apart from video.
+        let memo = ftyp(b"M4A ", &[b"M4A ", b"mp42", b"isom"]);
+        assert!(looks_like_iso_bmff(&memo));
+        assert!(looks_like_audio_iso_bmff(&memo));
+    }
+
+    #[test]
+    fn the_other_apple_audio_brands_are_recognised_too() {
+        for major in [b"M4B ", b"M4P ", b"M4R ", b"F4A ", b"F4B ", b"mp4a"] {
+            let bytes = ftyp(major, &[b"isom"]);
+            assert!(
+                looks_like_audio_iso_bmff(&bytes),
+                "{}",
+                String::from_utf8_lossy(major)
+            );
+        }
+    }
+
+    #[test]
+    fn an_mp4_video_is_not_audio() {
+        for major in [b"isom", b"mp42", b"avc1", b"M4V "] {
+            let bytes = ftyp(major, &[b"isom", b"mp42"]);
+            assert!(
+                !looks_like_audio_iso_bmff(&bytes),
+                "{}",
+                String::from_utf8_lossy(major)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_iso_bmff_file_is_not_audio() {
+        assert!(!looks_like_audio_iso_bmff(b"\x89PNG\r\n\x1a\n"));
+        assert!(!looks_like_audio_iso_bmff(&[]));
     }
 }
