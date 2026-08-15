@@ -18,7 +18,7 @@ use nostr::Timestamp;
 
 use crate::client::{normalize_write_response, BuzzClient};
 use crate::error::CliError;
-use crate::validate::validate_hex64;
+use crate::validate::parse_hex64;
 use crate::{ModerationCmd, OutputFormat};
 
 /// Resolve `--expires-in <secs>` / `--expires-at <unix>` into an absolute
@@ -38,7 +38,7 @@ async fn cmd_ban(
     expires_at: Option<u64>,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_hex64(pubkey)?;
+    let pubkey = &parse_hex64(pubkey)?;
     let expiry = resolve_expiry(expires_in, expires_at);
     let builder = buzz_sdk::build_moderation_ban(pubkey, expiry, reason)
         .map_err(|e| CliError::Usage(format!("invalid ban: {e}")))?;
@@ -49,7 +49,7 @@ async fn cmd_ban(
 }
 
 async fn cmd_unban(client: &BuzzClient, pubkey: &str) -> Result<(), CliError> {
-    validate_hex64(pubkey)?;
+    let pubkey = &parse_hex64(pubkey)?;
     let builder = buzz_sdk::build_moderation_unban(pubkey)
         .map_err(|e| CliError::Usage(format!("invalid unban: {e}")))?;
     let event = client.sign_event(builder)?;
@@ -65,7 +65,7 @@ async fn cmd_timeout(
     expires_at: Option<u64>,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_hex64(pubkey)?;
+    let pubkey = &parse_hex64(pubkey)?;
     let expiry = resolve_expiry(expires_in, expires_at)
         .ok_or_else(|| CliError::Usage("timeout requires --expires-in or --expires-at".into()))?;
     let builder = buzz_sdk::build_moderation_timeout(pubkey, expiry, reason)
@@ -77,7 +77,7 @@ async fn cmd_timeout(
 }
 
 async fn cmd_untimeout(client: &BuzzClient, pubkey: &str) -> Result<(), CliError> {
-    validate_hex64(pubkey)?;
+    let pubkey = &parse_hex64(pubkey)?;
     let builder = buzz_sdk::build_moderation_untimeout(pubkey)
         .map_err(|e| CliError::Usage(format!("invalid untimeout: {e}")))?;
     let event = client.sign_event(builder)?;
@@ -93,7 +93,7 @@ async fn cmd_resolve(
     action: &str,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
-    validate_hex64(report)?;
+    let report = &parse_hex64(report)?;
     let builder = buzz_sdk::build_moderation_resolve_report(report, status, action, reason)
         .map_err(|e| CliError::Usage(format!("invalid resolution: {e}")))?;
     let event = client.sign_event(builder)?;
