@@ -51,7 +51,7 @@ test("explains git's non-interactive credential failure instead of 'try again'",
     presentation.title,
     "Repository needs credentials Buzz can’t supply",
   );
-  assert.match(presentation.description, /SSH clone URL/);
+  assert.match(presentation.description, /Buzz relay/);
   assert.doesNotMatch(presentation.description, /Try again/);
 });
 
@@ -66,7 +66,7 @@ test("covers the no-tty wording git uses without GIT_TERMINAL_PROMPT", () => {
     presentation.title,
     "Repository needs credentials Buzz can’t supply",
   );
-  assert.match(presentation.description, /SSH clone URL/);
+  assert.match(presentation.description, /Buzz relay/);
 });
 
 test("still routes a real 403 to the access-required message", () => {

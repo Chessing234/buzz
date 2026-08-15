@@ -37,8 +37,8 @@ export function projectCloneErrorPresentation(
     return {
       title: "Repository needs credentials Buzz can’t supply",
       description: github
-        ? "Buzz clones with credential helpers disabled, so a private GitHub repository over HTTPS cannot authenticate. Use the SSH clone URL, or announce the repository on your Buzz relay."
-        : "Buzz clones with credential helpers disabled, so this repository cannot authenticate over HTTPS. Use an SSH clone URL, or announce the repository on your Buzz relay.",
+        ? "Buzz clones with credential helpers disabled, so a private GitHub repository over HTTPS cannot authenticate. Announce the repository on your Buzz relay to clone it through Buzz."
+        : "Buzz clones with credential helpers disabled, so this repository cannot authenticate over HTTPS. Announce the repository on your Buzz relay to clone it through Buzz.",
     };
   }
   if (
