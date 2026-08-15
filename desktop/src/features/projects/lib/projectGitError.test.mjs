@@ -78,3 +78,25 @@ test("still routes a real 403 to the access-required message", () => {
     "Repository access required",
   );
 });
+
+test("names the transport when a pasted SSH URL is refused outright", () => {
+  // `configure_git_auth` allows only http/https, so git refuses before it
+  // ever reaches the network — retrying can never help.
+  const presentation = projectCloneErrorPresentation(
+    new Error("fatal: transport 'ssh' not allowed"),
+    "git@github.com:example/app.git",
+  );
+  assert.equal(presentation.title, "Clone URL uses an unsupported transport");
+  assert.match(presentation.description, /HTTPS clone URL/);
+});
+
+test("names the transport for a git:// URL too", () => {
+  assert.equal(
+    projectCloneErrorPresentation(
+      new Error("fatal: transport 'git' not allowed"),
+      "git://example.com/app.git",
+    ).title,
+    "Clone URL uses an unsupported transport",
+  );
+});
+

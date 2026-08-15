@@ -53,6 +53,20 @@ export function projectCloneErrorPresentation(
         : "Buzz could not authenticate with this repository. Check your access and try again.",
     };
   }
+  // `configure_git_auth` allows only http/https (and file, on request), so a
+  // pasted `git@host:repo` URL never reaches the network: git refuses the
+  // transport outright. Retrying cannot change that — the URL has to change.
+  if (
+    /transport '[^']+' not allowed|protocol '[^']+' is not supported/.test(
+      message,
+    )
+  ) {
+    return {
+      title: "Clone URL uses an unsupported transport",
+      description:
+        "Buzz clones over HTTPS only. Use the repository’s HTTPS clone URL instead of an SSH or git:// one.",
+    };
+  }
   if (/\b404\b|repository not found|repository does not exist/.test(message)) {
     return {
       title: "Repository not found",
