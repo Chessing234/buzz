@@ -24,6 +24,30 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// Actionable advice for a keyring failure that retrying will never clear.
+///
+/// The generic "retry once the keyring is reachable" wording is wrong for
+/// these: the backend *is* reachable and the service *is* running — it simply
+/// will not accept another entry. Returns `None` when the error is one of the
+/// ordinary transient kinds, where the existing wording is right.
+///
+/// Windows `CredWriteW` reports a full credential store as error code 8,
+/// `ERROR_NOT_ENOUGH_MEMORY`, which reads like a memory problem and is not one
+/// (#5956). `cmdkey /generic:test /user:test /pass:test` fails the same way on
+/// an affected machine, so it is not specific to Buzz.
+pub fn keyring_failure_advice(error: &str) -> Option<&'static str> {
+    let lowered = error.to_ascii_lowercase();
+    let store_is_full = lowered.contains("windows error code 8")
+        || lowered.contains("error_not_enough_memory")
+        || (lowered.contains("os error 8") && lowered.contains("keyring"));
+    if store_is_full {
+        return Some(
+            "The Windows Credential Manager will not accept another entry.              Remove unused entries under Control Panel \u{2192} User Accounts \u{2192}              Credential Manager \u{2192} Windows Credentials, then start Buzz again.              Retrying or rebooting will not help on its own.",
+        );
+    }
+    None
+}
+
 /// Result of probing the keyring before a migration: distinguishes "reachable
 /// but holds no entry" (safe to migrate into) from "unreachable this boot"
 /// (must NOT migrate — re-importing from a leftover plaintext file could
@@ -1302,5 +1326,41 @@ mod tests {
         );
         // Agent key should also be gone.
         assert_eq!(store3.load("agent:abc123").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod keyring_failure_advice_tests {
+    use super::keyring_failure_advice;
+
+    #[test]
+    fn a_full_windows_credential_store_gets_actionable_advice() {
+        let advice = keyring_failure_advice(
+            "keyring write: Platform secure storage failure: Windows error code 8",
+        )
+        .expect("advice for a full credential store");
+        assert!(advice.contains("Credential Manager"), "{advice}");
+        assert!(
+            advice.contains("not help"),
+            "the advice must say retrying is pointless: {advice}"
+        );
+    }
+
+    #[test]
+    fn the_symbolic_spelling_is_recognised_too() {
+        assert!(keyring_failure_advice("CredWrite failed: ERROR_NOT_ENOUGH_MEMORY").is_some());
+    }
+
+    #[test]
+    fn an_ordinary_failure_keeps_the_existing_wording() {
+        // These are the transient kinds the generic "retry once the keyring is
+        // reachable" message is actually right about.
+        for error in [
+            "keyring write: No such file or directory",
+            "keyring entry: Platform secure storage failure: the user cancelled",
+            "keyring write: Access denied",
+        ] {
+            assert_eq!(keyring_failure_advice(error), None, "{error}");
+        }
     }
 }
