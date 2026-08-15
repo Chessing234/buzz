@@ -46,15 +46,31 @@ impl TriggerContext {
     ///
     /// Returns `Some(&str)` for known fields; for webhook triggers, also
     /// checks `webhook_fields`. Returns `None` for unknown names.
+    ///
+    /// A built-in field that the trigger actually populated always wins, so a
+    /// webhook body cannot spoof `author` or `channel_id` on a trigger that
+    /// sets them. A webhook trigger leaves every built-in but `channel_id`
+    /// empty, though, so a body key named after one — `text` is the obvious
+    /// one — would otherwise resolve to that empty default and the posted
+    /// value would be unreachable from a template. Fall back to the body in
+    /// exactly that case: the built-in carries nothing to shadow it with.
     pub fn get_field(&self, name: &str) -> Option<&str> {
-        match name {
+        let builtin = match name {
             "text" => Some(&self.text),
             "author" => Some(&self.author),
             "channel_id" => Some(&self.channel_id),
             "timestamp" => Some(&self.timestamp),
             "emoji" => Some(&self.emoji),
             "message_id" => Some(&self.message_id),
-            other => self.webhook_fields.get(other).map(|s| s.as_str()),
+            _ => None,
+        };
+        match builtin {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => self
+                .webhook_fields
+                .get(name)
+                .map(|s| s.as_str())
+                .or(builtin.map(|s| s.as_str())),
         }
     }
 }
