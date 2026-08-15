@@ -531,6 +531,55 @@ fn test_render_dynamic_section_agent_no_persona() {
     assert!(output.contains("| Scout | — | @Scout |"));
 }
 
+/// A create that failed partway through: the row persists with no pubkey,
+/// relay URL or command, so it can never run and can never be addressed.
+fn make_unprovisioned_agent(name: &str) -> ManagedAgentRecord {
+    ManagedAgentRecord {
+        pubkey: String::new(),
+        relay_url: String::new(),
+        agent_command: String::new(),
+        ..make_agent(name, None)
+    }
+}
+
+#[test]
+fn test_render_dynamic_section_skips_unprovisioned_agents() {
+    let personas = vec![make_persona("p1", "Builder")];
+    let agents = vec![
+        make_agent("Kit", Some("p1")),
+        make_unprovisioned_agent("Ghost"),
+    ];
+    let output = render_dynamic_section(&personas, &agents, "ws://example.com:3000");
+    assert!(output.contains("| Kit | Builder | @Kit |"));
+    assert!(
+        !output.contains("Ghost"),
+        "an agent with no pubkey cannot be addressed: {output}"
+    );
+}
+
+#[test]
+fn test_render_dynamic_section_all_unprovisioned_reads_as_empty() {
+    let agents = vec![
+        make_unprovisioned_agent("Ghost"),
+        make_unprovisioned_agent("Wraith"),
+    ];
+    let output = render_dynamic_section(&[], &agents, "ws://example.com:3000");
+    assert!(
+        output.contains("No agents deployed yet"),
+        "a table of unaddressable rows is worse than saying there are none: {output}"
+    );
+}
+
+#[test]
+fn test_render_dynamic_section_skips_blank_named_agents() {
+    let agents = vec![ManagedAgentRecord {
+        name: "   ".to_string(),
+        ..make_agent("Kit", None)
+    }];
+    let output = render_dynamic_section(&[], &agents, "ws://example.com:3000");
+    assert!(output.contains("No agents deployed yet"), "{output}");
+}
+
 #[test]
 fn test_upsert_managed_section_with_markers() {
     let tmp = tempfile::tempdir().unwrap();

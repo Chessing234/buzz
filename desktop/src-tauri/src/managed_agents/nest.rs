@@ -523,11 +523,25 @@ fn escape_md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
+/// Whether a record describes an agent another agent could actually reach.
+///
+/// A create that fails partway through still leaves its row in
+/// `managed-agents.json`, with an empty pubkey, relay URL and command. Such a
+/// row can never run and can never be addressed, so listing it under "How to
+/// address" hands agents a `@name` that goes nowhere (#5786).
+fn is_addressable(agent: &ManagedAgentRecord) -> bool {
+    !agent.pubkey.trim().is_empty() && !agent.name.trim().is_empty()
+}
+
 pub fn render_dynamic_section(
     personas: &[AgentDefinition],
     agents: &[ManagedAgentRecord],
     relay_url: &str,
 ) -> String {
+    let agents: Vec<&ManagedAgentRecord> = agents
+        .iter()
+        .filter(|agent| is_addressable(agent))
+        .collect();
     let active_agents = if agents.is_empty() {
         "## Active Agents\n\n*(No agents deployed yet. Add agents in the Buzz desktop app.)*"
             .to_string()
