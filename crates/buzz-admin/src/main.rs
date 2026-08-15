@@ -719,3 +719,48 @@ async fn reconcile_channels(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod auth_tag_tests {
+    use super::{owner_key_source, OwnerKeySource};
+    use nostr::Keys;
+
+    #[test]
+    fn no_flag_reads_the_environment() {
+        assert_eq!(owner_key_source(None).unwrap(), OwnerKeySource::Env);
+    }
+
+    #[test]
+    fn a_dash_reads_stdin() {
+        assert_eq!(owner_key_source(Some("-")).unwrap(), OwnerKeySource::Stdin);
+    }
+
+    #[test]
+    fn a_literal_secret_on_the_flag_is_refused() {
+        // argv is world-readable via `ps` and lands in shell history, so the
+        // flag must not become a second way to leak the owner key.
+        let err = owner_key_source(Some(&"a".repeat(64))).unwrap_err();
+        assert!(err.contains("BUZZ_OWNER_PRIVATE_KEY"), "{err}");
+    }
+
+    #[test]
+    fn the_emitted_tag_verifies_for_the_agent_it_names() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
+            .expect("compute");
+        let recovered =
+            buzz_sdk::nip_oa::verify_auth_tag(&tag, &agent.public_key()).expect("verify");
+        assert_eq!(recovered, owner.public_key());
+    }
+
+    #[test]
+    fn the_emitted_tag_does_not_verify_for_another_agent() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let other = Keys::generate();
+        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
+            .expect("compute");
+        assert!(buzz_sdk::nip_oa::verify_auth_tag(&tag, &other.public_key()).is_err());
+    }
+}
