@@ -39,3 +39,23 @@ describe("getInitials beyond the BMP", () => {
     assert.equal(getInitials("\u{1D400}da Lovelace"), "\u{1D400}L");
   });
 });
+
+describe("getInitials with combining marks", () => {
+  it("does not split a word at a vowel sign", () => {
+    // अनिल कुमार — the vowel sign in अनिल used to split the word, so the
+    // second initial came from the middle of the first name.
+    assert.equal(getInitials("अनिल कुमार"), "अक");
+  });
+
+  it("gives a one-word name one initial", () => {
+    assert.equal(getInitials("नमस्ते"), "न");
+  });
+
+  it("handles a Burmese name the same way", () => {
+    assert.equal(getInitials("မောင်မောင်"), "မ");
+  });
+
+  it("still strips punctuation that is not a mark", () => {
+    assert.equal(getInitials("B (relay)"), "BR");
+  });
+});
