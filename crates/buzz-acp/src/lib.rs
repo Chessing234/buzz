@@ -232,8 +232,9 @@ async fn is_owner_or_sibling(
 /// siblings may fire a turn — the explicit allowlist and `anyone` mode do
 /// NOT apply inside DMs. `Nobody` still drops everything. Callers must
 /// resolve `is_dm` fail-closed: unknown channel type ⇒ treat as DM.
-/// Remembers which (channel, author) pairs have already been reported as
-/// dropped by the inbound author gate.
+/// Remembers which (channel, subject) pairs have already been reported as
+/// dropped — by author for the inbound author gate, by event kind for a
+/// subscription miss.
 ///
 /// The gate is the quietest way an agent can ignore you: the event arrives,
 /// the agent is online, the mention is correct, and nothing happens. That drop
@@ -2052,6 +2053,8 @@ async fn tokio_main() -> Result<()> {
     // First-drop-per-author reporting for the inbound author gate; see
     // `AuthorGateReporter`.
     let mut author_gate_reporter = AuthorGateReporter::default();
+    // Same treatment for the subscription miss below, keyed by event kind.
+    let mut subscription_reporter = AuthorGateReporter::default();
 
     let mut relay_observer_control_rx = None;
     let mut relay_observer_publisher_task = None;
@@ -2909,7 +2912,19 @@ async fn tokio_main() -> Result<()> {
                             let prompt_tag = match matched {
                                 Some(m) => m.prompt_tag,
                                 None => {
-                                    tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
+                                    if subscription_reporter.should_report(
+                                        buzz_event.channel_id,
+                                        &buzz_event.event.kind.as_u16().to_string(),
+                                    ) {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            kind = buzz_event.event.kind.as_u16(),
+                                            "event matched no rule — dropping; this kind is \
+                                             not covered by the agent's subscription"
+                                        );
+                                    } else {
+                                        tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
+                                    }
                                     continue;
                                 }
                             };
