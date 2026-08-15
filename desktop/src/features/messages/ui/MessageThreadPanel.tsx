@@ -34,6 +34,7 @@ import {
   AuxiliaryPanelTitle,
 } from "@/shared/layout/AuxiliaryPanel";
 import {
+  COMPOSER_ACTIVITY_ROW_CLASS,
   THREAD_PANEL_COLUMN_CLASS,
   THREAD_PANEL_COMPOSER_GUTTER_CLASS,
   THREAD_PANEL_MESSAGE_GUTTER_CLASS,
@@ -928,7 +929,7 @@ export function MessageThreadPanel({
               className={THREAD_PANEL_COMPOSER_GUTTER_CLASS}
               visible={hasComposerBottomActivity}
             >
-              <div className="mx-auto flex w-full max-w-4xl items-center gap-2 overflow-visible pl-2">
+              <div className={COMPOSER_ACTIVITY_ROW_CLASS}>
                 {activityAccessoryVisible && activityAccessoryContent ? (
                   <div className="flex min-w-0 flex-1 overflow-visible">
                     {activityAccessoryContent}

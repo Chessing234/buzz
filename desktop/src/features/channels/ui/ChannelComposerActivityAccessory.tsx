@@ -3,6 +3,7 @@ import type { ComponentProps } from "react";
 import { CardMintComposerChip } from "@/features/agents/ui/CardMintComposerChip";
 import { useCardMintJobs } from "@/features/agents/cardMintStore";
 import { BotActivityComposerAction } from "@/features/channels/ui/BotActivityBar";
+import { COMPOSER_ACTIVITY_ROW_CLASS } from "@/features/messages/lib/messageThreadPanelLayout";
 import { ComposerActivityAccessory } from "@/features/messages/ui/ComposerActivityAccessory";
 import { TypingIndicatorRow } from "@/features/messages/ui/TypingIndicatorRow";
 
@@ -40,7 +41,7 @@ export function ChannelComposerActivityAccessory({
       testId="channel-composer-activity-row"
       visible={visible}
     >
-      <div className="flex w-full items-center gap-2 overflow-visible pl-2">
+      <div className={COMPOSER_ACTIVITY_ROW_CLASS}>
         {cardMintJobs.length > 0 ? <CardMintComposerChip /> : null}
         {workingBotPubkeys.length > 0 ? (
           <div className="flex min-w-0 flex-1 overflow-visible">
