@@ -76,6 +76,33 @@ enum Command {
     ListMembers,
     /// Generate a new Nostr keypair (for bootstrapping).
     GenerateKey,
+    /// Compute a NIP-OA `auth` tag authorizing an agent key.
+    ///
+    /// Starting an agent on a machine the Desktop app cannot reach needs this
+    /// tag, and the only way to produce one was
+    /// `cargo run --example compute_auth_tag` — i.e. a source checkout and a
+    /// release build. This binary already ships in the image beside
+    /// `generate-key`, which is where the rest of that bootstrap happens.
+    ///
+    /// The owner secret is read from `BUZZ_OWNER_PRIVATE_KEY`, or from stdin
+    /// with `--owner-key -`. It is deliberately not accepted as a literal
+    /// argument: process arguments are visible to every user on the host via
+    /// `ps`, and shell history keeps them afterwards.
+    ComputeAuthTag {
+        /// Agent public key to authorize — bech32 npub or 64-char hex.
+        #[arg(long)]
+        agent: String,
+
+        /// Conditions string, e.g. `kind=9` or `kind=0,kind=9`. Empty
+        /// authorizes every kind.
+        #[arg(long, default_value = "")]
+        conditions: String,
+
+        /// Pass `-` to read the owner secret key from stdin instead of
+        /// `BUZZ_OWNER_PRIVATE_KEY`.
+        #[arg(long)]
+        owner_key: Option<String>,
+    },
     /// Run pending database migrations.
     Migrate,
     /// Inspect deployment-wide Buzz product feedback.
@@ -148,6 +175,11 @@ async fn run(cli: Cli) -> Result<i32> {
             println!("\nSet BUZZ_PRIVATE_KEY to the secret key to use this identity.");
             Ok(0)
         }
+        Command::ComputeAuthTag {
+            agent,
+            conditions,
+            owner_key,
+        } => cmd_compute_auth_tag(&agent, &conditions, owner_key.as_deref()),
         Command::Migrate => {
             let db = connect_db().await?;
             db.migrate().await?;
@@ -310,6 +342,65 @@ fn validate_role(role: &str) -> std::result::Result<(), String> {
             "invalid role '{other}': must be 'member' or 'admin'"
         )),
     }
+}
+
+/// Where the owner secret key came from, for the error message when it is
+/// missing. Kept as a separate step from reading it so the precedence is
+/// testable without a process environment or a real stdin.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnerKeySource {
+    Stdin,
+    Env,
+}
+
+/// Resolve which source supplies the owner secret.
+///
+/// `--owner-key -` reads stdin; anything else on that flag is refused rather
+/// than treated as the key itself, because a secret in argv is readable by
+/// every process on the host (`ps`) and is kept by shell history.
+fn owner_key_source(flag: Option<&str>) -> std::result::Result<OwnerKeySource, String> {
+    match flag {
+        None => Ok(OwnerKeySource::Env),
+        Some("-") => Ok(OwnerKeySource::Stdin),
+        Some(_) => Err(
+            "--owner-key only accepts `-` (read the secret from stdin); set \
+             BUZZ_OWNER_PRIVATE_KEY instead of passing a secret as an argument"
+                .to_string(),
+        ),
+    }
+}
+
+/// Compute a NIP-OA `auth` tag for `agent` signed by the owner secret.
+fn cmd_compute_auth_tag(
+    agent: &str,
+    conditions: &str,
+    owner_key_flag: Option<&str>,
+) -> Result<i32> {
+    let agent_pubkey = nostr::PublicKey::parse(agent)
+        .map_err(|e| anyhow::anyhow!("invalid --agent '{agent}': {e}"))?;
+
+    let source = owner_key_source(owner_key_flag).map_err(|e| anyhow::anyhow!(e))?;
+    let secret = match source {
+        OwnerKeySource::Stdin => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                .map_err(|e| anyhow::anyhow!("failed to read the owner key from stdin: {e}"))?;
+            buf
+        }
+        OwnerKeySource::Env => std::env::var("BUZZ_OWNER_PRIVATE_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "set BUZZ_OWNER_PRIVATE_KEY to the owner secret key, or pass \
+                 --owner-key - to read it from stdin"
+            )
+        })?,
+    };
+
+    let owner_keys =
+        Keys::parse(secret.trim()).map_err(|e| anyhow::anyhow!("invalid owner secret key: {e}"))?;
+    let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, conditions)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("{tag}");
+    Ok(0)
 }
 
 /// Parse a bech32 npub or 64-char hex pubkey into lowercase hex.
