@@ -2074,13 +2074,10 @@ async fn tokio_main() -> Result<()> {
             vec![SubscriptionRule {
                 name: "mentions".into(),
                 channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_else(|| {
-                    vec![
-                        KIND_STREAM_MESSAGE,
-                        KIND_WORKFLOW_APPROVAL_REQUESTED,
-                        KIND_STREAM_REMINDER,
-                    ]
-                }),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(default_mention_kinds),
                 require_mention: !config.no_mention_filter,
                 filter: None,
                 compiled_filter: None,
@@ -3515,6 +3512,15 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
     })
+}
+
+/// Event kinds `--subscribe mentions` listens to by default.
+fn default_mention_kinds() -> Vec<u32> {
+    vec![
+        KIND_STREAM_MESSAGE,
+        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_STREAM_REMINDER,
+    ]
 }
 
 fn is_owner_control_command(
@@ -8672,5 +8678,25 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod default_mention_kinds_tests {
+    use super::default_mention_kinds;
+    use buzz_core::kind::{
+        KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+    };
+
+    #[test]
+    fn mentions_still_cover_the_stream_kinds_they_always_did() {
+        let kinds = default_mention_kinds();
+        for kind in [
+            KIND_STREAM_MESSAGE,
+            KIND_WORKFLOW_APPROVAL_REQUESTED,
+            KIND_STREAM_REMINDER,
+        ] {
+            assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+        }
     }
 }
