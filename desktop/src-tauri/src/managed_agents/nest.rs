@@ -133,6 +133,11 @@ pub fn ensure_nest() -> Result<(), String> {
 ///
 /// - Creates the root directory and all subdirectories.
 /// - Writes `AGENTS.md` only if it doesn't already exist.
+/// - Writes `CLAUDE.md` only if it doesn't already exist, containing the single
+///   line `@./AGENTS.md` — Claude Code auto-loads `CLAUDE.md`, so this is what
+///   makes the orientation file reach that runtime's context. If the write
+///   fails after the file is created, the partial file is removed so the next
+///   launch retries rather than seeing it as already provisioned.
 /// - Writes `.agents/skills/buzz-cli/SKILL.md` only if it doesn't already exist.
 /// - Creates harness-specific symlinks pointing to the canonical
 ///   `.agents/skills/buzz-cli` directory for each known provider.
@@ -209,8 +214,22 @@ pub fn ensure_nest_at(root: &Path) -> Result<(), String> {
     {
         Ok(mut file) => {
             use std::io::Write;
-            file.write_all(CLAUDE_MD.as_bytes())
-                .map_err(|e| format!("write {}: {e}", claude_md.display()))?;
+            if let Err(error) = file.write_all(CLAUDE_MD.as_bytes()) {
+                // `create_new` already made the path, so a failed write leaves
+                // an empty or partial pointer behind. Every later launch would
+                // then see AlreadyExists, treat provisioning as done, and never
+                // repair it — a permanently silent AGENTS.md. Remove it so the
+                // next launch retries; the file is one static line, so there is
+                // nothing of the user's to lose.
+                drop(file);
+                if let Err(cleanup) = fs::remove_file(&claude_md) {
+                    eprintln!(
+                        "buzz-desktop: could not remove the incomplete {}: {cleanup}",
+                        claude_md.display()
+                    );
+                }
+                return Err(format!("write {}: {error}", claude_md.display()));
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
