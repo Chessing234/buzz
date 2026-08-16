@@ -889,3 +889,81 @@ mod tests {
         assert_eq!(result, vec![TEST_HEX1]);
     }
 }
+
+#[cfg(test)]
+mod code_region_parity_tests {
+    use super::{extract_at_mentions_with_known, strip_code_regions};
+
+    /// Whether the send path would emit a `p` tag for `alice`.
+    fn tags_alice(content: &str) -> bool {
+        !extract_at_mentions_with_known(&strip_code_regions(content), &["alice"]).is_empty()
+    }
+
+    /// Each of these renders as code in Desktop, so `hasMention` returns false
+    /// for it — verified by running Desktop's own `hasMention` over the same
+    /// inputs. Tagging them anyway wakes an agent for text nobody addressed.
+    #[test]
+    fn code_desktop_masks_never_produces_a_mention() {
+        for content in [
+            "~~~\n@alice\n~~~",
+            "~~~~\n@alice\n~~~~",
+            "```\n@alice\n```",
+            "``@alice``",
+            "``` @alice ```",
+            "`@alice`",
+            // A longer opener is not closed by a shorter run.
+            "````\n@alice\n```\nstill code\n````",
+            // Never closed: code to the end of the message, as Desktop treats it.
+            "```\n@alice",
+            "~~~\n@alice",
+            // CommonMark allows up to three spaces of indent before a fence.
+            "   ```\n@alice\n   ```",
+        ] {
+            assert!(
+                !tags_alice(content),
+                "must not tag a mention in {content:?}"
+            );
+        }
+    }
+
+    /// The other direction: a visible mention must keep its tag. A missed tag
+    /// is the worse failure — the agent never wakes at all.
+    #[test]
+    fn a_visible_mention_still_tags() {
+        for content in [
+            "hi @alice",
+            "```\ncode\n```\nhi @alice",
+            "~~~\ncode\n~~~\nhi @alice",
+            "``code`` and @alice",
+            "`code` then @alice",
+            // A fence marker mid-line opens nothing.
+            "look at ``` @alice",
+            // A backtick fence's info string cannot contain a backtick, so
+            // this is a span followed by text, not an unterminated block.
+            "``` `x` ``` @alice",
+        ] {
+            assert!(tags_alice(content), "must tag the mention in {content:?}");
+        }
+    }
+
+    /// An escaped backtick does not open a code span — matching Desktop, which
+    /// skips escaped delimiters when masking. The text survives stripping; it
+    /// still resolves to no mention because a backtick is not a mention opener,
+    /// which is exactly what Desktop concludes.
+    #[test]
+    fn an_escaped_backtick_does_not_open_a_span() {
+        assert_eq!(strip_code_regions("\\`@alice\\`"), "\\`@alice\\`");
+        assert!(!tags_alice("\\`@alice\\`"));
+        // The mention outside the escaped pair is untouched.
+        assert!(tags_alice("\\`x\\` @alice"));
+    }
+
+    /// Documented divergence: Desktop also masks any line indented four spaces
+    /// or a tab. That is not CommonMark — the indented line here continues a
+    /// list item and renders as ordinary text — so copying the rule would drop
+    /// a `p` tag from a message whose mention is plainly visible.
+    #[test]
+    fn an_indented_list_continuation_keeps_its_mention() {
+        assert!(tags_alice("- item\n    @alice look"));
+    }
+}
