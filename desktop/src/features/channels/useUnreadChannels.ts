@@ -98,6 +98,20 @@ function toUnixSeconds(isoOrMs: string | null | undefined): number | null {
   return ms === null ? null : Math.floor(ms / 1_000);
 }
 
+// How far ahead of this machine's clock a read marker may land. `created_at`
+// is self-asserted by the sending client and the relay does not bound it for
+// ordinary messages, so an unbounded marker lets one future-dated event mark
+// every later message in the channel as already read — no badge, no divider,
+// no thread resume — until wall-clock time catches up with it.
+//
+// A tolerance rather than a hard `now` ceiling: ordinary skew between two
+// machines is seconds, and clamping that hard would leave a just-received
+// message unread until this clock caught up. 120s matches the relay's own
+// `MAX_COMMAND_SKEW_SECS` (`handlers/moderation_commands.rs`), which is the
+// house number for "clock difference we accept"; NIP-AB already says clients
+// MUST NOT set `created_at` in the future at all.
+const MAX_READ_MARKER_SKEW_SECONDS = 120;
+
 // Resolve where the read marker should land when a channel is marked read.
 // Folds the caller's timeline position together with the newest event this
 // client has observed live (`observedLatest`), so an explicit "mark read" still
@@ -107,17 +121,29 @@ function toUnixSeconds(isoOrMs: string | null | undefined): number | null {
 // the resulting marker covers the observed timestamp, signalling the caller to
 // drop its observed refs so the unread memo sees `latest === undefined` until a
 // genuinely newer event arrives.
+//
+// Both inputs are event-derived, so both are clamped: `callerReadAt` comes from
+// a message's own `created_at` (channel-open, the Esc shortcut's
+// `lastMessageAt`, mark-all-read) and `observedLatest` from live events.
+//
+// `nowSeconds` is injectable so the ceiling is testable; it must stay a
+// parameter rather than a captured constant.
 export function resolveChannelReadMarker(
   callerReadAt: string | null | undefined,
   observedLatest: number | undefined,
+  nowSeconds: number = Date.now() / 1_000,
 ): { markAt: number | null; clearObserved: boolean } {
   const callerUnix = toUnixSeconds(callerReadAt);
-  const markAt = Math.max(callerUnix ?? 0, observedLatest ?? 0) || null;
+  const requested = Math.max(callerUnix ?? 0, observedLatest ?? 0) || null;
+  const ceiling = Math.floor(nowSeconds) + MAX_READ_MARKER_SKEW_SECONDS;
+  const markAt = requested === null ? null : Math.min(requested, ceiling);
   return {
     markAt,
     clearObserved:
       markAt !== null &&
       observedLatest !== undefined &&
+      // A clamped marker does not cover a future-dated observed event, so the
+      // observed refs must survive: that event really is still unread.
       observedLatest <= markAt,
   };
 }
