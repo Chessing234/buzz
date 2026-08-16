@@ -22,8 +22,8 @@ use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::Result;
 use buzz_core::kind::{
     KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-    KIND_WORKFLOW_APPROVAL_REQUESTED,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -3522,9 +3522,15 @@ fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
 /// deaf in exactly the channels built for threaded discussion: it joined, it
 /// showed online, and an `@mention` in a forum post produced no inbound event
 /// at all (#5268).
+///
+/// The canonical message kinds are 9 *and* 40002; `buzz-db`'s mentions query
+/// (`feed.rs`) selects both alongside the two forum kinds, and this list has
+/// to match it or an agent stays deaf to direct mentions in v2 stream
+/// messages.
 fn default_mention_kinds() -> Vec<u32> {
     vec![
         KIND_STREAM_MESSAGE,
+        KIND_STREAM_MESSAGE_V2,
         KIND_FORUM_POST,
         KIND_FORUM_COMMENT,
         KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -8694,8 +8700,8 @@ mod observer_payload_trim_tests {
 mod default_mention_kinds_tests {
     use super::default_mention_kinds;
     use buzz_core::kind::{
-        KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER,
-        KIND_WORKFLOW_APPROVAL_REQUESTED,
+        KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2,
+        KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
     };
 
     #[test]
@@ -8717,5 +8723,15 @@ mod default_mention_kinds_tests {
         ] {
             assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
         }
+    }
+
+    #[test]
+    fn mentions_cover_both_canonical_message_kinds() {
+        // buzz-db's mentions query selects 9 and 40002 together; a default
+        // that carries only 9 leaves an agent deaf to direct mentions in v2
+        // stream messages.
+        let kinds = default_mention_kinds();
+        assert!(kinds.contains(&KIND_STREAM_MESSAGE), "{kinds:?}");
+        assert!(kinds.contains(&KIND_STREAM_MESSAGE_V2), "{kinds:?}");
     }
 }
