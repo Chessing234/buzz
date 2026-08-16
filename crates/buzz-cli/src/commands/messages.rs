@@ -574,26 +574,48 @@ fn channel_type_from_metadata(event: &serde_json::Value) -> Option<&str> {
         .flatten()
 }
 
-/// Kind to publish when `--kind` was not given.
+/// The single decision about which kind a `messages send` publishes.
 ///
 /// Desktop's forum surface lists kind:45001 topics and kind:45003 comments; a
 /// kind:9 event in a forum channel is accepted by the relay and then never
 /// appears in the topic list, so the send looks successful while the content
-/// is invisible where people read it. Match the channel's canonical surface
-/// instead of always defaulting to the stream kind.
+/// is invisible where people read it. Matching the channel's canonical surface
+/// is what removes that failure — which is also why `--broadcast` cannot
+/// quietly opt back into it.
 ///
-/// `--broadcast` stays on kind:9: it is a stream-only concept, and an explicit
-/// flag should not be silently redirected to a different event kind.
-fn default_message_kind(channel_type: Option<&str>, is_reply: bool, broadcast: bool) -> u16 {
-    match channel_type {
-        Some("forum") if !broadcast => {
-            if is_reply {
-                45003
-            } else {
-                45001
-            }
-        }
-        _ => 9,
+/// `--broadcast` is stream-only. Two combinations are rejected rather than
+/// half-applied:
+///
+/// * an implicit forum send with `--broadcast` — publishing kind:9 there is
+///   the exact invisible-success this command is fixing, so it fails instead;
+/// * an explicit forum kind with `--broadcast` — `build_forum_post` and
+///   `build_forum_comment` take no broadcast argument, so the flag was being
+///   silently dropped.
+///
+/// `--kind 9 --broadcast` stays available as the explicit opt-out: the caller
+/// has said which kind they want, and kind:9 is what broadcast means.
+fn resolve_message_kind(
+    explicit: Option<u16>,
+    channel_type: Option<&str>,
+    is_reply: bool,
+    broadcast: bool,
+) -> Result<u16, CliError> {
+    let is_forum = channel_type == Some("forum");
+    match explicit {
+        Some(kind @ (45001 | 45003)) if broadcast => Err(CliError::Usage(format!(
+            "--broadcast is stream-only and does not apply to kind {kind}; drop --broadcast, or use --kind 9 --broadcast to post a broadcast stream message"
+        ))),
+        Some(kind @ (9 | 45001 | 45003)) => Ok(kind),
+        Some(kind) => Err(CliError::Usage(format!(
+            "--kind {kind} is not supported (use 9, 45001, or 45003)"
+        ))),
+        None if is_forum && broadcast => Err(CliError::Usage(
+            "--broadcast is stream-only, and this is a forum channel: a kind 9 event there is accepted by the relay but never listed on the forum surface. Drop --broadcast to post a forum topic or comment, or use --kind 9 --broadcast if the invisible stream message is really what you want."
+                .into(),
+        )),
+        None if is_forum && is_reply => Ok(45003),
+        None if is_forum => Ok(45001),
+        None => Ok(9),
     }
 }
 
@@ -701,27 +723,23 @@ pub async fn cmd_send_message(
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
 
-    // Without an explicit --kind, follow the channel's canonical surface: a
-    // forum shows kind:45001 topics and kind:45003 comments, so a kind:9 event
-    // published there is accepted and then never listed.
-    let kind = match p.kind {
-        Some(k) => Some(k),
-        None => {
-            let channel_type = resolve_channel_type(client, &p.channel_id).await?;
-            Some(default_message_kind(
-                channel_type.as_deref(),
-                thread_ref.is_some(),
-                p.broadcast,
-            ))
-        }
+    let channel_type = match p.kind {
+        Some(_) => None,
+        None => resolve_channel_type(client, &p.channel_id).await?,
     };
+    let kind = resolve_message_kind(
+        p.kind,
+        channel_type.as_deref(),
+        thread_ref.is_some(),
+        p.broadcast,
+    )?;
 
     let builder = match kind {
-        Some(45001) => {
+        45001 => {
             buzz_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
                 .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
         }
-        Some(45003) => {
+        45003 => {
             let tr = thread_ref.as_ref().ok_or_else(|| {
                 CliError::Usage("--reply-to is required for forum comments (kind 45003)".into())
             })?;
@@ -734,7 +752,7 @@ pub async fn cmd_send_message(
             )
             .map_err(|e| CliError::Other(format!("build_forum_comment failed: {e}")))?
         }
-        None | Some(9) => buzz_sdk::build_message(
+        9 => buzz_sdk::build_message(
             channel_uuid,
             &final_content,
             thread_ref.as_ref(),
@@ -743,9 +761,12 @@ pub async fn cmd_send_message(
             &media_tags,
         )
         .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?,
-        Some(k) => {
-            return Err(CliError::Usage(format!(
-                "--kind {k} is not supported (use 9, 45001, or 45003)"
+        // `resolve_message_kind` is the only source of `kind` and returns
+        // nothing else; an unsupported `--kind` is rejected there, before any
+        // upload.
+        other => {
+            return Err(CliError::Other(format!(
+                "internal: unhandled message kind {other}"
             )))
         }
     };
@@ -1449,7 +1470,12 @@ mod tests {
 
 #[cfg(test)]
 mod default_kind_tests {
-    use super::{channel_type_from_metadata, default_message_kind};
+    use super::{channel_type_from_metadata, resolve_message_kind};
+
+    /// `resolve_message_kind` with no explicit `--kind` and no `--broadcast`.
+    fn implicit(channel_type: Option<&str>, is_reply: bool) -> u16 {
+        resolve_message_kind(None, channel_type, is_reply, false).expect("must resolve")
+    }
 
     fn metadata(tags: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "kind": 39000, "tags": tags })
@@ -1473,26 +1499,84 @@ mod default_kind_tests {
 
     #[test]
     fn forum_root_defaults_to_a_topic() {
-        assert_eq!(default_message_kind(Some("forum"), false, false), 45001);
+        assert_eq!(implicit(Some("forum"), false), 45001);
     }
 
     #[test]
     fn forum_reply_defaults_to_a_comment() {
-        assert_eq!(default_message_kind(Some("forum"), true, false), 45003);
+        assert_eq!(implicit(Some("forum"), true), 45003);
     }
 
     #[test]
     fn stream_and_dm_keep_kind_nine() {
         for channel_type in [Some("stream"), Some("dm"), Some("workflow"), None] {
-            assert_eq!(default_message_kind(channel_type, false, false), 9);
-            assert_eq!(default_message_kind(channel_type, true, false), 9);
+            assert_eq!(implicit(channel_type, false), 9);
+            assert_eq!(implicit(channel_type, true), 9);
         }
     }
 
     #[test]
-    fn broadcast_stays_on_the_stream_kind() {
-        // --broadcast is stream-only; redirecting it to a forum kind would
-        // change what the flag does rather than where the message lands.
-        assert_eq!(default_message_kind(Some("forum"), false, true), 9);
+    fn an_explicit_kind_wins_over_the_channel_type() {
+        assert_eq!(
+            resolve_message_kind(Some(9), Some("forum"), false, false).unwrap(),
+            9
+        );
+        assert_eq!(
+            resolve_message_kind(Some(45001), Some("stream"), false, false).unwrap(),
+            45001
+        );
+    }
+
+    #[test]
+    fn an_implicit_forum_broadcast_is_rejected() {
+        // Publishing kind 9 into a forum is the invisible success this command
+        // is fixing, so --broadcast there must fail rather than fall back.
+        let err = resolve_message_kind(None, Some("forum"), false, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stream-only"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("--kind 9 --broadcast"),
+            "error must name the opt-out: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_forum_kind_with_broadcast_is_rejected() {
+        // build_forum_post / build_forum_comment take no broadcast argument,
+        // so honouring both is impossible — the flag used to be dropped.
+        for kind in [45001u16, 45003] {
+            let err = resolve_message_kind(Some(kind), Some("forum"), true, true).unwrap_err();
+            assert!(
+                err.to_string().contains("stream-only"),
+                "kind {kind} must reject --broadcast: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_stream_broadcast_is_the_opt_out() {
+        // Even in a forum channel: the caller named the kind.
+        assert_eq!(
+            resolve_message_kind(Some(9), Some("forum"), false, true).unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn broadcast_does_not_change_a_stream_channel() {
+        assert_eq!(
+            resolve_message_kind(None, Some("stream"), false, true).unwrap(),
+            9
+        );
+        assert_eq!(resolve_message_kind(None, None, true, true).unwrap(), 9);
+    }
+
+    #[test]
+    fn an_unsupported_kind_is_rejected_before_anything_is_uploaded() {
+        let err = resolve_message_kind(Some(1), None, false, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
+        );
     }
 }
