@@ -11,7 +11,7 @@ use crate::client::{
 use crate::commands::agents::fetch_archived_snapshot;
 use crate::commands::channel_templates::{self, ChannelTemplateRecord, TemplateAgentRoster};
 use crate::error::CliError;
-use crate::validate::{parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
+use crate::validate::{fold_name, parse_uuid, read_or_stdin, validate_hex64, validate_uuid};
 
 fn extract_channel_metadata(e: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -132,7 +132,7 @@ pub async fn cmd_search_channels(
     });
     let arr = client.query_paginated(filter, limit).await?;
 
-    let needle = query.to_ascii_lowercase();
+    let needle = fold_name(query);
     let mut matches: Vec<ChannelSummary> = arr
         .iter()
         .filter_map(ChannelSummary::from_event)
@@ -213,7 +213,7 @@ impl ChannelSummary {
 }
 
 fn name_matches(name: &str, needle_lower: &str, exact: bool) -> bool {
-    let hay = name.to_ascii_lowercase();
+    let hay = fold_name(name);
     if exact {
         hay == needle_lower
     } else {
