@@ -5,7 +5,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { resolveCommunityUpdateResult } from "./useCommunities.tsx";
+import {
+  isSameRelay,
+  resolveCommunityUpdateResult,
+} from "./useCommunities.tsx";
+import { storageKey } from "@/features/profile/lib/selfProfileStorage";
 
 const COMMUNITIES = [
   {
@@ -104,4 +108,73 @@ test("resolveCommunityUpdateResult_same_relay_url_is_not_duplicate_of_self", () 
     relayUrl: "wss://relay-a.example.com",
   });
   assert.deepEqual(result, { kind: "unchanged" });
+});
+
+// ---------------------------------------------------------------------------
+// Relay identity is the storage notion of sameness, not string equality
+// ---------------------------------------------------------------------------
+//
+// Every per-relay slot — self profile, read state, channel sections, sort
+// preference, sidebar watermark, thread activity, observed unread — is keyed
+// through `normalizeRelayUrl` (trim, strip trailing slashes, lowercase). Two
+// communities whose URLs normalize alike therefore already share all of that
+// data, so admitting the second one does not separate them, it hides that
+// they are one.
+
+test("isSameRelay_treatsStorageEquivalentSpellingsAsOneRelay", () => {
+  const canonical = "wss://relay-a.example.com";
+  for (const spelling of [
+    "wss://relay-a.example.com/",
+    "wss://relay-a.example.com//",
+    "WSS://Relay-A.Example.com",
+    "  wss://relay-a.example.com  ",
+  ]) {
+    assert.equal(
+      isSameRelay(canonical, spelling),
+      true,
+      `${spelling} keys to the same storage slot and must be the same relay`,
+    );
+    assert.equal(
+      storageKey(canonical, "pk") === storageKey(spelling, "pk"),
+      true,
+      `${spelling} must actually collide in storage — the premise of this test`,
+    );
+  }
+});
+
+test("isSameRelay_keepsGenuinelyDifferentRelaysApart", () => {
+  assert.equal(
+    isSameRelay("wss://relay-a.example.com", "wss://relay-b.example.com"),
+    false,
+  );
+  assert.equal(
+    isSameRelay("wss://relay-a.example.com", "ws://relay-a.example.com"),
+    false,
+  );
+});
+
+test("resolveCommunityUpdateResult_trailingSlashOfAnotherRelay_isADuplicate", () => {
+  // Before: raw === missed this, so the edit was accepted and the two
+  // communities silently shared every per-relay storage slot.
+  const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {
+    relayUrl: "wss://relay-b.example.com/",
+  });
+  assert.deepEqual(result, { kind: "duplicate-relay" });
+});
+
+test("resolveCommunityUpdateResult_caseOnlyEditOfAnotherRelay_isADuplicate", () => {
+  const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {
+    relayUrl: "WSS://Relay-B.Example.com",
+  });
+  assert.deepEqual(result, { kind: "duplicate-relay" });
+});
+
+test("resolveCommunityUpdateResult_reSpellingOwnRelay_isStillAnUpdate", () => {
+  // Editing your own relay to an equivalent spelling is not a duplicate of
+  // yourself — it stays a normal update, and on the active community it still
+  // reinitialises the backend, because the connection URL really did change.
+  const result = resolveCommunityUpdateResult(COMMUNITIES, "ws-1", "ws-1", {
+    relayUrl: "wss://relay-a.example.com/",
+  });
+  assert.deepEqual(result, { kind: "updated", requiresReinit: true });
 });
