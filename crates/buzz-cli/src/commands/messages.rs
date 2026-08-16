@@ -690,6 +690,20 @@ pub async fn cmd_send_message(
         ));
     }
 
+    // Settle the kind before anything is uploaded. Every rejection above is a
+    // usage error the caller can fix and retry; deciding after the upload loop
+    // would leave the attachments on the relay with no event referencing them.
+    let channel_type = match p.kind {
+        Some(_) => None,
+        None => resolve_channel_type(client, &p.channel_id).await?,
+    };
+    let kind = resolve_message_kind(
+        p.kind,
+        channel_type.as_deref(),
+        p.reply_to.is_some(),
+        p.broadcast,
+    )?;
+
     // Upload files and build imeta tags
     let mut media_tags: Vec<Vec<String>> = Vec::new();
     let mut media_content = String::new();
@@ -722,17 +736,6 @@ pub async fn cmd_send_message(
     };
 
     let mention_refs: Vec<&str> = mention_pubkeys.iter().map(String::as_str).collect();
-
-    let channel_type = match p.kind {
-        Some(_) => None,
-        None => resolve_channel_type(client, &p.channel_id).await?,
-    };
-    let kind = resolve_message_kind(
-        p.kind,
-        channel_type.as_deref(),
-        thread_ref.is_some(),
-        p.broadcast,
-    )?;
 
     let builder = match kind {
         45001 => {
