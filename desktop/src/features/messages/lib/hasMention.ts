@@ -44,6 +44,15 @@ function maskMarkdownCode(text: string): string {
   }
 
   let fence: { marker: string; length: number } | null = null;
+  // An indented code block cannot interrupt a paragraph (CommonMark 4.4): the
+  // chunk has to start after a blank line. Without that condition every
+  // four-space or tab indented line was masked, so a mention on a nested list
+  // item — `- outer` then `    - @alice` — was treated as code and produced no
+  // `p` tag, while react-markdown rendered it as an ordinary visible mention.
+  // A blank line inside a chunk does not end it, so `inIndentedCode` survives
+  // blanks.
+  let previousLineWasBlank = true;
+  let inIndentedCode = false;
   for (const line of lines) {
     if (fence) {
       maskRange(chars, text, line.start, line.end);
@@ -55,6 +64,8 @@ function maskMarkdownCode(text: string): string {
       ) {
         fence = null;
       }
+      inIndentedCode = false;
+      previousLineWasBlank = false;
       continue;
     }
 
@@ -62,12 +73,20 @@ function maskMarkdownCode(text: string): string {
     if (opening && !(opening[1][0] === "`" && opening[2].includes("`"))) {
       fence = { marker: opening[1][0], length: opening[1].length };
       maskRange(chars, text, line.start, line.end);
+      inIndentedCode = false;
+      previousLineWasBlank = false;
       continue;
     }
 
-    if (/^(?: {4}|\t)/.test(line.content)) {
+    const isBlank = line.content.trim() === "";
+    const isIndented = /^(?: {4}|\t)/.test(line.content);
+    if (isIndented && (inIndentedCode || previousLineWasBlank)) {
       maskRange(chars, text, line.start, line.end);
+      inIndentedCode = true;
+    } else if (!isBlank) {
+      inIndentedCode = false;
     }
+    previousLineWasBlank = isBlank;
   }
 
   const isMasked = (index: number) =>
