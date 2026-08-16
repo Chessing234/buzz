@@ -56,6 +56,10 @@ pub const MENTION_CAP: usize = 50;
 /// Desktop and must not tag Fizz here either — the inverse error, waking an
 /// agent nobody visibly addressed.
 ///
+/// Whitespace is Unicode-aware, because JavaScript's `\s` is: Desktop renders
+/// a mention wrapped in non-breaking spaces, so `is_ascii_whitespace` would
+/// leave it out of the signed event.
+///
 /// Anything else — most importantly an alphanumeric, as in `user@host` — is
 /// not an opener.
 fn opens_mention(preceding: &str) -> bool {
@@ -63,7 +67,7 @@ fn opens_mention(preceding: &str) -> bool {
     match back.next() {
         None => true,
         Some('|') => back.next() == Some('|'),
-        Some(c) => c.is_ascii_whitespace() || matches!(c, '(' | '*' | '_'),
+        Some(c) => c.is_whitespace() || matches!(c, '(' | '*' | '_'),
     }
 }
 
@@ -191,14 +195,15 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
 /// the fallback tokenizer still reads `@fizz_` as `fizz_`, which is the name
 /// that was typed.
 ///
-/// A closing `|` counts only as the pair `||`.
+/// A closing `|` counts only as the pair `||`. Whitespace is Unicode-aware to
+/// match JavaScript's `\s`.
 fn is_word_boundary(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         None => true,
         Some('|') => chars.next() == Some('|'),
         Some(c) => {
-            c.is_ascii_whitespace()
+            c.is_whitespace()
                 || matches!(
                     c,
                     ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}' | '*' | '_'
@@ -535,6 +540,20 @@ mod tests {
             extract_at_mentions_with_known("||@fizz||", &["fizz"]),
             vec!["fizz"]
         );
+    }
+
+    #[test]
+    fn unicode_whitespace_bounds_a_mention() {
+        // JavaScript's `\s` is Unicode-aware, so Desktop renders these as
+        // mentions; `is_ascii_whitespace` left them out of the signed event.
+        assert_eq!(extract_at_names("hi\u{a0}@fizz"), vec!["fizz"]);
+        assert_eq!(
+            extract_at_mentions_with_known("hi\u{a0}@Will Pfleger\u{a0}ok", &["Will Pfleger"]),
+            vec!["will pfleger"]
+        );
+        // Other Unicode spaces Desktop accepts: en space, ideographic space.
+        assert_eq!(extract_at_names("hi\u{2002}@fizz"), vec!["fizz"]);
+        assert_eq!(extract_at_names("hi\u{3000}@fizz"), vec!["fizz"]);
     }
 
     #[test]
