@@ -1357,6 +1357,21 @@ test("a stripped javascript: link renders as inert text", () => {
   assert.doesNotMatch(html, /javascript:/);
 });
 
+test("a malformed buzz:// entity link renders as inert text", () => {
+  // The strict entity parser rejects the unknown `extra` param, so
+  // `buzzDeepLinkUrlTransform` hands the URL to `defaultUrlTransform` and the
+  // href is blanked — the same stripped-href path as `obsidian://`, reached
+  // through a scheme Buzz does support. Asserted through the production
+  // components, not just the transform.
+  const html = renderMarkdownWithComponents(
+    `[buzz pr](buzz://pr?id=${EVENT_HEX}&owner=${OWNER_HEX}&d=buzz-world&extra=ignored)`,
+    "stripped-entity-anchor-test",
+  );
+  assert.match(html, />buzz pr</);
+  assert.doesNotMatch(html, /<a /);
+  assert.doesNotMatch(html, /href=""/);
+});
+
 test("an http link still renders as a link", () => {
   const html = renderMarkdownWithComponents(
     "[example](https://example.com/path)",
