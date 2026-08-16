@@ -421,7 +421,10 @@ fn event_channel_id(event: &serde_json::Value) -> Option<Uuid> {
 /// `Uuid::parse_str`, which accepts uppercase, braced and unhyphenated forms,
 /// while `h` tags are `uuid-v4-lowercase` on the wire (NIP-PL `h_grammar`).
 ///
-/// A root the relay did not return is left alone, so a genuinely missing event
+/// A root that came back without a readable `h` tag fails closed: the command
+/// cannot show that it belongs to the requested channel, and printing it with
+/// no replies is the exact silence this check exists to remove. A root the
+/// relay did not return at all is left alone, so a genuinely missing event
 /// still prints an empty array.
 fn check_thread_channel(
     events: &[serde_json::Value],
@@ -435,7 +438,9 @@ fn check_thread_channel(
         return Ok(());
     };
     let Some(actual) = event_channel_id(root) else {
-        return Ok(());
+        return Err(CliError::Usage(format!(
+            "event {event_id} carries no readable channel (h) tag, so it cannot be shown as a thread in {channel}"
+        )));
     };
     if actual == channel {
         return Ok(());
@@ -1509,9 +1514,21 @@ mod thread_channel_tests {
     }
 
     #[test]
-    fn passes_through_when_the_root_has_no_h_tag() {
+    fn rejects_a_root_with_no_h_tag() {
+        // The command cannot establish that this root is in the requested
+        // channel, so it must not print it as that channel's thread.
         let event = serde_json::json!({"id": ROOT, "tags": [["p", "abc"]]});
-        assert!(check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).is_ok());
+        let err = check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).unwrap_err();
+        assert!(
+            err.to_string().contains("no readable channel"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_root_whose_h_tag_is_not_a_uuid() {
+        let event = serde_json::json!({"id": ROOT, "tags": [["h", "not-a-uuid"]]});
+        assert!(check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).is_err());
     }
 
     #[test]
