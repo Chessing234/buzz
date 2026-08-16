@@ -34,7 +34,6 @@ void main() {
 
   test('does not cut the ellipsis into an emoji', () {
     final body = '${'x' * 199}\u{1F389} more text';
-    expect(truncateWithEllipsis(body, 200, '...'),
-        '${'x' * 199}\u{1F389}...');
+    expect(truncateWithEllipsis(body, 200, '...'), '${'x' * 199}\u{1F389}...');
   });
 }
