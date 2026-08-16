@@ -934,8 +934,32 @@ fn nest_writes_a_claude_md_pointing_at_agents_md() {
     ensure_nest_at(&root).unwrap();
 
     let claude_md = std::fs::read_to_string(root.join("CLAUDE.md")).unwrap();
-    assert_eq!(claude_md.trim(), "@./AGENTS.md");
+    // Exact bytes, not `trim()`: `@./AGENTS.md` is an include directive, and
+    // leading whitespace or a missing newline is the kind of drift that stops
+    // it resolving. It must be the whole file.
+    assert_eq!(claude_md, "@./AGENTS.md\n");
+    assert_eq!(claude_md, super::CLAUDE_MD);
     assert!(root.join("AGENTS.md").exists());
+}
+
+#[test]
+fn a_nest_with_no_claude_md_gets_the_pointer_back() {
+    // The state the write-failure cleanup restores: no file, so the next
+    // launch's `create_new` succeeds and writes the pointer. (The failing
+    // write itself needs an I/O fault to reproduce and is not simulated here;
+    // this covers the state it hands back.)
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("nest");
+    ensure_nest_at(&root).unwrap();
+    std::fs::remove_file(root.join("CLAUDE.md")).unwrap();
+
+    ensure_nest_at(&root).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+        super::CLAUDE_MD,
+        "a nest missing its pointer must get it back on the next launch"
+    );
 }
 
 #[test]
