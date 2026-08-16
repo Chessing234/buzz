@@ -25,4 +25,16 @@ void main() {
     expect(truncateToCharacters('hello', 0), '');
     expect(truncateToCharacters('', 10), '');
   });
+
+  test('appends the ellipsis only when it actually cut', () {
+    expect(truncateWithEllipsis('hello', 100, '...'), 'hello');
+    expect(truncateWithEllipsis('hello', 5, '...'), 'hello');
+    expect(truncateWithEllipsis('hello there', 5, '...'), 'hello...');
+  });
+
+  test('does not cut the ellipsis into an emoji', () {
+    final body = '${'x' * 199}\u{1F389} more text';
+    expect(truncateWithEllipsis(body, 200, '...'),
+        '${'x' * 199}\u{1F389}...');
+  });
 }

@@ -22,3 +22,16 @@ String truncateToCharacters(String text, int maxCharacters) {
   if (characters.length <= maxCharacters) return text;
   return characters.take(maxCharacters).toString();
 }
+
+/// Returns [text] with [ellipsis] appended when it had to be shortened to
+/// [maxCharacters], or [text] unchanged when it fits.
+///
+/// Callers used to spell this out as
+/// `text.length > n ? '${text.substring(0, n)}…' : text`, which counts code
+/// units twice over — once to decide, once to cut.
+String truncateWithEllipsis(String text, int maxCharacters, String ellipsis) {
+  final truncated = truncateToCharacters(text, maxCharacters);
+  // `truncateToCharacters` returns `text` itself when it fits, so comparing
+  // lengths is exact and avoids walking the string again.
+  return truncated.length == text.length ? text : '$truncated$ellipsis';
+}
