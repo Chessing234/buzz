@@ -425,13 +425,15 @@ impl AcpClient {
         // ensures subprocesses (MCP servers, tool processes) are cleaned up
         // rather than orphaned to init.
         //
-        // Falls back to start_kill() (direct child only) on non-Unix or if
-        // the child has been polled to completion (id() returns None).
-        match self.child.id() {
-            Some(pid) if kill_process_group(pid) => {}
-            _ => {
-                let _ = self.child.start_kill();
-            }
+        // Falls back to start_kill() (direct child only) on platforms with no
+        // tree kill, or if the child has been polled to completion (id()
+        // returns None).
+        let killed_tree = match self.child.id() {
+            Some(pid) => kill_process_group_async(pid).await,
+            None => false,
+        };
+        if !killed_tree {
+            let _ = self.child.start_kill();
         }
         // Bounded wait: if the child doesn't exit within 5s after SIGKILL,
         // give up and let Drop/OS handle it. An unbounded wait here would
@@ -2386,6 +2388,39 @@ fn taskkill_tree_args(pid: u32) -> [String; 4] {
         "/T".to_string(),
         "/F".to_string(),
     ]
+}
+
+/// Await a tree kill without blocking the async worker it was called from.
+///
+/// On Unix this is `killpg`, a syscall that returns immediately. On Windows it
+/// shells out to `taskkill` and waits for it to exit, so it goes to the
+/// blocking pool under its own bound — otherwise a stalled system command
+/// would pin an executor thread indefinitely and slip past the caller's
+/// five-second child-wait timeout entirely.
+async fn kill_process_group_async(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || kill_process_group(pid)),
+        )
+        .await
+        {
+            Ok(Ok(killed)) => killed,
+            Ok(Err(e)) => {
+                tracing::debug!("taskkill task failed: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("taskkill did not return within 5s — falling back to start_kill()");
+                false
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        kill_process_group(pid)
+    }
 }
 
 /// Fallback for platforms that are neither Unix nor Windows: no tree kill
