@@ -10,10 +10,19 @@
  *      — the guard fires when skipKeys changes, even if value is unchanged.
  *   4. inheritedRows: render/exclusion/override/no-serialize invariants.
  *   5. getBakedProviderInheritLabel: label helper correctness.
+ *   6. That reprojection happens in place: `reconcileRows` keeps the existing
+ *      row objects (and so their ids) instead of rebuilding from `value`.
  *
  * These are pure-logic tests — no React renderer needed. The transition tests
- * (Invariant 3) exercise the real exported `skipKeysEqual` guard that controls
- * whether the effect calls `setRows(toRows(value, skipKeys))`.
+ * (Invariant 3) exercise the real exported `skipKeysEqual` guard that decides
+ * whether the effect reprojects at all; Invariant 6 covers what it reprojects
+ * to. Note that a skipKeys change no longer means a full
+ * `setRows(toRows(value, skipKeys))` rebuild — that path is now reserved for a
+ * `value` the editor did not emit.
+ *
+ * Row identity here is object identity, which is necessary but not sufficient:
+ * `envVarsEditorCatalogRerender.test.mjs` mounts the component in jsdom and
+ * asserts the focused DOM input itself survives the update.
  */
 
 import { test } from "node:test";
