@@ -41,9 +41,8 @@ export function createRemarkPrefixPlugin(
   };
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: remark tree types are not available
 function walkChildren(
-  node: any,
+  node: Node,
   pattern: RegExp,
   buildNode: NodeBuilder,
   leadGroup?: number,
@@ -73,8 +72,7 @@ function walkChildren(
   }
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: remark tree types are not available
-function shouldSkipNode(node: any): boolean {
+function shouldSkipNode(node: Node): boolean {
   return (
     node.type === "link" || node.type === "code" || node.type === "inlineCode"
   );
