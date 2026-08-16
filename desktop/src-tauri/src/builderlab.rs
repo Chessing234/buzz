@@ -159,24 +159,104 @@ fn persist_credential(credential: &str) {
     }
 }
 
-fn forget_credential() {
-    if let Err(error) = credential_store().delete(SESSION_CREDENTIAL_KEY) {
-        tracing::debug!(%error, "builderlab: could not delete the session credential");
-    }
+/// Read the persisted credential.
+///
+/// A keyring that cannot be read is *not* "no credential": reporting the user
+/// as signed out when the store is merely unavailable invites them to sign in
+/// again over a session that is still perfectly good. The error is returned so
+/// the caller can say the storage failed.
+fn stored_credential() -> Result<Option<String>, String> {
+    credential_store()
+        .load(SESSION_CREDENTIAL_KEY)
+        .map_err(|error| format!("could not read the stored Builderlab session: {error}"))
 }
 
-fn stored_credential() -> Option<String> {
-    match credential_store().load(SESSION_CREDENTIAL_KEY) {
-        Ok(credential) => credential,
-        Err(error) => {
-            tracing::warn!(%error, "builderlab: could not read the session credential");
-            None
-        }
-    }
+/// The credential, plus the generation it was read at.
+///
+/// Session checks are `await`ed, so a login or a logout can land while one is
+/// in flight. Every mutation bumps `generation`, and a check applies its result
+/// only if the generation it started from is still current — otherwise an older
+/// rejected request deletes a credential that was just exchanged, or an older
+/// success reports auth for a session the user already signed out of.
+#[derive(Default)]
+struct SessionState {
+    stored: Option<StoredSession>,
+    generation: u64,
 }
 
 #[derive(Default)]
-pub(crate) struct BuilderlabSession(Mutex<Option<StoredSession>>);
+pub(crate) struct BuilderlabSession(Mutex<SessionState>);
+
+impl BuilderlabSession {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionState>, String> {
+        self.0.lock().map_err(|error| error.to_string())
+    }
+
+    /// The current credential and generation, without touching the keyring.
+    fn current(&self) -> Result<Option<(String, u64)>, String> {
+        let state = self.lock()?;
+        Ok(state
+            .stored
+            .as_ref()
+            .map(|stored| (stored.credential.clone(), state.generation)))
+    }
+
+    /// Install a freshly exchanged credential in memory and in the keyring.
+    ///
+    /// Both stores are written under the lock so a concurrent hydrate or clear
+    /// cannot interleave between them and leave the two disagreeing.
+    fn replace(&self, credential: String) -> Result<(), String> {
+        let mut state = self.lock()?;
+        persist_credential(&credential);
+        state.stored = Some(StoredSession { credential });
+        state.generation += 1;
+        Ok(())
+    }
+
+    /// Adopt the persisted credential into memory, if memory is still empty.
+    ///
+    /// Returns the credential now in effect. If a login landed while the
+    /// keyring was being read, that newer credential wins — hydration must
+    /// never resurrect an older session over it, nor over a logout.
+    fn hydrate(&self, credential: String) -> Result<(String, u64), String> {
+        let mut state = self.lock()?;
+        if let Some(stored) = state.stored.as_ref() {
+            return Ok((stored.credential.clone(), state.generation));
+        }
+        state.stored = Some(StoredSession {
+            credential: credential.clone(),
+        });
+        state.generation += 1;
+        Ok((credential, state.generation))
+    }
+
+    /// Drop the credential from memory and from the keyring.
+    ///
+    /// The keyring failure is returned rather than logged: reporting a
+    /// successful sign-out while the credential is still on disk means the next
+    /// launch hydrates it and silently signs the user back in.
+    fn clear(&self) -> Result<(), String> {
+        let mut state = self.lock()?;
+        state.stored = None;
+        state.generation += 1;
+        credential_store()
+            .delete(SESSION_CREDENTIAL_KEY)
+            .map_err(|error| format!("could not delete the stored Builderlab session: {error}"))
+    }
+
+    /// Drop the credential, but only if it is still the one that was checked.
+    fn clear_if_current(&self, generation: u64) -> Result<(), String> {
+        {
+            let state = self.lock()?;
+            if state.generation != generation {
+                // A login or logout landed while the check was in flight; its
+                // verdict is about a credential that is no longer in use.
+                return Ok(());
+            }
+        }
+        self.clear()
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct BuilderlabLogin(Mutex<Option<PendingLogin>>);
@@ -394,10 +474,7 @@ pub(crate) async fn start_builderlab_login(
         }
         *pending = None;
     }
-    persist_credential(&exchanged.session_credential);
-    *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
-        credential: exchanged.session_credential,
-    });
+    session.replace(exchanged.session_credential)?;
     Ok(info)
 }
 
@@ -406,41 +483,36 @@ pub(crate) async fn get_builderlab_auth(
     app_state: tauri::State<'_, crate::app_state::AppState>,
     session: tauri::State<'_, BuilderlabSession>,
 ) -> Result<Option<BuilderlabAuthInfo>, String> {
-    let in_memory = session
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .as_ref()
-        .map(|stored| stored.credential.clone());
     // A fresh process has nothing in memory; the credential from the last run
     // is in the keyring. Hydrate before deciding the page is signed out.
-    let credential = match in_memory {
-        Some(credential) => credential,
+    let (credential, generation) = match session.current()? {
+        Some(current) => current,
         None => {
-            let Some(credential) = stored_credential() else {
+            let Some(persisted) = stored_credential()? else {
                 return Ok(None);
             };
-            *session.0.lock().map_err(|error| error.to_string())? = Some(StoredSession {
-                credential: credential.clone(),
-            });
-            credential
+            session.hydrate(persisted)?
         }
     };
     match authenticated_user(&app_state.http_client, &credential).await {
-        Ok(me) => Ok(Some(BuilderlabAuthInfo {
-            expires_at: me.expires_at,
-            email: me.email,
-            name: me.name,
-        })),
+        Ok(me) => {
+            // Only report auth for the session still in effect. An older check
+            // completing after a logout would otherwise present the user as
+            // signed in to an account they just left.
+            if session.current()?.is_none_or(|(_, now)| now != generation) {
+                return Ok(None);
+            }
+            Ok(Some(BuilderlabAuthInfo {
+                expires_at: me.expires_at,
+                email: me.email,
+                name: me.name,
+            }))
+        }
         Err(error) => {
             // The credential is no longer good (expired, revoked, or the
             // account changed). Drop it from both stores so the next launch
             // asks for a sign-in instead of failing this call again.
-            *session
-                .0
-                .lock()
-                .map_err(|lock_error| lock_error.to_string())? = None;
-            forget_credential();
+            session.clear_if_current(generation)?;
             Err(error)
         }
     }
@@ -460,9 +532,7 @@ pub(crate) fn cancel_builderlab_login(
 pub(crate) fn clear_builderlab_auth(
     session: tauri::State<'_, BuilderlabSession>,
 ) -> Result<(), String> {
-    *session.0.lock().map_err(|error| error.to_string())? = None;
-    forget_credential();
-    Ok(())
+    session.clear()
 }
 
 #[derive(Debug, Deserialize)]
@@ -482,11 +552,8 @@ async fn authenticated_json(
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let credential = session
-        .0
-        .lock()
-        .map_err(|error| error.to_string())?
-        .as_ref()
-        .map(|stored| stored.credential.clone())
+        .current()?
+        .map(|(credential, _generation)| credential)
         .ok_or_else(|| "Sign in to Builderlab first".to_owned())?;
     let response = client
         .request(method, api_url(path)?)
@@ -736,5 +803,57 @@ mod tests {
             Some("http://127.0.0.1:1234/callback/nonce")
         );
         assert!(!query.contains_key("screen_hint"));
+    }
+
+    #[test]
+    fn a_login_during_a_check_survives_that_check_s_rejection() {
+        // The race: a check reads generation N, the user signs in again while
+        // it is in flight, and the stale 401 comes back. It must not delete
+        // the credential that just replaced the one it checked.
+        let session = BuilderlabSession::default();
+        session.0.lock().unwrap().stored.replace(StoredSession {
+            credential: "old".into(),
+        });
+        let (credential, generation) = session.current().unwrap().expect("a session");
+        assert_eq!(credential, "old");
+
+        // A newer login lands, bumping the generation.
+        {
+            let mut state = session.0.lock().unwrap();
+            state.stored = Some(StoredSession {
+                credential: "new".into(),
+            });
+            state.generation += 1;
+        }
+
+        session
+            .clear_if_current(generation)
+            .expect("a stale verdict must be a no-op");
+
+        let (credential, _) = session.current().unwrap().expect("session must survive");
+        assert_eq!(
+            credential, "new",
+            "a stale rejection must not delete the credential that replaced it"
+        );
+    }
+
+    #[test]
+    fn hydration_never_overwrites_a_newer_credential() {
+        // The keyring read is not instant, so a login can land first. The
+        // credential from disk must not resurrect over it.
+        let session = BuilderlabSession::default();
+        {
+            let mut state = session.0.lock().unwrap();
+            state.stored = Some(StoredSession {
+                credential: "new".into(),
+            });
+            state.generation += 1;
+        }
+
+        let (credential, _) = session.hydrate("from-disk".into()).unwrap();
+        assert_eq!(
+            credential, "new",
+            "hydration must yield to the credential already in memory"
+        );
     }
 }
