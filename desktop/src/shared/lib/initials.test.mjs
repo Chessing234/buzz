@@ -43,8 +43,9 @@ describe("getInitials beyond the BMP", () => {
 describe("getInitials with combining marks", () => {
   it("does not split a word at a vowel sign", () => {
     // अनिल कुमार — the vowel sign in अनिल used to split the word, so the
-    // second initial came from the middle of the first name.
-    assert.equal(getInitials("अनिल कुमार"), "अक");
+    // second initial came from the middle of the first name. कु is one
+    // cluster: the surname's vowel sign belongs to its consonant.
+    assert.equal(getInitials("अनिल कुमार"), "अकु");
   });
 
   it("gives a one-word name one initial", () => {
@@ -52,10 +53,30 @@ describe("getInitials with combining marks", () => {
   });
 
   it("handles a Burmese name the same way", () => {
-    assert.equal(getInitials("မောင်မောင်"), "မ");
+    assert.equal(getInitials("မောင်မောင်"), "မေ");
   });
 
   it("still strips punctuation that is not a mark", () => {
     assert.equal(getInitials("B (relay)"), "BR");
+  });
+});
+
+describe("getInitials takes a grapheme cluster, not a code point", () => {
+  it("keeps a decomposed accent with its letter", () => {
+    // NFD: E + U+0301. A code point initial dropped the accent entirely.
+    // The result stays decomposed — the initial is the input's own cluster,
+    // not a renormalized one — so compare against the decomposed form.
+    assert.equal(getInitials("E\u0301lodie Durand"), "E\u0301D");
+    assert.equal(getInitials("E\u0301lodie Durand").normalize("NFC"), "ÉD");
+  });
+
+  it("does not split a cluster joined by a zero-width joiner", () => {
+    // क्‍ष is one cluster; ZWJ is neither a letter nor a mark, so it used to
+    // act as a word separator and produce two initials from one word.
+    assert.equal(getInitials("\u0915\u094D\u200D\u0937 Name"), "क्‍षN");
+  });
+
+  it("still returns nothing for a name with no letters", () => {
+    assert.equal(getInitials("()"), "");
   });
 });
