@@ -76,8 +76,21 @@ pub enum ConfigOrigin {
 }
 
 /// How a config field can be written back to the runtime.
+///
+/// `rename_all_fields` is load-bearing, not decoration: on an internally
+/// tagged enum `rename_all` renames the *variants*, never the variants'
+/// fields, so without it `RespawnWithEnvVar` serializes as
+/// `{"type":"respawnWithEnvVar","env_key":"…"}` while
+/// `desktop/src/shared/api/types.ts` declares `envKey`. `invokeTauri<T>` is an
+/// unchecked cast, so `tsc` cannot see the mismatch — the reader just gets
+/// `undefined`. `wire_format_matches_typescript_contract` below pins the exact
+/// bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ConfigWriteMechanism {
     /// Update record env vars, save, stop + restart agent.
     RespawnWithEnvVar { env_key: String },
@@ -134,8 +147,15 @@ pub struct ConfigField {
     pub write_via: ConfigWriteMechanism,
 }
 
+/// `rename_all_fields` is carried here for the same reason as on
+/// [`ConfigWriteMechanism`], even though `options` is a single word today: it
+/// is the attribute a future multi-word field would silently need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ConfigFieldType {
     String,
     Number,
@@ -263,3 +283,4 @@ pub struct AcpModelEntry {
     pub name: Option<String>,
     pub description: Option<String>,
 }
+
