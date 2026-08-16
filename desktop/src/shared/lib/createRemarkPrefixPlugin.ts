@@ -41,8 +41,8 @@ export function createRemarkPrefixPlugin(
   };
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: remark tree types are not available
 function walkChildren(
+  // biome-ignore lint/suspicious/noExplicitAny: remark tree types are not available
   node: any,
   pattern: RegExp,
   buildNode: NodeBuilder,
