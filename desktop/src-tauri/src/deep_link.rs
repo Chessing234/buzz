@@ -329,9 +329,20 @@ fn single_param(url: &Url, name: &str) -> Option<String> {
 
 /// A 64-character hex event id, lowercased. Mirrors the check
 /// `parse_channel_deep_link` already applies to the message id it carries.
-/// An optional param: absent or empty reads as absent; repeated is a
-/// rejection.
-fn optional_single_param(url: &Url, name: &str) -> Option<Option<String>> {
+fn canonical_hex64(value: &str) -> Option<String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+fn hex64_param(url: &Url, name: &str) -> Option<String> {
+    canonical_hex64(&single_param(url, name)?)
+}
+
+/// An optional hex64 param: absent or empty reads as absent, as it always has;
+/// present-but-malformed and repeated are rejections.
+fn optional_hex64_param(url: &Url, name: &str) -> Option<Option<String>> {
     let values: Vec<String> = url
         .query_pairs()
         .filter(|(key, _)| key == name)
@@ -340,7 +351,7 @@ fn optional_single_param(url: &Url, name: &str) -> Option<Option<String>> {
     match values.as_slice() {
         [] => Some(None),
         [value] if value.is_empty() => Some(None),
-        [value] => Some(Some(value.clone())),
+        [value] => canonical_hex64(value).map(Some),
         _ => None,
     }
 }
@@ -351,12 +362,21 @@ fn optional_single_param(url: &Url, name: &str) -> Option<Option<String>> {
 /// policy of the `connect` arm so the frontend never sees a half-formed
 /// payload (e.g. `channelId: ""` from `channel=&id=foo`).
 ///
+/// The shapes are checked the same way `parse_channel_deep_link` checks the
+/// equivalent path segments a few lines up: a `buzz://message` link and a
+/// `buzz://channel/<uuid>/<id>` link name the same two things, so a value one
+/// of them would refuse should not sail through the other.
+///
 /// Pulled out of `handle_deep_link_url` so it can be unit-tested without
 /// a live `tauri::AppHandle`.
 fn parse_message_deep_link(url: &Url) -> Option<serde_json::Value> {
-    let channel_id = single_param(url, "channel")?;
-    let message_id = single_param(url, "id")?;
-    let thread = optional_single_param(url, "thread")?;
+    let channel_id = uuid::Uuid::parse_str(&single_param(url, "channel")?)
+        .ok()?
+        .to_string();
+    let message_id = hex64_param(url, "id")?;
+    // Absent or empty is fine; present-but-malformed is not, and neither is
+    // repeated.
+    let thread = optional_hex64_param(url, "thread")?;
     Some(serde_json::json!({
         "channelId": channel_id,
         "messageId": message_id,
