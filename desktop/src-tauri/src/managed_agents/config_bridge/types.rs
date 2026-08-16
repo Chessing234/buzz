@@ -284,3 +284,106 @@ pub struct AcpModelEntry {
     pub description: Option<String>,
 }
 
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+
+    /// Every `ConfigWriteMechanism` variant, as `desktop/src/shared/api/types.ts`
+    /// declares it. Whole-value comparison, not a key-set check: a key-set
+    /// assertion still passes if the variant *name* regresses, and the `type`
+    /// discriminant is what every `switch (writeVia.type)` reads.
+    #[test]
+    fn wire_format_matches_typescript_contract() {
+        let cases = [
+            (
+                ConfigWriteMechanism::RespawnWithEnvVar {
+                    env_key: "GOOSE_MODE".into(),
+                },
+                r#"{"type":"respawnWithEnvVar","envKey":"GOOSE_MODE"}"#,
+            ),
+            (
+                ConfigWriteMechanism::AcpSetConfigOption {
+                    config_id: "model".into(),
+                },
+                r#"{"type":"acpSetConfigOption","configId":"model"}"#,
+            ),
+            (
+                ConfigWriteMechanism::AcpSetSessionModel,
+                r#"{"type":"acpSetSessionModel"}"#,
+            ),
+            (
+                ConfigWriteMechanism::GooseNativeConfigWrite {
+                    config_key: "goose.model".into(),
+                },
+                r#"{"type":"gooseNativeConfigWrite","configKey":"goose.model"}"#,
+            ),
+            (ConfigWriteMechanism::ReadOnly, r#"{"type":"readOnly"}"#),
+        ];
+        for (mechanism, expected) in cases {
+            assert_eq!(
+                serde_json::to_string(&mechanism).expect("serialize"),
+                expected
+            );
+        }
+    }
+
+    /// The renderer never sees a bare mechanism — it arrives nested inside
+    /// `NormalizedField`, which is where the mismatch used to hide: the
+    /// enclosing struct's `writeVia` / `overriddenValue` / `isRequired` all
+    /// renamed correctly, so only the variant's own field was snake_case.
+    #[test]
+    fn nested_field_is_camel_case_all_the_way_down() {
+        let field = NormalizedField {
+            value: Some("v".into()),
+            origin: ConfigOrigin::EnvVar,
+            write_via: ConfigWriteMechanism::RespawnWithEnvVar {
+                env_key: "GOOSE_MODE".into(),
+            },
+            overridden_value: Some("o".into()),
+            overridden_origin: Some(ConfigOrigin::ConfigFile),
+            is_required: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&field).expect("serialize"),
+            r#"{"value":"v","origin":"envVar","writeVia":{"type":"respawnWithEnvVar","envKey":"GOOSE_MODE"},"overriddenValue":"o","overriddenOrigin":"configFile","isRequired":true}"#
+        );
+    }
+
+    /// The contract is singular: the shape the renderer sends back round-trips,
+    /// and the old snake_case spelling is no longer accepted. Without the
+    /// second half, a future revert would still deserialize and the read path
+    /// would look healthy.
+    #[test]
+    fn camel_case_round_trips_and_snake_case_is_rejected() {
+        let parsed: ConfigWriteMechanism =
+            serde_json::from_str(r#"{"type":"respawnWithEnvVar","envKey":"GOOSE_MODE"}"#)
+                .expect("the TypeScript shape must deserialize");
+        assert_eq!(
+            parsed,
+            ConfigWriteMechanism::RespawnWithEnvVar {
+                env_key: "GOOSE_MODE".into(),
+            }
+        );
+
+        assert!(
+            serde_json::from_str::<ConfigWriteMechanism>(
+                r#"{"type":"respawnWithEnvVar","env_key":"GOOSE_MODE"}"#
+            )
+            .is_err(),
+            "the pre-fix snake_case spelling must not be accepted"
+        );
+    }
+
+    /// `ConfigFieldType`'s only payload field is single-word today, so this
+    /// pins the shape rather than proving a fix.
+    #[test]
+    fn config_field_type_enum_variant_matches_the_contract() {
+        assert_eq!(
+            serde_json::to_string(&ConfigFieldType::Enum {
+                options: vec!["a".into(), "b".into()],
+            })
+            .expect("serialize"),
+            r#"{"type":"enum","options":["a","b"]}"#
+        );
+    }
+}
