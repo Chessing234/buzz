@@ -199,6 +199,14 @@ fn migrate_inline_key(store: &impl KeyStore, record: &ManagedAgentRecord) -> Key
     if record.private_key_nsec.is_empty() {
         return KeyMigration::Nothing;
     }
+    // Usable key material exists for this agent, whatever an earlier keyring
+    // read concluded. This is the single funnel every inline key passes
+    // through — hydration's fallback branch and the save-time persist
+    // chokepoint both land here — so it is where a stale "known missing" mark
+    // gets cleared. A restore from backup or an import shows up as an inline
+    // key without ever going through a successful keyring *read*, and without
+    // this the session would go on telling the user the identity is gone.
+    forget_key_missing(&record.pubkey);
     let name = agent_keyring_name(&record.pubkey);
     match store.probe(&name) {
         // Keyring down this boot: keep the key inline (file fallback), do NOT
@@ -269,16 +277,21 @@ pub(crate) fn key_known_missing(pubkey: &str) -> bool {
 /// Word the refusal for the condition that actually holds.
 ///
 /// When the keyring answered and had nothing, "retry once the keyring is
-/// reachable" sends the user to inspect a keyring that is working fine while
-/// the key is gone for good: `managed-agents.json` never carries the secret,
-/// so there is nothing left to recover from. Pure, so both wordings are
-/// unit-tested.
+/// reachable" sends the user to inspect a keyring that is working fine. What
+/// is true in that case is narrower than "the key is gone": the two places
+/// this session looked — the inline `private_key_nsec` in
+/// `managed-agents.json` (the deliberate `0600` fallback used when the keyring
+/// is unreachable) and the keyring itself — both came up empty. A copy of the
+/// nsec held anywhere else still restores the identity: `private_key_nsec` is
+/// a real field of the record and hydration reads it, so recreation is the
+/// last resort and not the only one. Pure, so both wordings are unit-tested.
 pub(crate) fn key_refusal_message(pubkey: &str, known_missing: bool) -> String {
     if known_missing {
         format!(
-            "agent {pubkey} has no private key: none inline and none in the OS keyring. \
-             The key is not recoverable from managed-agents.json, which never holds it — \
-             recreate the agent to mint a new identity."
+            "agent {pubkey} has no private key: none inline in managed-agents.json \
+             and none in the OS keyring. If you have this agent's nsec saved \
+             elsewhere, restore it to the record's private_key_nsec field; \
+             otherwise recreate the agent to mint a new identity."
         )
     } else {
         format!(
