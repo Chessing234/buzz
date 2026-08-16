@@ -69,6 +69,25 @@ test("covers the no-tty wording git uses without GIT_TERMINAL_PROMPT", () => {
   assert.match(presentation.description, /Buzz relay/);
 });
 
+test("a device failure on its own is not read as missing credentials", () => {
+  // The no-tty reason git appends is also what unrelated device failures
+  // report; only git's own credential prefix should reach that message.
+  assert.notEqual(
+    projectCloneErrorPresentation(
+      new Error("fatal: cannot open '/dev/disk4': No such device or address"),
+      "https://example.com/team/app.git",
+    ).title,
+    "Repository needs credentials Buzz can’t supply",
+  );
+  assert.notEqual(
+    projectCloneErrorPresentation(
+      new Error("error: unable to write file: Device not configured"),
+      "https://example.com/team/app.git",
+    ).title,
+    "Repository needs credentials Buzz can’t supply",
+  );
+});
+
 test("still routes a real 403 to the access-required message", () => {
   assert.equal(
     projectCloneErrorPresentation(
@@ -109,6 +128,45 @@ test("explains a TLS certificate that could not be verified", () => {
   );
   assert.equal(presentation.title, "Couldn’t verify the server’s certificate");
   assert.match(presentation.description, /proxy|self-signed/);
+});
+
+test("names the certificate for backend-specific trust failures", () => {
+  for (const message of [
+    "fatal: unable to access 'https://git.corp.example/app.git/': gnutls_handshake() failed: Error in the certificate verification.",
+    "fatal: unable to access 'https://git.corp.example/app.git/': schannel: next InitializeSecurityContext failed: SEC_E_UNTRUSTED_ROOT (0x80090325)",
+  ]) {
+    assert.equal(
+      projectCloneErrorPresentation(
+        new Error(message),
+        "https://git.corp.example/app.git",
+      ).title,
+      "Couldn’t verify the server’s certificate",
+    );
+  }
+});
+
+test("a generic handshake failure is not blamed on the certificate", () => {
+  // Both backends report ordinary transport failures under the same prefix;
+  // advising a CA install there sends the user after the wrong problem.
+  for (const message of [
+    "fatal: unable to access 'https://example.com/app.git/': gnutls_handshake() failed: The TLS connection was non-properly terminated.",
+    "fatal: unable to access 'https://example.com/app.git/': schannel: failed to receive handshake, SSL/TLS connection failed",
+  ]) {
+    const presentation = projectCloneErrorPresentation(
+      new Error(message),
+      "https://example.com/app.git",
+    );
+    assert.equal(presentation.title, "Couldn’t reach the repository");
+  }
+});
+
+test("the certificate advice names the trusted CA and keeps verification on", () => {
+  const presentation = projectCloneErrorPresentation(
+    new Error("fatal: unable to access: certificate verify failed"),
+    "https://example.com/app.git",
+  );
+  assert.match(presentation.description, /trusted CA certificate/);
+  assert.match(presentation.description, /Don’t turn off/);
 });
 
 test("a certificate failure is not mistaken for an auth failure", () => {

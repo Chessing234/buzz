@@ -29,8 +29,14 @@ export function projectCloneErrorPresentation(
   // holding NOSTR_PRIVATE_KEY. A private HTTPS remote therefore fails with
   // git's non-interactive credential error, which matches none of the auth
   // patterns below and lands on "try again" — advice that can never work.
+  //
+  // Key this on git's own credential signatures only. The trailing reason git
+  // prints for a missing tty ("No such device or address", "Device not
+  // configured") is also what an unrelated filesystem or device failure
+  // reports, and git always prefixes the credential case with "could not read
+  // Username/Password", so matching the reason alone only overmatches.
   if (
-    /could not read (?:username|password)|terminal prompts disabled|no such device or address|device not configured/.test(
+    /could not read (?:username|password)|terminal prompts disabled/.test(
       message,
     )
   ) {
@@ -69,15 +75,21 @@ export function projectCloneErrorPresentation(
   }
   // A proxy or self-signed certificate in front of the host. "Try again"
   // never resolves it; the certificate chain has to be trusted first.
+  //
+  // Match concrete trust/verification signatures only. Every backend also
+  // reports ordinary transport failures under its handshake prefix
+  // (`gnutls_handshake`, `schannel:`), and telling someone to install a CA
+  // when the certificate was never the problem sends them the wrong way;
+  // those fall through to the connectivity message below.
   if (
-    /ssl certificate problem|unable to get local issuer certificate|certificate verify failed|self[- ]signed certificate|gnutls_handshake|schannel: /.test(
+    /ssl certificate problem|unable to get local issuer certificate|unable to verify the first certificate|certificate verify failed|error in the certificate verification|self[- ]signed certificate|certificate (?:chain )?(?:is |was )?not trusted|sec_e_untrusted_root|cert_e_untrustedroot/.test(
       message,
     )
   ) {
     return {
       title: "Couldn’t verify the server’s certificate",
       description:
-        "The TLS certificate for this host could not be verified — often a corporate proxy or a self-signed certificate. Trust the certificate on this machine, then try again.",
+        "The TLS certificate for this host could not be verified — often a corporate proxy or a self-signed certificate. Install the trusted CA certificate your administrator provides, then try again. Don’t turn off certificate verification.",
     };
   }
   if (/\b404\b|repository not found|repository does not exist/.test(message)) {
@@ -87,8 +99,10 @@ export function projectCloneErrorPresentation(
         "Check that the repository link is correct and that the repository still exists.",
     };
   }
+  // A handshake that failed for anything other than trust — a prematurely
+  // terminated TLS connection, a dropped proxy — is a connectivity problem.
   if (
-    /timed? out|could not resolve host|failed to connect|connection (?:refused|reset)|network is unreachable|offline/.test(
+    /timed? out|could not resolve host|failed to connect|connection (?:refused|reset)|network is unreachable|offline|gnutls_handshake|schannel: |ssl connect error|handshake fail/.test(
       message,
     )
   ) {
