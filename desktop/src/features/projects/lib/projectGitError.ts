@@ -29,11 +29,14 @@ export function projectCloneErrorPresentation(
   // holding NOSTR_PRIVATE_KEY. A private HTTPS remote therefore fails with
   // git's non-interactive credential error, which matches none of the auth
   // patterns below and lands on "try again" — advice that can never work.
-  if (
-    /could not read (?:username|password)|terminal prompts disabled|no such device or address|device not configured/.test(
-      message,
-    )
-  ) {
+  //
+  // Only git's own `could not read Username/Password for <url>` signature is
+  // matched. The trailing reason varies by platform (`terminal prompts
+  // disabled` under GIT_TERMINAL_PROMPT=0, `No such device or address` on a
+  // TTY-less Unix, `Device not configured` on macOS), so anchoring on the
+  // prefix covers all three without claiming a credential failure for the
+  // transport and filesystem errors those generic OS phrases also accompany.
+  if (/could not read (?:username|password) for /.test(message)) {
     return {
       title: "Repository needs credentials Buzz can’t supply",
       description: github

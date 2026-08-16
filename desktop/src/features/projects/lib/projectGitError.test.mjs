@@ -55,18 +55,41 @@ test("explains git's non-interactive credential failure instead of 'try again'",
   assert.doesNotMatch(presentation.description, /Try again/);
 });
 
-test("covers the no-tty wording git uses without GIT_TERMINAL_PROMPT", () => {
-  const presentation = projectCloneErrorPresentation(
-    new Error(
-      "fatal: could not read Username for 'https://example.com': No such device or address",
-    ),
-    "https://example.com/team/app.git",
-  );
-  assert.equal(
-    presentation.title,
-    "Repository needs credentials Buzz can’t supply",
-  );
-  assert.match(presentation.description, /Buzz relay/);
+test("covers the platform wordings git uses for the same prompt failure", () => {
+  // Only the reason after the colon changes across GIT_TERMINAL_PROMPT=0, a
+  // TTY-less Unix and macOS, so all three land on the same presentation.
+  for (const reason of [
+    "terminal prompts disabled",
+    "No such device or address",
+    "Device not configured",
+  ]) {
+    assert.equal(
+      projectCloneErrorPresentation(
+        new Error(
+          `fatal: could not read Password for 'https://example.com': ${reason}`,
+        ),
+        "https://example.com/team/app.git",
+      ).title,
+      "Repository needs credentials Buzz can’t supply",
+    );
+  }
+});
+
+test("does not claim a credential failure for generic OS device errors", () => {
+  // These phrases also accompany transport and filesystem failures; without
+  // git's `could not read Username/Password for` prefix they carry no signal.
+  for (const message of [
+    "fatal: unable to access 'https://example.com/team/app.git': No such device or address",
+    "error: cannot stat '.git/objects': Device not configured",
+  ]) {
+    assert.equal(
+      projectCloneErrorPresentation(
+        new Error(message),
+        "https://example.com/team/app.git",
+      ).title,
+      "Couldn’t clone repository",
+    );
+  }
 });
 
 test("still routes a real 403 to the access-required message", () => {
