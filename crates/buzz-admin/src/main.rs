@@ -376,15 +376,28 @@ fn owner_key_source(flag: Option<&str>) -> std::result::Result<OwnerKeySource, S
     }
 }
 
+/// Turn a raw owner secret plus the command's arguments into the `auth` tag.
+///
+/// This is the whole of the command except reading the secret: argument
+/// parsing, the trim, key parsing, and the SDK call. Tests drive this rather
+/// than `buzz_sdk::nip_oa::compute_auth_tag` directly, so that a change to
+/// what the command accepts — an npub agent, a padded secret — is covered
+/// instead of bypassed.
+fn auth_tag_from_secret(secret: &str, agent: &str, conditions: &str) -> Result<String> {
+    let agent_pubkey = nostr::PublicKey::parse(agent)
+        .map_err(|e| anyhow::anyhow!("invalid --agent '{agent}': {e}"))?;
+    let owner_keys =
+        Keys::parse(secret.trim()).map_err(|e| anyhow::anyhow!("invalid owner secret key: {e}"))?;
+    buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, conditions)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Compute a NIP-OA `auth` tag for `agent` signed by the owner secret.
 fn cmd_compute_auth_tag(
     agent: &str,
     conditions: &str,
     owner_key_flag: Option<&str>,
 ) -> Result<i32> {
-    let agent_pubkey = nostr::PublicKey::parse(agent)
-        .map_err(|e| anyhow::anyhow!("invalid --agent '{agent}': {e}"))?;
-
     let source = owner_key_source(owner_key_flag).map_err(|e| anyhow::anyhow!(e))?;
     let secret = match source {
         OwnerKeySource::Stdin => {
@@ -401,10 +414,7 @@ fn cmd_compute_auth_tag(
         })?,
     };
 
-    let owner_keys =
-        Keys::parse(secret.trim()).map_err(|e| anyhow::anyhow!("invalid owner secret key: {e}"))?;
-    let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner_keys, &agent_pubkey, conditions)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tag = auth_tag_from_secret(&secret, agent, conditions)?;
     println!("{tag}");
     Ok(0)
 }
@@ -728,8 +738,9 @@ async fn reconcile_channels(
 
 #[cfg(test)]
 mod auth_tag_tests {
-    use super::{owner_key_source, OwnerKeySource};
-    use nostr::Keys;
+    use super::{auth_tag_from_secret, owner_key_source, Cli, Command, OwnerKeySource};
+    use clap::Parser;
+    use nostr::{Keys, ToBech32};
 
     #[test]
     fn no_flag_reads_the_environment() {
@@ -751,10 +762,15 @@ mod auth_tag_tests {
 
     #[test]
     fn the_emitted_tag_verifies_for_the_agent_it_names() {
+        // Through the command's own path — secret text in, tag out.
         let owner = Keys::generate();
         let agent = Keys::generate();
-        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
-            .expect("compute");
+        let tag = auth_tag_from_secret(
+            &owner.secret_key().to_secret_hex(),
+            &agent.public_key().to_hex(),
+            "kind=9",
+        )
+        .expect("compute");
         let recovered =
             buzz_sdk::nip_oa::verify_auth_tag(&tag, &agent.public_key()).expect("verify");
         assert_eq!(recovered, owner.public_key());
@@ -765,8 +781,103 @@ mod auth_tag_tests {
         let owner = Keys::generate();
         let agent = Keys::generate();
         let other = Keys::generate();
-        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "kind=9")
-            .expect("compute");
+        let tag = auth_tag_from_secret(
+            &owner.secret_key().to_secret_hex(),
+            &agent.public_key().to_hex(),
+            "kind=9",
+        )
+        .expect("compute");
         assert!(buzz_sdk::nip_oa::verify_auth_tag(&tag, &other.public_key()).is_err());
+    }
+
+    #[test]
+    fn the_command_accepts_the_spellings_its_help_advertises() {
+        // An nsec owner secret, an npub agent, and the whitespace a piped
+        // secret arrives with — all handled by the command, not by the caller.
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let piped = format!("{}\n", owner.secret_key().to_bech32().expect("nsec"));
+        let tag = auth_tag_from_secret(
+            &piped,
+            &agent.public_key().to_bech32().expect("npub"),
+            "kind=9&created_at<1713957000",
+        )
+        .expect("compute");
+        let recovered =
+            buzz_sdk::nip_oa::verify_auth_tag(&tag, &agent.public_key()).expect("verify");
+        assert_eq!(recovered, owner.public_key());
+    }
+
+    #[test]
+    fn a_comma_separated_conditions_string_is_rejected() {
+        // NIP-OA joins clauses with `&`; the comma form the help used to
+        // suggest is not a valid clause list.
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let err = auth_tag_from_secret(
+            &owner.secret_key().to_secret_hex(),
+            &agent.public_key().to_hex(),
+            "kind=0,kind=9",
+        )
+        .expect_err("comma form must be rejected");
+        // The whole `0,kind=9` is read as one kind value, so the complaint is
+        // about that value rather than about the comma — which is precisely
+        // why the old help example was worth correcting.
+        assert!(err.to_string().contains("0,kind=9"), "{err}");
+    }
+
+    #[test]
+    fn clap_accepts_owner_key_dash_and_a_compound_conditions_value() {
+        // `-` on a value-taking flag is easy to lose to clap's own parsing,
+        // and `&` has to survive as one argument.
+        let cli = Cli::try_parse_from([
+            "buzz-admin",
+            "compute-auth-tag",
+            "--agent",
+            &"a".repeat(64),
+            "--conditions",
+            "kind=9&created_at<1713957000",
+            "--owner-key",
+            "-",
+        ])
+        .expect("must parse");
+        match cli.command {
+            Command::ComputeAuthTag {
+                agent,
+                conditions,
+                owner_key,
+            } => {
+                assert_eq!(agent, "a".repeat(64));
+                assert_eq!(conditions, "kind=9&created_at<1713957000");
+                assert_eq!(owner_key.as_deref(), Some("-"));
+                assert_eq!(
+                    owner_key_source(owner_key.as_deref()).unwrap(),
+                    OwnerKeySource::Stdin
+                );
+            }
+            _ => panic!("clap parsed the wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn conditions_default_to_authorizing_every_kind() {
+        let cli =
+            Cli::try_parse_from(["buzz-admin", "compute-auth-tag", "--agent", &"a".repeat(64)])
+                .expect("must parse");
+        match cli.command {
+            Command::ComputeAuthTag {
+                conditions,
+                owner_key,
+                ..
+            } => {
+                assert_eq!(conditions, "");
+                assert_eq!(owner_key, None);
+                assert_eq!(
+                    owner_key_source(owner_key.as_deref()).unwrap(),
+                    OwnerKeySource::Env
+                );
+            }
+            _ => panic!("clap parsed the wrong subcommand"),
+        }
     }
 }
