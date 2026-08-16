@@ -19,7 +19,10 @@ import {
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { Badge } from "@/shared/ui/badge";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
-import { truncateByCharacters } from "@/shared/lib/truncateByCharacters";
+import {
+  countCharacters,
+  truncateByCharacters,
+} from "@/shared/lib/truncateByCharacters";
 
 export type SearchResult =
   | {
@@ -183,7 +186,7 @@ function truncateContent(content: string) {
     return "No message body.";
   }
 
-  if (trimmed.length <= 180) {
+  if (countCharacters(trimmed) <= 180) {
     return trimmed;
   }
 

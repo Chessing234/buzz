@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { truncateByCharacters } from "./truncateByCharacters.ts";
+import {
+  countCharacters,
+  truncateByCharacters,
+} from "./truncateByCharacters.ts";
 
 test("leaves a short string alone", () => {
   assert.equal(truncateByCharacters("hello", 100), "hello");
@@ -28,4 +31,20 @@ test("counts characters, not code units", () => {
 test("handles the degenerate limits", () => {
   assert.equal(truncateByCharacters("hello", 0), "");
   assert.equal(truncateByCharacters("", 10), "");
+});
+
+test("counts characters so a guard cannot disagree with the cut", () => {
+  // 150 emoji: 150 characters, 300 code units. A `.length > 200` guard fires
+  // while the cut returns the whole string, so the caller appends an ellipsis
+  // to text that was never shortened.
+  const emoji = "🎉".repeat(150);
+  assert.equal(emoji.length, 300);
+  assert.equal(countCharacters(emoji), 150);
+  assert.equal(truncateByCharacters(emoji, 200), emoji);
+  assert.equal(countCharacters(emoji) > 200, false);
+});
+
+test("counts a plain string the same as .length", () => {
+  assert.equal(countCharacters("hello"), 5);
+  assert.equal(countCharacters(""), 0);
 });
