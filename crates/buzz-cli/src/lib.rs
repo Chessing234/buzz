@@ -387,7 +387,8 @@ pub enum MessagesCmd {
         /// Event ID to reply to (creates a thread)
         #[arg(long)]
         reply_to: Option<String>,
-        /// Also publish to the Nostr network
+        /// Also publish to the Nostr network. Stream-only (kind 9): rejected
+        /// in a forum channel and with --kind 45001/45003.
         #[arg(long, default_value_t = false)]
         broadcast: bool,
         /// Attach file(s) — uploads and includes as imeta tags
