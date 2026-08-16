@@ -420,6 +420,35 @@ fn parse_message_deep_link_validates_the_shapes_its_neighbours_validate() {
 }
 
 #[test]
+fn parse_message_deep_link_rejects_a_repeated_param() {
+    // The loop used to keep the last value while the in-app parser keeps the
+    // first, so one URL routed two ways depending on where it was opened.
+    for raw in [
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&channel=11111111-1111-4111-8111-111111111111",
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&thread=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&thread=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ] {
+        assert!(
+            parse_message_deep_link(&Url::parse(raw).unwrap()).is_none(),
+            "must reject {raw}"
+        );
+    }
+}
+
+#[test]
+fn parse_join_deep_link_rejects_a_repeated_param() {
+    for raw in [
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc&code=evil",
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&relay=wss%3A%2F%2Fevil.example&code=abc",
+    ] {
+        assert!(
+            parse_join_deep_link(&Url::parse(raw).unwrap()).is_none(),
+            "must reject {raw}"
+        );
+    }
+}
+
+#[test]
 fn parse_join_deep_link_extracts_relay_and_code() {
     let url = Url::parse("buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc.def").unwrap();
     let payload = parse_join_deep_link(&url).expect("required params present");
