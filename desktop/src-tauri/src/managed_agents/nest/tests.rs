@@ -599,6 +599,66 @@ fn test_render_dynamic_section_skips_blank_named_agents() {
 }
 
 #[test]
+fn test_duplicate_names_are_marked_ambiguous_not_merged() {
+    // Four creates of "Coder" mint four keypairs (#5786 defect B). Rendered
+    // plainly this is four identical `@Coder` cells.
+    let personas = vec![make_persona("p1", "Builder")];
+    let agents: Vec<ManagedAgentRecord> = (0..4)
+        .map(|i| ManagedAgentRecord {
+            pubkey: fake_pubkey(&format!("coder-{i}")),
+            ..make_agent("Coder", Some("p1"))
+        })
+        .collect();
+    let output = render_dynamic_section(&personas, &agents, "ws://example.com:3000");
+
+    // No identity is dropped — all four are really deployed.
+    assert_eq!(output.matches("| Coder | Builder |").count(), 4, "{output}");
+    // And none of them claims to be reachable as a plain `@Coder`.
+    assert!(
+        !output.contains("| @Coder |"),
+        "a bare @Coder address is ambiguous here: {output}"
+    );
+    assert_eq!(output.matches("4 agents share this name").count(), 4);
+    // The pubkey prefix is what tells the rows apart.
+    for i in 0..4 {
+        let short = &fake_pubkey(&format!("coder-{i}"))[..8];
+        assert!(output.contains(short), "missing {short} in {output}");
+    }
+}
+
+#[test]
+fn test_duplicate_detection_ignores_case_and_surrounding_space() {
+    // Mention resolution is case-insensitive, so `Coder` and ` coder ` collide.
+    let agents = vec![
+        ManagedAgentRecord {
+            pubkey: fake_pubkey("one"),
+            ..make_agent("Coder", None)
+        },
+        ManagedAgentRecord {
+            pubkey: fake_pubkey("two"),
+            name: " coder ".to_string(),
+            ..make_agent("Coder", None)
+        },
+    ];
+    let output = render_dynamic_section(&[], &agents, "ws://example.com:3000");
+    assert_eq!(
+        output.matches("2 agents share this name").count(),
+        2,
+        "{output}"
+    );
+}
+
+#[test]
+fn test_a_unique_name_keeps_the_plain_address() {
+    let personas = vec![make_persona("p1", "Builder")];
+    let agents = vec![make_agent("Kit", Some("p1")), make_agent("Scout", None)];
+    let output = render_dynamic_section(&personas, &agents, "ws://example.com:3000");
+    assert!(output.contains("| Kit | Builder | @Kit |"), "{output}");
+    assert!(output.contains("| Scout | — | @Scout |"), "{output}");
+    assert!(!output.contains("ambiguous"), "{output}");
+}
+
+#[test]
 fn test_upsert_managed_section_with_markers() {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("AGENTS.md");
