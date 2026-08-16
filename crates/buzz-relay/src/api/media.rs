@@ -48,16 +48,14 @@ enum UploadRouteMode {
 
 /// Whether an upload should take the streaming video path.
 ///
-/// An audio-only container is excluded even though it is ISO-BMFF: it has no
-/// video track, so the video validator can only reject it — and it rejects a
-/// normal (non-fast-start) voice memo with "moov atom not at front of file",
-/// a 422 about a detail the user cannot act on. Sending it down the generic
-/// path instead produces the honest answer, `415 disallowed content type:
-/// audio/m4a`, which is what audio support actually being absent looks like.
+/// Every ISO-BMFF container does, including one whose major brand says audio.
+/// A brand is a compatibility declaration, not an inventory: MP4RA registers
+/// `M4A `/`M4B ` as iTunes audio brands that may still carry video, chapter
+/// and text tracks. Routing on the brand would send a genuine video down the
+/// generic path to be rejected as audio. The validator classifies from parsed
+/// track types instead, and answers `415 audio/mp4` for a container that turns
+/// out to hold no video.
 fn should_stream_as_video(sniff: &[u8]) -> bool {
-    if buzz_media::looks_like_audio_iso_bmff(sniff) {
-        return false;
-    }
     infer::get(sniff).is_some_and(|kind| kind.mime_type() == "video/mp4")
         || buzz_media::looks_like_iso_bmff(sniff)
 }
@@ -1004,12 +1002,14 @@ mod tests {
     }
 
     #[test]
-    fn audio_only_container_does_not_use_video_pipeline() {
-        // An Apple Voice Memo: major brand M4A, but isom/mp42 among its
-        // compatible brands, which is why it used to read as video.
+    fn an_audio_branded_container_stays_on_the_bounded_video_path() {
+        // An Apple Voice Memo is major brand `M4A `. It must still reach the
+        // validator: the brand does not rule out a video track, and only the
+        // parsed tracks can say. Routing it away here would reject a
+        // video-bearing `M4A ` file on its compatibility declaration alone.
         let memo = ftyp(b"M4A ", &[b"M4A ", b"mp42", b"isom"]);
         assert!(buzz_media::looks_like_iso_bmff(&memo));
-        assert!(!should_stream_as_video(&memo));
+        assert!(should_stream_as_video(&memo));
     }
 
     #[test]
