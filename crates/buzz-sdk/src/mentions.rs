@@ -238,104 +238,175 @@ pub fn normalize_mention_pubkeys(pubkeys: &[String], sender_pubkey: Option<&str>
 
 /// Remove fenced code blocks and inline code spans from content.
 ///
-/// Returns a copy of `content` with ` ```…``` ` blocks and `` `…` `` spans
-/// replaced by spaces. Used only for mention scanning — the original
-/// content is stored verbatim. Preserves valid UTF-8 throughout.
+/// Returns a copy of `content` with fenced blocks and inline spans replaced by
+/// a single space. Used only for mention scanning — the original content is
+/// stored verbatim. Preserves valid UTF-8 throughout.
+///
+/// Mirrors `maskMarkdownCode` in
+/// `desktop/src/features/messages/lib/hasMention.ts`, which is what decides
+/// whether Desktop renders and notifies a mention. Where the two disagree the
+/// signed `p` tags disagree with what a reader sees: text that renders as code
+/// still wakes an agent, or a visible mention carries no tag at all. Three
+/// rules were missing here and are covered by the parity tests below:
+///
+/// * tilde fences (`~~~`), which CommonMark treats exactly like backtick ones;
+/// * fence markers longer than three characters, closed only by a run at least
+///   as long, so ` ```` ` inside a ` ``` ` block does not end it early;
+/// * multi-backtick spans (`` ``code`` ``), where the closing run must match
+///   the opening run's length.
+///
+/// Backslash-escaped backticks do not open a span, also matching Desktop.
+///
+/// Not mirrored: Desktop additionally masks any line indented by four spaces
+/// or a tab. That is not CommonMark — an indented line continuing a list item
+/// is ordinary text — and copying it here would drop `p` tags from list
+/// continuations, which is the more harmful direction. See the PR discussion.
 pub fn strip_code_regions(content: &str) -> String {
+    let bytes = content.as_bytes();
     let mut out = String::with_capacity(content.len());
-    let mut chars = content.char_indices().peekable();
+    let mut i = 0usize;
 
-    while let Some(&(i, ch)) = chars.peek() {
-        // Fenced code block: ``` at line start (possibly after whitespace)
-        if ch == '`' && content[i..].starts_with("```") {
-            let is_fence_start = if i == 0 {
-                true
-            } else {
-                let before = &content[..i];
-                before.ends_with('\n')
-                    || before.chars().all(|c| c.is_ascii_whitespace())
-                    || before.rsplit_once('\n').is_some_and(|(_, after_nl)| {
-                        after_nl.chars().all(|c| c.is_ascii_whitespace())
-                    })
-            };
+    while i < content.len() {
+        let ch = content[i..].chars().next().expect("char boundary");
 
-            if is_fence_start {
-                // Find end of opening fence line
-                let after_fence = i + 3;
-                let rest = &content[after_fence..];
-                let line_end = rest
-                    .find('\n')
-                    .map_or(content.len(), |p| after_fence + p + 1);
-
-                // Find closing fence
-                let mut search_from = line_end;
-                let close_end = loop {
-                    if search_from >= content.len() {
-                        break content.len();
-                    }
-                    if let Some(pos) = content[search_from..].find("```") {
-                        let abs_pos = search_from + pos;
-                        let at_line_start = abs_pos == 0
-                            || content.as_bytes()[abs_pos - 1] == b'\n'
-                            || content[..abs_pos]
-                                .rsplit_once('\n')
-                                .is_some_and(|(_, after_nl)| {
-                                    after_nl.chars().all(|c| c.is_ascii_whitespace())
-                                });
-                        if at_line_start {
-                            // Skip to end of closing fence line
-                            let after_close = abs_pos + 3;
-                            let end = content[after_close..]
-                                .find('\n')
-                                .map_or(content.len(), |p| after_close + p + 1);
-                            break end;
-                        }
-                        search_from = abs_pos + 3;
-                    } else {
-                        break content.len();
-                    }
-                };
-
+        if (ch == '`' || ch == '~') && at_line_start(content, i) {
+            if let Some(fence) = fence_at(content, i) {
                 out.push(' ');
-                // Advance chars iterator past the fenced block
-                while let Some(&(ci, _)) = chars.peek() {
-                    if ci >= close_end {
-                        break;
-                    }
-                    chars.next();
-                }
+                i = fence_end(content, fence);
                 continue;
             }
         }
 
-        // Inline code span: `…`
-        if ch == '`' {
-            let after_tick = i + 1;
-            if after_tick < content.len() {
-                // Find closing backtick on same line
-                if let Some(rel_end) = content[after_tick..].find('`') {
-                    let close_pos = after_tick + rel_end;
-                    // Only treat as code span if no newline between the backticks
-                    if !content[after_tick..close_pos].contains('\n') {
-                        out.push(' ');
-                        // Advance past closing backtick
-                        while let Some(&(ci, _)) = chars.peek() {
-                            if ci > close_pos {
-                                break;
-                            }
-                            chars.next();
-                        }
-                        continue;
-                    }
-                }
+        if ch == '`' && !is_escaped(bytes, i) {
+            if let Some(end) = code_span_end(content, i) {
+                out.push(' ');
+                i = end;
+                continue;
             }
         }
 
         out.push(ch);
-        chars.next();
+        i += ch.len_utf8();
     }
 
     out
+}
+
+/// A fenced-code opener: where its marker run starts, the marker, its length,
+/// and the byte offset just past the opening line.
+struct Fence {
+    marker: u8,
+    length: usize,
+    body_start: usize,
+}
+
+/// Whether `index` is at the start of a line, allowing the up-to-three leading
+/// spaces CommonMark permits before a fence.
+fn at_line_start(content: &str, index: usize) -> bool {
+    let line_start = content[..index].rfind('\n').map_or(0, |p| p + 1);
+    let indent = &content[line_start..index];
+    indent.len() <= 3 && indent.chars().all(|c| c == ' ')
+}
+
+/// Read a fence opener at `index`, if there is one.
+fn fence_at(content: &str, index: usize) -> Option<Fence> {
+    let marker = content.as_bytes()[index];
+    let length = run_length(content, index, marker);
+    if length < 3 {
+        return None;
+    }
+    let line_end = content[index..]
+        .find('\n')
+        .map_or(content.len(), |p| index + p + 1);
+    // A backtick fence's info string may not contain a backtick (CommonMark),
+    // so ``` `x` ``` on one line is a span, not an unterminated block.
+    if marker == b'`' && content[index + length..line_end].contains('`') {
+        return None;
+    }
+    Some(Fence {
+        marker,
+        length,
+        body_start: line_end,
+    })
+}
+
+/// Byte offset just past the fence's closing line, or the end of input when it
+/// is never closed.
+fn fence_end(content: &str, fence: Fence) -> usize {
+    let mut line_start = fence.body_start;
+    while line_start < content.len() {
+        let line_end = content[line_start..]
+            .find('\n')
+            .map_or(content.len(), |p| line_start + p + 1);
+        let line = &content[line_start..line_end];
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        if indent <= 3 {
+            let run = run_length(content, line_start + indent, fence.marker);
+            // A closing fence is at least as long as the opener and carries
+            // nothing but trailing whitespace.
+            if run >= fence.length
+                && trimmed[run..]
+                    .chars()
+                    .all(|c| c == ' ' || c == '\t' || c == '\n' || c == '\r')
+            {
+                return line_end;
+            }
+        }
+        line_start = line_end;
+    }
+    content.len()
+}
+
+/// Byte offset just past an inline code span opening at `index`, if it closes.
+///
+/// The closing run must be exactly as long as the opening one, and the span
+/// must not span a line — both matching Desktop, and the second matching the
+/// behaviour this function has always had.
+fn code_span_end(content: &str, index: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let open_length = run_length(content, index, b'`');
+    let mut cursor = index + open_length;
+    while cursor < content.len() {
+        match content[cursor..].find('`') {
+            None => return None,
+            Some(offset) => {
+                let candidate = cursor + offset;
+                if content[cursor..candidate].contains('\n') {
+                    return None;
+                }
+                if is_escaped(bytes, candidate) {
+                    cursor = candidate + 1;
+                    continue;
+                }
+                let close_length = run_length(content, candidate, b'`');
+                if close_length == open_length {
+                    return Some(candidate + close_length);
+                }
+                cursor = candidate + close_length;
+            }
+        }
+    }
+    None
+}
+
+/// How many consecutive `marker` bytes start at `index`.
+fn run_length(content: &str, index: usize, marker: u8) -> usize {
+    content.as_bytes()[index..]
+        .iter()
+        .take_while(|&&b| b == marker)
+        .count()
+}
+
+/// Whether the byte at `index` is preceded by an odd number of backslashes.
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
 }
 
 /// Bech32 alphabet used by NIP-19.
