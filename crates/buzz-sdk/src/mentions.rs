@@ -37,22 +37,33 @@ use nostr::{FromBech32, PublicKey};
 /// inline implementation.
 pub const MENTION_CAP: usize = 50;
 
-/// Whether an `@` at this position opens a mention.
+/// Whether an `@` opens a mention, given everything before it.
 ///
-/// Start-of-string or whitespace, plus the markdown punctuation Buzz Desktop
-/// treats as an opener (`hasMention.ts`): an opening parenthesis, a bold or
-/// italic marker, and the spoiler delimiter. Desktop renders `**@fizz**`,
-/// `_@fizz_`, `(@fizz)` and `||@fizz||` as mentions, and agents are told to
-/// write GitHub-flavored Markdown, so a mention that only the renderer
-/// recognises produces a message that *looks* addressed to an agent and
-/// carries no `p` tag to wake it.
+/// Mirrors the opening group of Desktop's mention regex (`hasMention.ts`):
+///
+/// ```text
+/// (^|\s|\(|[*_]{1,3}|\|\|)(@name)(?=\|\||[\s,;.!?:)\]}*_]|$)
+/// ```
+///
+/// so: start-of-string, whitespace, an opening parenthesis (team expansions),
+/// a bold or italic marker, or the **paired** spoiler delimiter. Desktop
+/// renders `**@fizz**`, `_@fizz_`, `(@fizz)` and `||@fizz||` as mentions, and
+/// agents are told to write GitHub-flavored Markdown, so a mention only the
+/// renderer recognises produces a message that *looks* addressed to an agent
+/// and carries no `p` tag to wake it.
+///
+/// The delimiter is `||`, never a lone `|`: `|@fizz` is not a spoiler to
+/// Desktop and must not tag Fizz here either — the inverse error, waking an
+/// agent nobody visibly addressed.
 ///
 /// Anything else — most importantly an alphanumeric, as in `user@host` — is
 /// not an opener.
-fn opens_mention(preceding: Option<char>) -> bool {
-    match preceding {
+fn opens_mention(preceding: &str) -> bool {
+    let mut back = preceding.chars().rev();
+    match back.next() {
         None => true,
-        Some(c) => c.is_ascii_whitespace() || matches!(c, '(' | '*' | '_' | '|'),
+        Some('|') => back.next() == Some('|'),
+        Some(c) => c.is_ascii_whitespace() || matches!(c, '(' | '*' | '_'),
     }
 }
 
@@ -91,8 +102,8 @@ pub fn extract_at_names(content: &str) -> Vec<String> {
     let mut i = 0;
     while i < len {
         if chars[i] == '@' {
-            let opens = opens_mention(if i == 0 { None } else { Some(chars[i - 1]) });
-            if opens && i + 1 < len {
+            let preceding: String = chars[..i].iter().rev().take(2).rev().collect();
+            if opens_mention(&preceding) && i + 1 < len {
                 let start = i + 1;
                 let mut end = start;
                 while end < len {
@@ -103,7 +114,9 @@ pub fn extract_at_names(content: &str) -> Vec<String> {
                         break;
                     }
                 }
-                if end > start {
+                let closed_by_lone_pipe =
+                    chars.get(end) == Some(&'|') && chars.get(end + 1) != Some(&'|');
+                if end > start && !closed_by_lone_pipe {
                     let name: String = chars[start..end].iter().collect();
                     let lower = name.to_ascii_lowercase();
                     if seen.insert(lower.clone()) {
@@ -139,8 +152,7 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
     let mut seen = HashSet::new();
 
     for (i, _) in content.match_indices('@') {
-        let preceding = content[..i].chars().next_back();
-        if !opens_mention(preceding) {
+        if !opens_mention(&content[..i]) {
             continue;
         }
         let rest = &content[i + 1..];
@@ -157,7 +169,7 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
             let end = rest
                 .find(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '-' | '_'))
                 .unwrap_or(rest.len());
-            if end == 0 {
+            if end == 0 || ends_on_unpaired_pipe(&rest[end..]) {
                 continue;
             }
             rest[..end].to_ascii_lowercase()
@@ -172,19 +184,38 @@ pub fn extract_at_mentions_with_known(content: &str, known_names: &[&str]) -> Ve
 
 /// Whether a known name ends here.
 ///
-/// Includes the markdown markers Buzz Desktop closes a mention on
-/// (`hasMention.ts`), so `**@Will Pfleger**` and `_@Will Pfleger_` resolve to
-/// the member rather than to a name with a marker glued on. `_` is a legal
-/// name character, so it only ends a *known* name — the fallback tokenizer
-/// still reads `@fizz_` as `fizz_`, which is the name that was typed.
+/// Mirrors the closing lookahead of Desktop's mention regex,
+/// `(?=\|\||[\s,;.!?:)\]}*_]|$)` — so `**@Will Pfleger**` and
+/// `_@Will Pfleger_` resolve to the member rather than to a name with a marker
+/// glued on. `_` is a legal name character, so it only ends a *known* name:
+/// the fallback tokenizer still reads `@fizz_` as `fizz_`, which is the name
+/// that was typed.
+///
+/// A closing `|` counts only as the pair `||`.
 fn is_word_boundary(s: &str) -> bool {
-    s.chars().next().is_none_or(|c| {
-        c.is_ascii_whitespace()
-            || matches!(
-                c,
-                ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}' | '*' | '_' | '|'
-            )
-    })
+    let mut chars = s.chars();
+    match chars.next() {
+        None => true,
+        Some('|') => chars.next() == Some('|'),
+        Some(c) => {
+            c.is_ascii_whitespace()
+                || matches!(
+                    c,
+                    ',' | ';' | '.' | '!' | '?' | ':' | ')' | ']' | '}' | '*' | '_'
+                )
+        }
+    }
+}
+
+/// Whether the text after a mention is a lone `|`.
+///
+/// The fallback tokenizer stops at any non-name character, so it would restore
+/// `fizz` from `||@fizz|` — a spoiler Desktop never closes and therefore never
+/// renders as a mention. Only the pipe is checked: every other terminator the
+/// tokenizer accepts is pre-existing behaviour this change does not touch.
+fn ends_on_unpaired_pipe(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    chars.next() == Some('|') && chars.next() != Some('|')
 }
 
 /// Match extracted `@names` against channel-member profiles.
@@ -485,6 +516,25 @@ mod tests {
         // `_` is a legal name character, so an unknown name keeps it — the
         // member list is what disambiguates.
         assert_eq!(extract_at_names("_@fizz_"), vec!["fizz_"]);
+    }
+
+    #[test]
+    fn a_lone_pipe_is_not_a_spoiler_delimiter() {
+        // Desktop's regex takes `\|\|` on both boundaries. A single pipe is
+        // not a spoiler, so treating it as one tags an agent that nobody
+        // visibly addressed — the inverse of the bug this PR fixes.
+        assert!(extract_at_names("|@fizz").is_empty());
+        assert!(extract_at_names("||@fizz|").is_empty());
+        assert!(extract_at_mentions_with_known("|@fizz", &["fizz"]).is_empty());
+        assert!(extract_at_mentions_with_known("||@fizz|", &["fizz"]).is_empty());
+        // The fallback tokenizer must not restore it either.
+        assert!(extract_at_mentions_with_known("||@fizz|", &["nobody"]).is_empty());
+        // The paired form still works on both sides.
+        assert_eq!(extract_at_names("||@fizz||"), vec!["fizz"]);
+        assert_eq!(
+            extract_at_mentions_with_known("||@fizz||", &["fizz"]),
+            vec!["fizz"]
+        );
     }
 
     #[test]
