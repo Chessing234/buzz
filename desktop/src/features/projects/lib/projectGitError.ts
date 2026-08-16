@@ -16,6 +16,22 @@ function isGitHubUrl(cloneUrl: string | null | undefined) {
   }
 }
 
+/**
+ * Recognises the relay's git route by the same path boundary `projectRepoHost`
+ * enforces. The origin cannot be compared here — presentation has no relay
+ * origin to hand — but a `/git/<owner-pubkey>/<repo>` path is only ever served
+ * by a Buzz relay, and it is enough to pick the right recovery advice.
+ */
+function isBuzzRelayUrl(cloneUrl: string | null | undefined) {
+  try {
+    return /^\/git\/[0-9a-f]{64}\/[^/]+\/?$/i.test(
+      new URL(cloneUrl ?? "").pathname,
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function projectCloneErrorPresentation(
   error: unknown,
   cloneUrl?: string | null,
@@ -37,11 +53,18 @@ export function projectCloneErrorPresentation(
   // prefix covers all three without claiming a credential failure for the
   // transport and filesystem errors those generic OS phrases also accompany.
   if (/could not read (?:username|password) for /.test(message)) {
+    if (isBuzzRelayUrl(cloneUrl)) {
+      return {
+        title: "Relay wouldn’t authenticate this clone",
+        description:
+          "Check that the relay hosting this repository is connected and that your Buzz identity has access to it.",
+      };
+    }
     return {
       title: "Repository needs credentials Buzz can’t supply",
       description: github
-        ? "Buzz clones with credential helpers disabled, so a private GitHub repository over HTTPS cannot authenticate. Announce the repository on your Buzz relay to clone it through Buzz."
-        : "Buzz clones with credential helpers disabled, so this repository cannot authenticate over HTTPS. Announce the repository on your Buzz relay to clone it through Buzz.",
+        ? "Buzz clones with credential helpers disabled, so a private GitHub repository over HTTPS cannot authenticate. Clone it outside Buzz, push it to a Buzz-hosted repository, then clone from that repository’s Buzz URL."
+        : "Buzz clones with credential helpers disabled, so this repository cannot authenticate over HTTPS. Clone it outside Buzz, push it to a Buzz-hosted repository, then clone from that repository’s Buzz URL.",
     };
   }
   if (
