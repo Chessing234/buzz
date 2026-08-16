@@ -2078,7 +2078,7 @@ async fn tokio_main() -> Result<()> {
     }
     let owner_cache = OwnerCache::new(startup_owner.clone());
     // First-drop-per-author reporting for the inbound author gate; see
-    // `AuthorGateReporter`.
+    // `DropReporter`.
     let mut author_gate_reporter: DropReporter<String> = DropReporter::default();
     // Same treatment for the subscription miss below, keyed by event kind.
     let mut subscription_reporter: DropReporter<u16> = DropReporter::default();
