@@ -447,11 +447,25 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
     }
 }
 
+/// A well-formed 64-character hex identity, deterministic per seed.
+///
+/// The renderer only accepts a real-shaped pubkey, so fixtures have to carry
+/// one; a placeholder like "Kit-pubkey" would be filtered out and the test
+/// would be asserting on the wrong thing.
+fn fake_pubkey(seed: &str) -> String {
+    let mut hex: String = seed.bytes().map(|b| format!("{b:02x}")).collect();
+    while hex.len() < 64 {
+        hex.push_str("ab");
+    }
+    hex.truncate(64);
+    hex
+}
+
 fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
     ManagedAgentRecord {
         // A provisioned agent always has a pubkey — that is what makes it
         // addressable.
-        pubkey: format!("{name}-pubkey"),
+        pubkey: fake_pubkey(name),
         name: name.to_string(),
         persona_id: persona_id.map(|s| s.to_string()),
         private_key_nsec: String::new(),
@@ -531,11 +545,13 @@ fn test_render_dynamic_section_agent_no_persona() {
     assert!(output.contains("| Scout | — | @Scout |"));
 }
 
-/// A create that failed partway through: the row persists with no pubkey,
-/// relay URL or command, so it can never run and can never be addressed.
-fn make_unprovisioned_agent(name: &str) -> ManagedAgentRecord {
+/// A row whose identity is missing or malformed. `load_managed_agents` already
+/// drops empty-pubkey rows before regeneration (an empty pubkey is what marks a
+/// key-less agent *definition*), so these exercise the renderer's own guard
+/// against a caller that hands over raw store rows.
+fn make_unaddressable_agent(name: &str, pubkey: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        pubkey: String::new(),
+        pubkey: pubkey.to_string(),
         relay_url: String::new(),
         agent_command: String::new(),
         ..make_agent(name, None)
@@ -543,25 +559,27 @@ fn make_unprovisioned_agent(name: &str) -> ManagedAgentRecord {
 }
 
 #[test]
-fn test_render_dynamic_section_skips_unprovisioned_agents() {
+fn test_render_dynamic_section_skips_malformed_identities() {
     let personas = vec![make_persona("p1", "Builder")];
-    let agents = vec![
-        make_agent("Kit", Some("p1")),
-        make_unprovisioned_agent("Ghost"),
-    ];
-    let output = render_dynamic_section(&personas, &agents, "ws://example.com:3000");
-    assert!(output.contains("| Kit | Builder | @Kit |"));
-    assert!(
-        !output.contains("Ghost"),
-        "an agent with no pubkey cannot be addressed: {output}"
-    );
+    for bad in ["", "   ", "not-hex", &"a".repeat(63), &"z".repeat(64)] {
+        let agents = vec![
+            make_agent("Kit", Some("p1")),
+            make_unaddressable_agent("Ghost", bad),
+        ];
+        let output = render_dynamic_section(&personas, &agents, "ws://example.com:3000");
+        assert!(output.contains("| Kit | Builder | @Kit |"), "{output}");
+        assert!(
+            !output.contains("Ghost"),
+            "{bad:?} is not an addressable identity: {output}"
+        );
+    }
 }
 
 #[test]
-fn test_render_dynamic_section_all_unprovisioned_reads_as_empty() {
+fn test_render_dynamic_section_all_unaddressable_reads_as_empty() {
     let agents = vec![
-        make_unprovisioned_agent("Ghost"),
-        make_unprovisioned_agent("Wraith"),
+        make_unaddressable_agent("Ghost", ""),
+        make_unaddressable_agent("Wraith", "nope"),
     ];
     let output = render_dynamic_section(&[], &agents, "ws://example.com:3000");
     assert!(

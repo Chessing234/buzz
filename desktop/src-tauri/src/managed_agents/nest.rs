@@ -523,14 +523,21 @@ fn escape_md_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-/// Whether a record describes an agent another agent could actually reach.
+/// Whether a record carries a well-formed identity that could be addressed.
 ///
-/// A create that fails partway through still leaves its row in
-/// `managed-agents.json`, with an empty pubkey, relay URL and command. Such a
-/// row can never run and can never be addressed, so listing it under "How to
-/// address" hands agents a `@name` that goes nowhere (#5786).
+/// This is a defensive check on the renderer, not the fix for any reported
+/// symptom: `load_managed_agents` already drops rows with an empty pubkey
+/// before regeneration reaches here — in the unified store an empty pubkey is
+/// what marks a key-less agent *definition*, which `load_agent_definitions`
+/// selects on. Keeping the check means a future caller that hands over raw
+/// store rows cannot publish an address that goes nowhere, and requiring a
+/// 64-character hex identity rather than merely a non-empty string means a
+/// truncated or garbage value is caught with it.
 fn is_addressable(agent: &ManagedAgentRecord) -> bool {
-    !agent.pubkey.trim().is_empty() && !agent.name.trim().is_empty()
+    let pubkey = agent.pubkey.trim();
+    !agent.name.trim().is_empty()
+        && pubkey.len() == 64
+        && pubkey.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub fn render_dynamic_section(
@@ -542,6 +549,7 @@ pub fn render_dynamic_section(
         .iter()
         .filter(|agent| is_addressable(agent))
         .collect();
+
     let active_agents = if agents.is_empty() {
         "## Active Agents\n\n*(No agents deployed yet. Add agents in the Buzz desktop app.)*"
             .to_string()
