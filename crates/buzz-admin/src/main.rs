@@ -88,13 +88,19 @@ enum Command {
     /// with `--owner-key -`. It is deliberately not accepted as a literal
     /// argument: process arguments are visible to every user on the host via
     /// `ps`, and shell history keeps them afterwards.
+    ///
+    /// The tag is printed to stdout on its own line, ready to be assigned to
+    /// `BUZZ_AUTH_TAG` on the agent host.
     ComputeAuthTag {
         /// Agent public key to authorize — bech32 npub or 64-char hex.
         #[arg(long)]
         agent: String,
 
-        /// Conditions string, e.g. `kind=9` or `kind=0,kind=9`. Empty
-        /// authorizes every kind.
+        /// Conditions string, e.g. `kind=9` or
+        /// `'kind=9&created_at<1713957000'`. Clauses are joined with `&` and
+        /// are conjunctive, so quote the whole value in a shell and do not
+        /// repeat `kind=` — two kinds can never both hold. Empty authorizes
+        /// every kind.
         #[arg(long, default_value = "")]
         conditions: String,
 
