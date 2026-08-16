@@ -369,11 +369,22 @@ pub fn run() {
                 if let Ok(data_dir) = app_handle.path().app_data_dir() {
                     let _ = std::fs::create_dir_all(&data_dir);
                     let _ = std::fs::write(
-                        data_dir.join("startup-error.log"),
+                        data_dir.join(crate::secret_store::STARTUP_ERROR_LOG),
                         format!("buzz-desktop: fatal: {message}\n"),
                     );
                 }
                 std::process::exit(1);
+            }
+
+            // Identity resolved, so any record of an earlier failure is stale.
+            // Leaving it beside a working install misdiagnoses the next launch.
+            if let Ok(data_dir) = app_handle.path().app_data_dir() {
+                if let Err(error) = crate::secret_store::clear_startup_error_log(&data_dir) {
+                    eprintln!(
+                        "buzz-desktop: could not remove the stale {}: {error}",
+                        crate::secret_store::STARTUP_ERROR_LOG
+                    );
+                }
             }
 
             // When the identity is in recovery mode (lost = keyring empty after
