@@ -171,6 +171,41 @@ fn stored_credential() -> Result<Option<String>, String> {
         .map_err(|error| format!("could not read the stored Builderlab session: {error}"))
 }
 
+/// Why a `/v1/auth/me` check did not return a user.
+///
+/// Only an explicit authentication rejection proves the credential is bad. A
+/// timeout, a DNS failure, a 5xx, a 429, or a body that does not parse says
+/// nothing about the credential — deleting it on those turns a blip in the
+/// service into a permanent sign-out, since the credential is gone from the
+/// keyring as well as from memory.
+#[derive(Debug)]
+enum SessionCheckError {
+    /// The service rejected the credential itself (HTTP 401 or 403).
+    Rejected(String),
+    /// Anything else. The credential is kept for the next attempt.
+    Transient(String),
+}
+
+impl SessionCheckError {
+    fn message(self) -> String {
+        match self {
+            SessionCheckError::Rejected(message) | SessionCheckError::Transient(message) => message,
+        }
+    }
+
+    fn invalidates_credential(&self) -> bool {
+        matches!(self, SessionCheckError::Rejected(_))
+    }
+}
+
+/// Whether an HTTP status is the service saying "this credential is not good".
+///
+/// 401 and 403 only. 429 in particular is *not* here: rate limiting says the
+/// caller asked too often, not that the session expired.
+fn status_rejects_credential(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
+}
+
 /// The credential, plus the generation it was read at.
 ///
 /// Session checks are `await`ed, so a login or a logout can land while one is
@@ -343,24 +378,31 @@ fn login_url(return_to: &str) -> Result<Url, String> {
 async fn authenticated_user(
     client: &reqwest::Client,
     credential: &str,
-) -> Result<AuthMeResponse, String> {
+) -> Result<AuthMeResponse, SessionCheckError> {
+    let url = api_url("/v1/auth/me").map_err(SessionCheckError::Transient)?;
     let response = client
-        .get(api_url("/v1/auth/me")?)
+        .get(url)
         .header(BB_SESSION_CREDENTIAL_HEADER, credential)
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|error| format!("Builderlab session check failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Builderlab session check failed with HTTP {}",
-            response.status()
-        ));
+        .map_err(|error| {
+            SessionCheckError::Transient(format!("Builderlab session check failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = format!("Builderlab session check failed with HTTP {status}");
+        return Err(if status_rejects_credential(status) {
+            SessionCheckError::Rejected(message)
+        } else {
+            SessionCheckError::Transient(message)
+        });
     }
-    response
-        .json()
-        .await
-        .map_err(|error| format!("invalid Builderlab session response: {error}"))
+    // A success status with a body we cannot read says nothing about the
+    // credential — a proxy or a deploy mid-flight can produce it.
+    response.json().await.map_err(|error| {
+        SessionCheckError::Transient(format!("invalid Builderlab session response: {error}"))
+    })
 }
 
 #[tauri::command]
@@ -455,7 +497,9 @@ pub(crate) async fn start_builderlab_login(
         return Err("Builderlab code exchange returned an empty credential".to_owned());
     }
 
-    let me = authenticated_user(&app_state.http_client, &exchanged.session_credential).await?;
+    let me = authenticated_user(&app_state.http_client, &exchanged.session_credential)
+        .await
+        .map_err(SessionCheckError::message)?;
     if exchanged.expires_at != me.expires_at {
         return Err("Builderlab session expiry did not match code exchange".to_owned());
     }
@@ -509,11 +553,13 @@ pub(crate) async fn get_builderlab_auth(
             }))
         }
         Err(error) => {
-            // The credential is no longer good (expired, revoked, or the
-            // account changed). Drop it from both stores so the next launch
-            // asks for a sign-in instead of failing this call again.
-            session.clear_if_current(generation)?;
-            Err(error)
+            // Only an explicit rejection means the credential is bad. On a
+            // timeout, a 5xx or a malformed body it is kept, so a blip in the
+            // service does not sign the user out of the next launch too.
+            if error.invalidates_credential() {
+                session.clear_if_current(generation)?;
+            }
+            Err(error.message())
         }
     }
 }
@@ -803,6 +849,50 @@ mod tests {
             Some("http://127.0.0.1:1234/callback/nonce")
         );
         assert!(!query.contains_key("screen_hint"));
+    }
+
+    #[test]
+    fn only_a_confirmed_authentication_rejection_invalidates_a_session() {
+        use reqwest::StatusCode;
+
+        // The service saying "not you".
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            assert!(
+                status_rejects_credential(status),
+                "HTTP {status} must invalidate the credential"
+            );
+        }
+
+        // Everything else is the service having a bad day. Deleting the
+        // credential on these turns a blip into a permanent sign-out, because
+        // it is removed from the keyring as well as from memory.
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
+        ] {
+            assert!(
+                !status_rejects_credential(status),
+                "HTTP {status} must preserve the credential for a retry"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_failures_do_not_invalidate_but_rejections_do() {
+        assert!(SessionCheckError::Rejected("nope".into()).invalidates_credential());
+        // A transport failure, a timeout, or a body that would not parse.
+        assert!(!SessionCheckError::Transient("dns".into()).invalidates_credential());
+        assert_eq!(
+            SessionCheckError::Transient("dns".into()).message(),
+            "dns",
+            "the caller still reports what went wrong"
+        );
     }
 
     #[test]
