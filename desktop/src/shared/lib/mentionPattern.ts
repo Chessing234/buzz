@@ -17,15 +17,22 @@ export const PREFIX_LEAD_GROUP = 1;
 
 /**
  * A prefix only opens a mention or channel link at the start of the text or
- * after whitespace or an opening paren — `bob@alice.dev` is an address, not a
- * mention of `@alice`, and the composer's own highlighter already draws the
- * line in the same place.
+ * after whitespace — `bob@alice.dev` is an address, not a mention of `@alice`.
  *
  * The boundary is a capture group rather than a lookbehind on purpose: WebKit
  * before Safari 16.4 fails to parse lookbehind and blanks the whole app
  * (#5547).
  */
-const LEADING_BOUNDARY = "(^|[\\s(])";
+const LEADING_BOUNDARY = "(^|\\s)";
+
+/**
+ * Mentions additionally open after `(`, because team expansions render as
+ * `Team (@ana @bo)`. Channels deliberately do not — these two boundaries are
+ * exactly the ones the composer's highlighter applies to `@` and `#`
+ * respectively, and the rendered message has to agree with the composer or a
+ * `(#general)` that shows no chip while typing turns into a link once sent.
+ */
+const LEADING_BOUNDARY_WITH_PAREN = "(^|[\\s(])";
 
 /**
  * Build a regex that matches a given prefix followed by known multi-word names
@@ -39,21 +46,28 @@ const LEADING_BOUNDARY = "(^|[\\s(])";
  * - Otherwise returns a never-matching regex, preventing arbitrary `@word`
  *   patterns from being highlighted as valid mentions when no p-tags are
  *   present (used by remarkMentions / buildMentionPattern).
+ *
+ * `options.allowOpeningParen` widens the leading boundary to include `(`; see
+ * {@link LEADING_BOUNDARY_WITH_PAREN}. It is off by default so a new caller
+ * gets the stricter rule.
  */
 export function buildPrefixPattern(
   prefix: string,
   knownNames: string[],
-  options?: { fallbackToGeneric?: boolean },
+  options?: { fallbackToGeneric?: boolean; allowOpeningParen?: boolean },
 ): RegExp {
   const sorted = [...new Set(knownNames)]
     .filter((name) => name.trim().length > 0)
     .sort((a, b) => b.length - a.length);
 
   const escapedPrefix = escapeRegExp(prefix);
+  const lead = options?.allowOpeningParen
+    ? LEADING_BOUNDARY_WITH_PAREN
+    : LEADING_BOUNDARY;
 
   if (sorted.length === 0) {
     if (options?.fallbackToGeneric) {
-      return new RegExp(`${LEADING_BOUNDARY}${escapedPrefix}\\S+`, "gi");
+      return new RegExp(`${lead}${escapedPrefix}\\S+`, "gi");
     }
     return NEVER_MATCH;
   }
@@ -61,7 +75,7 @@ export function buildPrefixPattern(
   const nameAlternatives = sorted.map((name) => escapeRegExp(name)).join("|");
   const boundary = "(?=[\\s,;.!?:)\\]}]|$)";
   return new RegExp(
-    `${LEADING_BOUNDARY}${escapedPrefix}(?:${nameAlternatives})${boundary}`,
+    `${lead}${escapedPrefix}(?:${nameAlternatives})${boundary}`,
     "gi",
   );
 }
@@ -73,5 +87,5 @@ export function buildPrefixPattern(
  * they correspond to an actual p-tagged member.
  */
 export function buildMentionPattern(mentionNames: string[]): RegExp {
-  return buildPrefixPattern("@", mentionNames);
+  return buildPrefixPattern("@", mentionNames, { allowOpeningParen: true });
 }

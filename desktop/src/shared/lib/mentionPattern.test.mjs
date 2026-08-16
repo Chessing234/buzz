@@ -78,3 +78,20 @@ test("the generic channel fallback also requires a leading boundary", () => {
   ]);
   assert.deepEqual(matches(pattern, "issue-42#general"), []);
 });
+
+test("an opening paren opens a mention but not a channel", () => {
+  // Exactly the split the composer's highlighter draws: `(?<=[\s(])@` versus
+  // `(?<=\s)#`. Team expansions render as `Team (@ana @bo)`; channels have no
+  // such form, so `(#general)` is not a channel link.
+  assert.deepEqual(matches(buildMentionPattern(["alice"]), "(@alice)"), [
+    { text: "@alice", index: 1 },
+  ]);
+  assert.deepEqual(
+    matches(buildPrefixPattern("#", ["general"]), "(#general)"),
+    [],
+  );
+  assert.deepEqual(
+    matches(buildPrefixPattern("#", [], { fallbackToGeneric: true }), "(#gen)"),
+    [],
+  );
+});
