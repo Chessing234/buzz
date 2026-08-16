@@ -2317,11 +2317,24 @@ fn kill_process_group(pid: u32) -> bool {
 /// `unsafe`, which this crate denies. `taskkill /T /F` is the documented
 /// tree-terminating tool, ships with every supported Windows, and needs no
 /// privileges beyond the ones required to kill the child itself.
+///
+/// It is launched by absolute path. `CreateProcess` resolves a bare executable
+/// name against the application directory and the parent's *current* directory
+/// before the system directory, and the harness commonly runs with an
+/// agent-controlled repository as its current directory — a `taskkill.exe`
+/// committed to that repository would otherwise run as the Buzz user every
+/// time an agent is shut down or replaced.
 #[cfg(windows)]
 fn kill_process_group(pid: u32) -> bool {
-    let (program, args) = taskkill_tree_command(pid);
+    let Some(program) = taskkill_program() else {
+        tracing::warn!(
+            "SystemRoot is not an absolute path — skipping tree kill, \
+             falling back to a direct-child kill"
+        );
+        return false;
+    };
     std::process::Command::new(program)
-        .args(args)
+        .args(taskkill_tree_args(pid))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2330,22 +2343,49 @@ fn kill_process_group(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// The `taskkill` invocation that ends `pid` and every descendant.
+/// Absolute path to the system `taskkill.exe`, or `None` when it cannot be
+/// resolved — in which case the caller falls back to killing the direct child.
+#[cfg(windows)]
+fn taskkill_program() -> Option<String> {
+    taskkill_program_in(&std::env::var("SystemRoot").ok()?)
+}
+
+/// Join `system_root` with `System32\taskkill.exe`, rejecting any root that is
+/// not an absolute Windows path.
+///
+/// "Absolute" is checked by Windows' own rules rather than `Path::is_absolute`
+/// so the check is exercised by the test suite on every platform: a drive path
+/// (`C:\…`) or a UNC path (`\\server\share\…`). A relative or bare value would
+/// reintroduce the search-order hijack this exists to prevent, so it is
+/// rejected rather than passed through.
+#[cfg(any(windows, test))]
+fn taskkill_program_in(system_root: &str) -> Option<String> {
+    let root = system_root.trim_end_matches(['\\', '/']);
+    let bytes = root.as_bytes();
+    let drive_rooted = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let unc = root.starts_with("\\\\");
+    if !drive_rooted && !unc {
+        return None;
+    }
+    Some(format!("{root}\\System32\\taskkill.exe"))
+}
+
+/// The `taskkill` arguments that end `pid` and every descendant.
 ///
 /// Split out so the flags are asserted on every platform: `/T` is what makes
 /// it a tree kill and `/F` is what makes it unconditional — a drain timeout
 /// means the agent already ignored a polite stop.
 #[cfg(any(windows, test))]
-fn taskkill_tree_command(pid: u32) -> (&'static str, [String; 4]) {
-    (
-        "taskkill",
-        [
-            "/PID".to_string(),
-            pid.to_string(),
-            "/T".to_string(),
-            "/F".to_string(),
-        ],
-    )
+fn taskkill_tree_args(pid: u32) -> [String; 4] {
+    [
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ]
 }
 
 /// Fallback for platforms that are neither Unix nor Windows: no tree kill
@@ -5003,14 +5043,47 @@ mod tests {
 
 #[cfg(test)]
 mod process_tree_kill_tests {
+    use super::{taskkill_program_in, taskkill_tree_args};
+
     #[test]
     fn taskkill_targets_the_whole_tree_forcibly() {
         // `/T` is what turns this into a tree kill — without it the harness's
         // own workers survive, which is the leak in #5849. `/F` is what makes
         // it unconditional: a drain timeout means the agent already ignored a
         // polite stop.
-        let (program, args) = super::taskkill_tree_command(4242);
-        assert_eq!(program, "taskkill");
-        assert_eq!(args, ["/PID", "4242", "/T", "/F"]);
+        assert_eq!(taskkill_tree_args(4242), ["/PID", "4242", "/T", "/F"]);
+    }
+
+    #[test]
+    fn taskkill_is_launched_from_an_absolute_system_directory() {
+        // A bare "taskkill" would let CreateProcess resolve it against the
+        // current directory, which is an agent-controlled repository.
+        assert_eq!(
+            taskkill_program_in(r"C:\Windows").as_deref(),
+            Some(r"C:\Windows\System32\taskkill.exe")
+        );
+        assert_eq!(
+            taskkill_program_in(r"D:\WINNT\").as_deref(),
+            Some(r"D:\WINNT\System32\taskkill.exe"),
+            "a trailing separator must not double up"
+        );
+        assert_eq!(
+            taskkill_program_in(r"\\host\share\win").as_deref(),
+            Some(r"\\host\share\win\System32\taskkill.exe"),
+            "a UNC root is absolute too"
+        );
+    }
+
+    #[test]
+    fn a_non_absolute_system_root_is_refused_rather_than_joined() {
+        // Falling back to the direct-child kill leaks the tree; running an
+        // attacker-placed taskkill.exe is worse, so these must return None.
+        for root in ["", "Windows", r"..\Windows", "/usr/bin", r"\Windows"] {
+            assert_eq!(
+                taskkill_program_in(root),
+                None,
+                "{root:?} is not an absolute Windows path"
+            );
+        }
     }
 }
