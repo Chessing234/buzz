@@ -74,7 +74,6 @@ import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { Button } from "@/shared/ui/button";
 import { HomeMembersSidebarOverlay } from "./HomeMembersSidebarOverlay";
 import { truncateByCharacters } from "@/shared/lib/truncateByCharacters";
-
 const INBOX_SEARCH_KEYS = [
   "item",
   "profile",
