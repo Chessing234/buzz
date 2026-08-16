@@ -305,6 +305,46 @@ pub(crate) fn install_deep_link_handlers(app: &mut tauri::App) {
     }
 }
 
+/// Read a query parameter that may appear at most once.
+///
+/// Returns `None` when the parameter is absent, empty, or repeated. Repeated
+/// is deliberately a rejection rather than a pick: our own builders never emit
+/// a duplicate, the in-app parsers in
+/// `desktop/src/features/messages/lib/messageLink.ts` and
+/// `desktop/src/shared/lib/entityLink.ts` take the first value or refuse
+/// outright, and this parser used to take the *last* — so the same URL could
+/// route one way when clicked inside the app and another when handed to the
+/// app by the OS.
+fn single_param(url: &Url, name: &str) -> Option<String> {
+    let mut values = url
+        .query_pairs()
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned());
+    let first = values.next()?;
+    if values.next().is_some() || first.is_empty() {
+        return None;
+    }
+    Some(first)
+}
+
+/// A 64-character hex event id, lowercased. Mirrors the check
+/// `parse_channel_deep_link` already applies to the message id it carries.
+/// An optional param: absent or empty reads as absent; repeated is a
+/// rejection.
+fn optional_single_param(url: &Url, name: &str) -> Option<Option<String>> {
+    let values: Vec<String> = url
+        .query_pairs()
+        .filter(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    match values.as_slice() {
+        [] => Some(None),
+        [value] if value.is_empty() => Some(None),
+        [value] => Some(Some(value.clone())),
+        _ => None,
+    }
+}
+
 /// Parse the query string of a `buzz://message?…` URL into the JSON
 /// payload emitted on `deep-link-message`. Returns `None` when a required
 /// param (`channel`, `id`) is missing or empty — mirroring the validation
@@ -314,22 +354,9 @@ pub(crate) fn install_deep_link_handlers(app: &mut tauri::App) {
 /// Pulled out of `handle_deep_link_url` so it can be unit-tested without
 /// a live `tauri::AppHandle`.
 fn parse_message_deep_link(url: &Url) -> Option<serde_json::Value> {
-    let mut channel: Option<String> = None;
-    let mut message_id: Option<String> = None;
-    let mut thread: Option<String> = None;
-    for (k, v) in url.query_pairs() {
-        let v = v.into_owned();
-        if v.is_empty() {
-            continue;
-        }
-        match k.as_ref() {
-            "channel" => channel = Some(v),
-            "id" => message_id = Some(v),
-            "thread" => thread = Some(v),
-            _ => {}
-        }
-    }
-    let (channel_id, message_id) = (channel?, message_id?);
+    let channel_id = single_param(url, "channel")?;
+    let message_id = single_param(url, "id")?;
+    let thread = optional_single_param(url, "thread")?;
     Some(serde_json::json!({
         "channelId": channel_id,
         "messageId": message_id,
@@ -342,20 +369,8 @@ fn parse_message_deep_link(url: &Url) -> Option<serde_json::Value> {
 /// `code`; returns `None` otherwise so the frontend never sees a half-formed
 /// payload.
 fn parse_join_deep_link(url: &Url) -> Option<serde_json::Value> {
-    let mut code: Option<String> = None;
-    let mut policy_receipt: Option<String> = None;
-    for (k, v) in url.query_pairs() {
-        let v = v.into_owned();
-        if v.is_empty() {
-            continue;
-        }
-        match k.as_ref() {
-            "code" => code = Some(v),
-            "policy_receipt" => policy_receipt = Some(v),
-            _ => {}
-        }
-    }
-    let code = code?;
+    let code = single_param(url, "code")?;
+    let policy_receipt = single_param(url, "policy_receipt");
     let relay_url = parse_websocket_relay_param(url)?;
     Some(serde_json::json!({
         "relayUrl": relay_url,
@@ -456,11 +471,7 @@ struct AddCommunityDeepLinkPayload {
 }
 
 fn parse_websocket_relay_param(url: &Url) -> Option<String> {
-    let relay_url = url
-        .query_pairs()
-        .find(|(key, _)| key == "relay")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())?;
+    let relay_url = single_param(url, "relay")?;
     let parsed = Url::parse(&relay_url).ok()?;
     if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
         return None;
@@ -500,10 +511,7 @@ fn non_empty_param(url: &Url, name: &str) -> Result<String, String> {
 }
 
 fn optional_non_empty_param(url: &Url, name: &str) -> Option<String> {
-    url.query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
+    single_param(url, name)
 }
 
 fn validate_nostr_bind_callback_url(callback_url: &str, origin: &str) -> Result<(), String> {

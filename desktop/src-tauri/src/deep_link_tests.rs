@@ -338,52 +338,91 @@ fn parse_channel_deep_link_rejects_malformed_forms() {
 
 #[test]
 fn parse_message_deep_link_extracts_required_params() {
-    let url = Url::parse("buzz://message?channel=abc&id=xyz").unwrap();
+    let url = Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     let payload = parse_message_deep_link(&url).expect("required params present");
-    assert_eq!(payload["channelId"], "abc");
-    assert_eq!(payload["messageId"], "xyz");
+    assert_eq!(payload["channelId"], "580ca78b-9dae-46f3-8854-bd671853ba32");
+    assert_eq!(
+        payload["messageId"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
     assert!(payload["threadRootId"].is_null());
 }
 
 #[test]
 fn parse_message_deep_link_accepts_buzz_scheme() {
-    let url = Url::parse("buzz://message?channel=abc&id=xyz").unwrap();
+    let url = Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     let payload = parse_message_deep_link(&url).expect("required params present");
-    assert_eq!(payload["channelId"], "abc");
-    assert_eq!(payload["messageId"], "xyz");
+    assert_eq!(payload["channelId"], "580ca78b-9dae-46f3-8854-bd671853ba32");
+    assert_eq!(
+        payload["messageId"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
 }
 
 #[test]
 fn parse_message_deep_link_includes_thread_root() {
-    let url = Url::parse("buzz://message?channel=abc&id=xyz&thread=root1").unwrap();
+    let url = Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&thread=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
     let payload = parse_message_deep_link(&url).expect("required params present");
-    assert_eq!(payload["threadRootId"], "root1");
+    assert_eq!(
+        payload["threadRootId"],
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
 }
 
 #[test]
 fn parse_message_deep_link_rejects_missing_id() {
-    let url = Url::parse("buzz://message?channel=abc").unwrap();
+    let url = Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32").unwrap();
     assert!(parse_message_deep_link(&url).is_none());
 }
 
 #[test]
 fn parse_message_deep_link_rejects_empty_channel() {
     // Regression: `channel=&id=foo` previously produced channelId: "".
-    let url = Url::parse("buzz://message?channel=&id=foo").unwrap();
+    let url = Url::parse("buzz://message?channel=&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
     assert!(parse_message_deep_link(&url).is_none());
 }
 
 #[test]
 fn parse_message_deep_link_rejects_empty_id() {
-    let url = Url::parse("buzz://message?channel=abc&id=").unwrap();
+    let url =
+        Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=").unwrap();
     assert!(parse_message_deep_link(&url).is_none());
 }
 
 #[test]
 fn parse_message_deep_link_treats_empty_thread_as_absent() {
-    let url = Url::parse("buzz://message?channel=abc&id=xyz&thread=").unwrap();
+    let url = Url::parse("buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&thread=").unwrap();
     let payload = parse_message_deep_link(&url).expect("required params present");
     assert!(payload["threadRootId"].is_null());
+}
+
+#[test]
+fn parse_message_deep_link_rejects_a_repeated_param() {
+    // The loop used to keep the last value while the in-app parser keeps the
+    // first, so one URL routed two ways depending on where it was opened.
+    for raw in [
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&channel=11111111-1111-4111-8111-111111111111",
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&thread=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&thread=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    ] {
+        assert!(
+            parse_message_deep_link(&Url::parse(raw).unwrap()).is_none(),
+            "must reject {raw}"
+        );
+    }
+}
+
+#[test]
+fn parse_join_deep_link_rejects_a_repeated_param() {
+    for raw in [
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc&code=evil",
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&relay=wss%3A%2F%2Fevil.example&code=abc",
+    ] {
+        assert!(
+            parse_join_deep_link(&Url::parse(raw).unwrap()).is_none(),
+            "must reject {raw}"
+        );
+    }
 }
 
 #[test]
