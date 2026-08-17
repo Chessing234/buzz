@@ -327,15 +327,26 @@ function archiveChannelKey(agentPubkey: string, channelId: string): string {
 }
 
 /**
- * Append a decoded archived observer event to the channel-scoped archive
- * event journal. Unlike `appendAgentEvent`, this path does NOT cap or trim —
- * the channel archive window grows only by explicit paged loads from SQLite,
- * so unbounded growth from live relay events is impossible.
+ * Identity of an archived event for dedup: the `(seq, timestamp)` pair
+ * `appendAgentEvent` and `mergeObserverEventWindows` also key on. NUL-joined
+ * so no timestamp spelling can borrow a digit from the seq beside it.
+ */
+function archiveDedupKey(event: { seq: number; timestamp: string }): string {
+  return `${event.seq}\u0000${event.timestamp}`;
+}
+
+/**
+ * Merge a page of decoded archived observer events into the channel-scoped
+ * archive event journal. Unlike `appendAgentEvent`, this path does NOT cap or
+ * trim — the channel archive window grows only by explicit paged loads from
+ * SQLite, so unbounded growth from live relay events is impossible.
  *
- * Deduplicates on `(seq, timestamp)` — identical to `appendAgentEvent` — so
- * events that arrive on the live relay before the archive page is loaded are
- * silently skipped. The archive window and the live transcript are kept
- * strictly separate: live events never write here.
+ * Deduplicates on `(seq, timestamp)`, both against the events already in the
+ * window and within the incoming page. That dedup is *archive-local*: the
+ * archive window and the live transcript are deliberately separate stores and
+ * live events never write here, so an archived copy of an event that already
+ * arrived live is still stored. The two windows are reconciled at read time,
+ * by `mergeObserverEventWindows`.
  *
  * Takes the whole page at once. Merging event-by-event meant a linear dedup
  * scan and a full re-sort of the window per event, so ingesting a page of P
@@ -347,10 +358,6 @@ function archiveChannelKey(agentPubkey: string, channelId: string): string {
  * Returns `true` if anything was added (state changed), `false` if every event
  * was a duplicate. The caller batches notifications.
  */
-function archiveDedupKey(event: { seq: number; timestamp: string }): string {
-  return `${event.seq}\u0000${event.timestamp}`;
-}
-
 function appendArchivedChannelEvents(
   agentPubkey: string,
   channelId: string,
@@ -792,10 +799,17 @@ export function useManagedAgentObserverBridge(
  * - The event sender (`pubkey`) must match the `agent` tag value.
  * - Event must decrypt successfully via `decryptObserverEvent`.
  *
- * Routes through `appendAgentEvent` so dedup on `(seq, timestamp)` and
- * sort are reused — archived events that are already present (live-delivered)
- * are silently skipped. Failed decryptions are silently dropped (same as
- * live path error handling).
+ * Routing depends on whether the decoded event carries a `channelId`:
+ *
+ * - With one, it joins the channel-scoped archive window via
+ *   `appendArchivedChannelEvents`, batched so each channel's slice of the page
+ *   is merged in a single call. Dedup there is archive-local — an event that
+ *   also arrived live is still stored, and the two windows are reconciled at
+ *   read time by `mergeObserverEventWindows`.
+ * - Without one, it falls through to `appendAgentEvent` so it stays visible in
+ *   the agent's general transcript.
+ *
+ * Failed decryptions are silently dropped (same as live path error handling).
  *
  * Note: events for agents not currently registered in `knownAgentPubkeys`
  * (e.g. an agent that is stopped but has archived history) are dropped.
