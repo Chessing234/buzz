@@ -129,14 +129,26 @@ export function isValidBlob(obj: unknown): obj is ReadStateBlob {
   return true;
 }
 
+/**
+ * Validate a decrypted blob's context map.
+ *
+ * Implausible markers are dropped rather than clamped. Markers are monotonic
+ * and this blob may have been written by another desktop that predates the
+ * skew policy, so a year-ahead entry admitted here would silently mark every
+ * later message read and never expire. Dropping it restores the channel to
+ * unread, which the user can see and act on; clamping it to the present would
+ * assert a read position nobody ever reached.
+ */
 export function sanitizeContexts(
   contexts: Record<string, unknown>,
+  now: number = nowUnixSeconds(),
 ): Record<string, number> {
   const result: Record<string, number> = {};
   for (const [key, value] of Object.entries(contexts)) {
     if (new TextEncoder().encode(key).length > 256) continue;
     if (typeof value !== "number" || !Number.isInteger(value)) continue;
     if (value < 0 || value > 4294967295) continue;
+    if (!isPlausibleReadMarker(value, now)) continue;
     result[key] = value;
   }
   return result;
