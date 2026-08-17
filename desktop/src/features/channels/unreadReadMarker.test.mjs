@@ -517,38 +517,77 @@ test("addThreadActivityItems keeps newest items when input is newest-first", () 
 // --- A future-dated created_at must not mark later messages read ---
 //
 // `created_at` is self-asserted by the sending client and the relay does not
-// bound it for ordinary messages. Before the clamp, one event dated a year out
-// landed in the read marker verbatim, so every genuinely new message failed
-// `createdAt > readAt` and was classified read: no badge, no divider, no
-// thread resume, until wall-clock time caught up.
+// bound it for ordinary messages. Before the skew policy, one event dated a
+// year out landed in the read marker verbatim, so every genuinely new message
+// failed `createdAt > readAt` and was classified read: no badge, no divider,
+// no thread resume, until wall-clock time caught up.
+//
+// The tolerance decides whether a timestamp is *plausible*; it is not a value
+// to clamp to. Clamping an outlier to `now + 120` would manufacture a read
+// frontier two minutes into the future and hide every legitimate message that
+// arrives before the clock reaches it. An implausible timestamp is discarded
+// and the marker repaired to the present instead.
 
 const NOW = 1_780_000_000;
 const YEAR_AHEAD = NOW + 365 * 24 * 60 * 60;
 
-test("resolveChannelReadMarker_futureCallerReadAt_clampsToSkewCeiling", () => {
+test("resolveChannelReadMarker_futureCallerReadAt_repairsToThePresent", () => {
   const result = resolveChannelReadMarker(
     new Date(YEAR_AHEAD * 1_000).toISOString(),
     undefined,
     NOW,
   );
 
-  assert.equal(result.markAt, NOW + 120);
+  assert.equal(result.markAt, NOW);
   assert.ok(
     result.markAt < YEAR_AHEAD,
     "a future-dated message must not push the marker past it",
   );
 });
 
-test("resolveChannelReadMarker_futureObservedLatest_clampsAndKeepsObserved", () => {
+test("resolveChannelReadMarker_repairedMarker_doesNotHideTheNextTwoMinutes", () => {
+  // The regression the ceiling-clamp version had: a correct message arriving a
+  // second from now must still be unread against the repaired marker.
+  const { markAt } = resolveChannelReadMarker(
+    new Date(YEAR_AHEAD * 1_000).toISOString(),
+    undefined,
+    NOW,
+  );
+
+  const marker = computeChannelUnreadMarker(
+    [topLevel("soon", NOW + 1)],
+    markAt,
+  );
+
+  assert.equal(marker.firstUnreadMessageId, "soon");
+  assert.equal(marker.unreadCount, 1);
+});
+
+test("resolveChannelReadMarker_futureObservedLatest_repairsAndKeepsObserved", () => {
   const result = resolveChannelReadMarker(null, YEAR_AHEAD, NOW);
 
-  assert.equal(result.markAt, NOW + 120);
+  assert.equal(result.markAt, NOW);
   // The observed refs must survive: that event really is still unread, so
-  // clearing them would drop the sidebar dot the clamp exists to preserve.
+  // clearing them would drop the sidebar dot the policy exists to preserve.
   assert.equal(result.clearObserved, false);
 });
 
-test("resolveChannelReadMarker_afterClamp_aLaterRealMessageIsStillUnread", () => {
+test("resolveChannelReadMarker_keepsThePlausibleInputWhenTheOtherIsPoison", () => {
+  // Discarding is per-input, not on the max: a real caller position must not be
+  // thrown away just because the observed timestamp beside it is implausible.
+  const realRead = NOW - 3_600;
+
+  const result = resolveChannelReadMarker(
+    new Date(realRead * 1_000).toISOString(),
+    YEAR_AHEAD,
+    NOW,
+  );
+
+  assert.equal(result.markAt, realRead);
+  assert.equal(result.clearObserved, false);
+});
+
+test("resolveChannelReadMarker_afterRepair_aLaterRealMessageIsStillUnread", () => {
   // The end-to-end shape of the bug, through the same comparison the divider
   // uses: poison arrives, the channel is marked read, then a genuine message.
   const { markAt } = resolveChannelReadMarker(
@@ -564,9 +603,9 @@ test("resolveChannelReadMarker_afterClamp_aLaterRealMessageIsStillUnread", () =>
   assert.equal(marker.unreadCount, 1);
 });
 
-test("resolveChannelReadMarker_ordinarySkewInsideTolerance_isNotClamped", () => {
-  // A sender 30s ahead of this machine is normal. Clamping that would leave a
-  // just-received message unread until this clock caught up.
+test("resolveChannelReadMarker_ordinarySkewInsideTolerance_isKept", () => {
+  // A sender 30s ahead of this machine is normal. Discarding that would move
+  // the marker back to now and leave a message the user just read unread.
   const slightlyAhead = NOW + 30;
 
   const result = resolveChannelReadMarker(

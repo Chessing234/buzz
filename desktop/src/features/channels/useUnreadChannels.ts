@@ -16,6 +16,7 @@ import {
   type ObservedUnreadEvent,
 } from "@/features/channels/unreadChannelCounts";
 import { useReadState } from "@/features/channels/readState/useReadState";
+import { isPlausibleReadMarker } from "@/features/channels/readState/readStateFormat";
 import { makeRootIdStore } from "@/features/channels/unreadRootIdStore";
 import {
   forcedUnreadStore,
@@ -98,54 +99,67 @@ function toUnixSeconds(isoOrMs: string | null | undefined): number | null {
   return ms === null ? null : Math.floor(ms / 1_000);
 }
 
-// How far ahead of this machine's clock a read marker may land. `created_at`
-// is self-asserted by the sending client and the relay does not bound it for
-// ordinary messages, so an unbounded marker lets one future-dated event mark
-// every later message in the channel as already read — no badge, no divider,
-// no thread resume — until wall-clock time catches up with it.
-//
-// A tolerance rather than a hard `now` ceiling: ordinary skew between two
-// machines is seconds, and clamping that hard would leave a just-received
-// message unread until this clock caught up. 120s matches the relay's own
-// `MAX_COMMAND_SKEW_SECS` (`handlers/moderation_commands.rs`), which is the
-// house number for "clock difference we accept"; NIP-AB already says clients
-// MUST NOT set `created_at` in the future at all.
-const MAX_READ_MARKER_SKEW_SECONDS = 120;
-
-// Resolve where the read marker should land when a channel is marked read.
-// Folds the caller's timeline position together with the newest event this
-// client has observed live (`observedLatest`), so an explicit "mark read" still
-// covers messages that arrived faster than channel metadata — this fold is
-// load-bearing for the Esc shortcut, sidebar mark-read, and empty-channel open,
-// all of which pass a null/stale caller value. `clearObserved` reports whether
-// the resulting marker covers the observed timestamp, signalling the caller to
-// drop its observed refs so the unread memo sees `latest === undefined` until a
+// Resolve where the read marker should land when a channel is marked read,
+// from timestamps already in unix seconds. Folds the caller's timeline position
+// together with the newest event this client has observed live
+// (`observedLatest`), so an explicit "mark read" still covers messages that
+// arrived faster than channel metadata — this fold is load-bearing for the Esc
+// shortcut, sidebar mark-read, empty-channel open and mark-all-read, all of
+// which pass a null/stale caller value. `clearObserved` reports whether the
+// resulting marker covers the observed timestamp, signalling the caller to drop
+// its observed refs so the unread memo sees `latest === undefined` until a
 // genuinely newer event arrives.
 //
-// Both inputs are event-derived, so both are clamped: `callerReadAt` comes from
-// a message's own `created_at` (channel-open, the Esc shortcut's
-// `lastMessageAt`, mark-all-read) and `observedLatest` from live events.
+// Both inputs are event-derived — `callerUnix` from a message's own
+// `created_at`, `observedLatest` from live events — so `isPlausibleReadMarker`
+// decides for each of them whether it could have come from a clock we agree
+// with. An implausible input is *discarded*, not clamped: clamping it to the
+// tolerance ceiling would manufacture a read frontier at `now + 120` and hide
+// every legitimate message for the next two minutes. If no input survives, the
+// marker is repaired to the present — the mark-read gesture is real, so it
+// still takes effect, and only the future-dated event itself stays unread.
 //
-// `nowSeconds` is injectable so the ceiling is testable; it must stay a
+// `nowSeconds` is injectable so the policy is testable; it must stay a
 // parameter rather than a captured constant.
+export function resolveChannelReadMarkerUnix(
+  callerUnix: number | null,
+  observedLatest: number | undefined,
+  nowSeconds: number = Date.now() / 1_000,
+): { markAt: number | null; clearObserved: boolean } {
+  const requested = Math.max(callerUnix ?? 0, observedLatest ?? 0) || null;
+  if (requested === null) return { markAt: null, clearObserved: false };
+
+  const now = Math.floor(nowSeconds);
+  const plausible = [callerUnix, observedLatest].filter(
+    (value): value is number =>
+      value !== null &&
+      value !== undefined &&
+      value > 0 &&
+      isPlausibleReadMarker(value, now),
+  );
+  const markAt = plausible.length > 0 ? Math.max(...plausible) : now;
+  return {
+    markAt,
+    clearObserved:
+      observedLatest !== undefined &&
+      // A repaired marker does not cover a future-dated observed event, so the
+      // observed refs must survive: that event really is still unread.
+      observedLatest <= markAt,
+  };
+}
+
+// String-timestamp front door for `resolveChannelReadMarkerUnix`, for the
+// callers that hold a message's ISO `created_at`.
 export function resolveChannelReadMarker(
   callerReadAt: string | null | undefined,
   observedLatest: number | undefined,
   nowSeconds: number = Date.now() / 1_000,
 ): { markAt: number | null; clearObserved: boolean } {
-  const callerUnix = toUnixSeconds(callerReadAt);
-  const requested = Math.max(callerUnix ?? 0, observedLatest ?? 0) || null;
-  const ceiling = Math.floor(nowSeconds) + MAX_READ_MARKER_SKEW_SECONDS;
-  const markAt = requested === null ? null : Math.min(requested, ceiling);
-  return {
-    markAt,
-    clearObserved:
-      markAt !== null &&
-      observedLatest !== undefined &&
-      // A clamped marker does not cover a future-dated observed event, so the
-      // observed refs must survive: that event really is still unread.
-      observedLatest <= markAt,
-  };
+  return resolveChannelReadMarkerUnix(
+    toUnixSeconds(callerReadAt),
+    observedLatest,
+    nowSeconds,
+  );
 }
 
 export function resolveObservedUnreadRootId(tags: string[][]): string | null {

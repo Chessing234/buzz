@@ -37,6 +37,41 @@ export const THREAD_PREFIX = "thread:";
 
 const EVENT_ID_PATTERN = /^[0-9a-f]{64}$/;
 
+// How far ahead of this machine's clock a read marker may plausibly land.
+// `created_at` is self-asserted by the sending client and the relay does not
+// bound it for ordinary messages, so an unbounded marker lets one future-dated
+// event mark every later message in the channel as already read — no badge, no
+// divider, no thread resume — until wall-clock time catches up with it.
+//
+// A tolerance rather than a hard `now` ceiling: ordinary skew between two
+// machines is seconds, and rejecting that would drop a marker a sibling device
+// legitimately wrote. 120s matches the relay's own `MAX_COMMAND_SKEW_SECS`
+// (`handlers/moderation_commands.rs`), the house number for "clock difference
+// we accept"; NIP-AB already says clients MUST NOT set `created_at` in the
+// future at all.
+export const MAX_READ_MARKER_SKEW_SECONDS = 120;
+
+export function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1_000);
+}
+
+/**
+ * Whether a read marker at `unixSeconds` could have been written by a clock
+ * this one agrees with.
+ *
+ * The single skew policy for read state. Every route a marker can enter by
+ * consults it, because read markers are monotonic and persisted: a marker
+ * accepted once from a live event, from local storage, or from an NIP-RS
+ * event synced by another (possibly unpatched) desktop stays effective, and
+ * a year-ahead one is unrecoverable from the UI.
+ */
+export function isPlausibleReadMarker(
+  unixSeconds: number,
+  now: number = nowUnixSeconds(),
+): boolean {
+  return unixSeconds <= now + MAX_READ_MARKER_SKEW_SECONDS;
+}
+
 export function maxReadAt(...markers: Array<number | null>): number | null {
   return markers.reduce<number | null>((latest, marker) => {
     if (marker === null) return latest;
