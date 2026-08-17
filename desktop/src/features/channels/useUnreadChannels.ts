@@ -954,14 +954,25 @@ export function useUnreadChannels(
   unreadChannelIdsRef.current = unreadChannelIds;
 
   const markAllChannelsRead = React.useCallback(() => {
+    // Channels whose observed evidence must outlive the clear: their newest
+    // observed event is future-dated, so the repaired marker does not cover it
+    // and it is genuinely still unread. Clearing them here would delete the
+    // only record of that event and silently drop its unread dot.
+    const retainObserved = new Set<string>();
     for (const channelId of unreadChannelIdsRef.current) {
       delete forcedUnreadRef.current[channelId];
-      const unixSeconds =
-        latestByChannelRef.current.get(channelId) ??
-        getEffectiveTimestamp(channelId) ??
-        null;
-      if (unixSeconds !== null) {
-        markContextRead(channelId, unixSeconds);
+      const observedLatest = latestByChannelRef.current.get(channelId);
+      // Same funnel as markChannelRead — mark-all must not be a second,
+      // unbounded way to write a marker.
+      const { markAt, clearObserved } = resolveChannelReadMarkerUnix(
+        getEffectiveTimestamp(channelId),
+        observedLatest,
+      );
+      if (markAt !== null) {
+        markContextRead(channelId, markAt);
+      }
+      if (observedLatest !== undefined && !clearObserved) {
+        retainObserved.add(channelId);
       }
     }
     if (pubkey) {
@@ -971,7 +982,7 @@ export function useUnreadChannels(
     // the parent must not reset the observed Maps directly on this path, or a
     // stale scope-A callback could corrupt scope B before the fence rejects.
     // (Fenced record writes in handleChannelMessage and catch-up remain in the parent.)
-    observedPersistence.clearAll();
+    observedPersistence.clearAll(retainObserved);
     bumpLatestVersion();
   }, [getEffectiveTimestamp, markContextRead, observedPersistence, pubkey]);
 
