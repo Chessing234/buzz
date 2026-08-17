@@ -280,11 +280,15 @@ pub struct AcpModelEntry {
 #[cfg(test)]
 mod wire_format_tests {
     use super::*;
+    use serde_json::json;
 
     /// Every `ConfigWriteMechanism` variant, as `desktop/src/shared/api/types.ts`
     /// declares it. Whole-value comparison, not a key-set check: a key-set
     /// assertion still passes if the variant *name* regresses, and the `type`
-    /// discriminant is what every `switch (writeVia.type)` reads.
+    /// discriminant is what every `switch (writeVia.type)` reads. Compared as
+    /// `serde_json::Value` rather than as text, because JSON object order is
+    /// not semantic and the contract is the keys and values, not the encoder's
+    /// field order.
     #[test]
     fn wire_format_matches_typescript_contract() {
         let cases = [
@@ -292,29 +296,29 @@ mod wire_format_tests {
                 ConfigWriteMechanism::RespawnWithEnvVar {
                     env_key: "GOOSE_MODE".into(),
                 },
-                r#"{"type":"respawnWithEnvVar","envKey":"GOOSE_MODE"}"#,
+                json!({"type": "respawnWithEnvVar", "envKey": "GOOSE_MODE"}),
             ),
             (
                 ConfigWriteMechanism::AcpSetConfigOption {
                     config_id: "model".into(),
                 },
-                r#"{"type":"acpSetConfigOption","configId":"model"}"#,
+                json!({"type": "acpSetConfigOption", "configId": "model"}),
             ),
             (
                 ConfigWriteMechanism::AcpSetSessionModel,
-                r#"{"type":"acpSetSessionModel"}"#,
+                json!({"type": "acpSetSessionModel"}),
             ),
             (
                 ConfigWriteMechanism::GooseNativeConfigWrite {
                     config_key: "goose.model".into(),
                 },
-                r#"{"type":"gooseNativeConfigWrite","configKey":"goose.model"}"#,
+                json!({"type": "gooseNativeConfigWrite", "configKey": "goose.model"}),
             ),
-            (ConfigWriteMechanism::ReadOnly, r#"{"type":"readOnly"}"#),
+            (ConfigWriteMechanism::ReadOnly, json!({"type": "readOnly"})),
         ];
         for (mechanism, expected) in cases {
             assert_eq!(
-                serde_json::to_string(&mechanism).expect("serialize"),
+                serde_json::to_value(&mechanism).expect("serialize"),
                 expected
             );
         }
@@ -337,8 +341,15 @@ mod wire_format_tests {
             is_required: true,
         };
         assert_eq!(
-            serde_json::to_string(&field).expect("serialize"),
-            r#"{"value":"v","origin":"envVar","writeVia":{"type":"respawnWithEnvVar","envKey":"GOOSE_MODE"},"overriddenValue":"o","overriddenOrigin":"configFile","isRequired":true}"#
+            serde_json::to_value(&field).expect("serialize"),
+            json!({
+                "value": "v",
+                "origin": "envVar",
+                "writeVia": {"type": "respawnWithEnvVar", "envKey": "GOOSE_MODE"},
+                "overriddenValue": "o",
+                "overriddenOrigin": "configFile",
+                "isRequired": true,
+            })
         );
     }
 
