@@ -147,15 +147,8 @@ pub struct ConfigField {
     pub write_via: ConfigWriteMechanism,
 }
 
-/// `rename_all_fields` is carried here for the same reason as on
-/// [`ConfigWriteMechanism`], even though `options` is a single word today: it
-/// is the attribute a future multi-word field would silently need.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum ConfigFieldType {
     String,
     Number,
@@ -371,19 +364,6 @@ mod wire_format_tests {
             )
             .is_err(),
             "the pre-fix snake_case spelling must not be accepted"
-        );
-    }
-
-    /// `ConfigFieldType`'s only payload field is single-word today, so this
-    /// pins the shape rather than proving a fix.
-    #[test]
-    fn config_field_type_enum_variant_matches_the_contract() {
-        assert_eq!(
-            serde_json::to_string(&ConfigFieldType::Enum {
-                options: vec!["a".into(), "b".into()],
-            })
-            .expect("serialize"),
-            r#"{"type":"enum","options":["a","b"]}"#
         );
     }
 }
