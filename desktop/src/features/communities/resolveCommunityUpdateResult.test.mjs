@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  hasCommunityForRelay,
   isSameRelay,
   resolveCommunityUpdateResult,
 } from "./useCommunities.tsx";
@@ -177,4 +178,61 @@ test("resolveCommunityUpdateResult_reSpellingOwnRelay_isStillAnUpdate", () => {
     relayUrl: "wss://relay-a.example.com/",
   });
   assert.deepEqual(result, { kind: "updated", requiresReinit: true });
+});
+
+// ---------------------------------------------------------------------------
+// The onboarding rollback flag must agree with addCommunity
+// ---------------------------------------------------------------------------
+//
+// `handleCommunityOnboardingConnect` records `addedCommunity` from this
+// predicate and `handleCommunityOnboardingCancel` acts on it: a true flag lets
+// cancel remove the community, or `clearCommunities()` it when it is the only
+// one. Since `addCommunity` folds an equivalent spelling into the existing
+// community rather than creating a new one, asking with raw `===` here would
+// arm that rollback against a community the connect never created.
+
+test("hasCommunityForRelay_reportsAnEquivalentSpellingAsAlreadyPresent", () => {
+  for (const spelling of [
+    "wss://relay-a.example.com/",
+    "wss://relay-a.example.com//",
+    "WSS://Relay-A.Example.com",
+    "  wss://relay-a.example.com  ",
+  ]) {
+    assert.equal(
+      hasCommunityForRelay(COMMUNITIES, spelling),
+      true,
+      `${spelling} is the existing relay, so the connect added nothing`,
+    );
+  }
+});
+
+test("hasCommunityForRelay_reportsAGenuinelyNewRelayAsAbsent", () => {
+  assert.equal(
+    hasCommunityForRelay(COMMUNITIES, "wss://relay-c.example.com"),
+    false,
+  );
+  assert.equal(
+    hasCommunityForRelay(COMMUNITIES, "ws://relay-a.example.com"),
+    false,
+  );
+  assert.equal(hasCommunityForRelay([], "wss://relay-a.example.com"), false);
+});
+
+test("hasCommunityForRelay_agreesWithTheMatchAddCommunityUses", () => {
+  // addCommunity folds via isSameRelay; the rollback flag must not disagree
+  // with it for any spelling, or cancel deletes a pre-existing community.
+  for (const spelling of [
+    "wss://relay-a.example.com",
+    "WSS://Relay-A.Example.com/",
+    "wss://relay-b.example.com//",
+    "wss://relay-c.example.com",
+  ]) {
+    assert.equal(
+      hasCommunityForRelay(COMMUNITIES, spelling),
+      COMMUNITIES.some((community) =>
+        isSameRelay(community.relayUrl, spelling),
+      ),
+      `${spelling} must resolve the same way for both`,
+    );
+  }
 });

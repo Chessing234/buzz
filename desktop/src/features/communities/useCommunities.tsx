@@ -51,6 +51,25 @@ export function isSameRelay(left: string, right: string): boolean {
 }
 
 /**
+ * Whether the community list already holds the relay `relayUrl` names.
+ *
+ * Callers that decide *whether an add created a community* must ask this, not
+ * compare raw strings: `addCommunity` folds a storage-equivalent spelling into
+ * the existing community and hands back its id, so a raw comparison marks a
+ * pre-existing community as freshly added. Onboarding's rollback then treats
+ * it as temporary and can remove it — or `clearCommunities()` when it is the
+ * only one. Keep this predicate and `addCommunity`'s match in lockstep.
+ */
+export function hasCommunityForRelay(
+  communities: readonly Pick<Community, "relayUrl">[],
+  relayUrl: string,
+): boolean {
+  return communities.some((community) =>
+    isSameRelay(community.relayUrl, relayUrl),
+  );
+}
+
+/**
  * Pure decision logic for updateCommunity — determines the outcome from a
  * synchronous snapshot of communities without side effects.  Extracted so the
  * 5-case result matrix is unit-testable outside React.
