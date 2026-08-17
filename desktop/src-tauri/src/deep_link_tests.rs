@@ -629,3 +629,68 @@ fn parse_nostr_bind_deep_link_accepts_expired_link_for_user_facing_error() {
     let payload = parse_nostr_bind_deep_link(&url).unwrap();
     assert_eq!(payload.expires_at, "2000-01-01T00:00:00Z");
 }
+
+/// An optional parameter is still covered by the one-value-per-param policy.
+/// Reading a repetition as "not supplied" let the link through with the field
+/// silently dropped, which is the ambiguity this policy exists to remove.
+#[test]
+fn optional_params_reject_a_repetition_rather_than_reading_it_as_absent() {
+    let join = Url::parse(
+        "buzz://join?relay=wss%3A%2F%2Frelay.example&code=abc&policy_receipt=a&policy_receipt=b",
+    )
+    .unwrap();
+    assert!(
+        parse_join_deep_link(&join).is_none(),
+        "a repeated policy_receipt must reject the join, not join without it"
+    );
+
+    let add_community = Url::parse(
+        "buzz://add-community?relay=wss%3A%2F%2Facme.example&name=Acme&name=Evil%20Corp",
+    )
+    .unwrap();
+    assert!(
+        parse_add_community_deep_link(&add_community).is_none(),
+        "a repeated name must reject the link, not add the community unnamed"
+    );
+}
+
+/// Nostr-bind is the most security-sensitive link the app parses, and its
+/// required fields used to read the *first* value while every other family had
+/// moved to the single policy.
+#[test]
+fn parse_nostr_bind_deep_link_rejects_a_repeated_required_param() {
+    for (param, extra) in [
+        ("origin", "origin=https%3A%2F%2Fevil.example"),
+        (
+            "challenge_id",
+            "challenge_id=11111111-1111-4111-8111-111111111111",
+        ),
+        ("verification_code", "verification_code=999999"),
+        ("audience", "audience=buzz%3Aevil"),
+        ("return", "return=browser_fragment_v1"),
+    ] {
+        let url = Url::parse(&format!("{}&{extra}", valid_nostr_bind_url())).unwrap();
+        assert_eq!(
+            parse_nostr_bind_deep_link(&url).unwrap_err(),
+            format!("repeated {param}"),
+            "a repeated {param} must be named as such"
+        );
+    }
+}
+
+/// The callback is validated against `origin` only when it is present, so
+/// reading a repeated `callback_url` as absent would hand back a bind payload
+/// carrying a callback that never met `validate_nostr_bind_callback_url`.
+#[test]
+fn parse_nostr_bind_deep_link_rejects_a_repeated_callback_url() {
+    let url = Url::parse(&format!(
+        "{}&callback_url=https%3A%2F%2Fexample.com%2Fbuzz&callback_url=https%3A%2F%2Fevil.example%2Fbuzz",
+        valid_nostr_bind_url()
+    ))
+    .unwrap();
+
+    assert_eq!(
+        parse_nostr_bind_deep_link(&url).unwrap_err(),
+        "repeated callback_url"
+    );
+}

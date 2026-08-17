@@ -305,26 +305,66 @@ pub(crate) fn install_deep_link_handlers(app: &mut tauri::App) {
     }
 }
 
+/// What a query parameter that may appear at most once actually was.
+///
+/// Three outcomes, not two. Collapsing `Repeated` into `Absent` is what let a
+/// duplicate slip past an *optional* parameter: the reader said "not supplied",
+/// the parser shrugged and carried on, and the link was accepted with the field
+/// silently dropped — the opposite of the single policy this parser is supposed
+/// to apply.
+enum SingleParam {
+    /// Not supplied at all, or supplied exactly once with an empty value.
+    /// Empty has always read as absent here and still does.
+    Absent,
+    Present(String),
+    /// Named more than once. Always a rejection, never a pick.
+    Repeated,
+}
+
 /// Read a query parameter that may appear at most once.
 ///
-/// Returns `None` when the parameter is absent, empty, or repeated. Repeated
-/// is deliberately a rejection rather than a pick: our own builders never emit
-/// a duplicate, the in-app parsers in
+/// Repeated is deliberately a rejection rather than a pick: our own builders
+/// never emit a duplicate, the in-app parsers in
 /// `desktop/src/features/messages/lib/messageLink.ts` and
 /// `desktop/src/shared/lib/entityLink.ts` take the first value or refuse
 /// outright, and this parser used to take the *last* — so the same URL could
 /// route one way when clicked inside the app and another when handed to the
 /// app by the OS.
-fn single_param(url: &Url, name: &str) -> Option<String> {
+fn read_single_param(url: &Url, name: &str) -> SingleParam {
     let mut values = url
         .query_pairs()
         .filter(|(key, _)| key == name)
         .map(|(_, value)| value.into_owned());
-    let first = values.next()?;
-    if values.next().is_some() || first.is_empty() {
-        return None;
+    let Some(first) = values.next() else {
+        return SingleParam::Absent;
+    };
+    if values.next().is_some() {
+        return SingleParam::Repeated;
     }
-    Some(first)
+    if first.is_empty() {
+        return SingleParam::Absent;
+    }
+    SingleParam::Present(first)
+}
+
+/// A required parameter: absent, empty and repeated all fail the same way,
+/// because the caller has nothing to distinguish them with.
+fn single_param(url: &Url, name: &str) -> Option<String> {
+    match read_single_param(url, name) {
+        SingleParam::Present(value) => Some(value),
+        SingleParam::Absent | SingleParam::Repeated => None,
+    }
+}
+
+/// An optional parameter. `Some(None)` is a valid absence; `None` is a
+/// rejection of the whole link, which is what a repetition has to be — an
+/// optional parameter is still covered by the one-value-per-param policy.
+fn optional_param(url: &Url, name: &str) -> Option<Option<String>> {
+    match read_single_param(url, name) {
+        SingleParam::Absent => Some(None),
+        SingleParam::Present(value) => Some(Some(value)),
+        SingleParam::Repeated => None,
+    }
 }
 
 /// A 64-character hex event id, lowercased. Mirrors the check
@@ -343,16 +383,9 @@ fn hex64_param(url: &Url, name: &str) -> Option<String> {
 /// An optional hex64 param: absent or empty reads as absent, as it always has;
 /// present-but-malformed and repeated are rejections.
 fn optional_hex64_param(url: &Url, name: &str) -> Option<Option<String>> {
-    let values: Vec<String> = url
-        .query_pairs()
-        .filter(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-        .collect();
-    match values.as_slice() {
-        [] => Some(None),
-        [value] if value.is_empty() => Some(None),
-        [value] => canonical_hex64(value).map(Some),
-        _ => None,
+    match optional_param(url, name)? {
+        None => Some(None),
+        Some(value) => canonical_hex64(&value).map(Some),
     }
 }
 
@@ -390,7 +423,9 @@ fn parse_message_deep_link(url: &Url) -> Option<serde_json::Value> {
 /// payload.
 fn parse_join_deep_link(url: &Url) -> Option<serde_json::Value> {
     let code = single_param(url, "code")?;
-    let policy_receipt = single_param(url, "policy_receipt");
+    // Optional, but still one-value-only: a repeated `policy_receipt` used to
+    // read as "not supplied" and the join went ahead without it.
+    let policy_receipt = optional_param(url, "policy_receipt")?;
     let relay_url = parse_websocket_relay_param(url)?;
     Some(serde_json::json!({
         "relayUrl": relay_url,
@@ -502,7 +537,7 @@ fn parse_websocket_relay_param(url: &Url) -> Option<String> {
 fn parse_add_community_deep_link(url: &Url) -> Option<AddCommunityDeepLinkPayload> {
     Some(AddCommunityDeepLinkPayload {
         relay_url: parse_websocket_relay_param(url)?,
-        name: optional_non_empty_param(url, "name"),
+        name: optional_param(url, "name")?,
     })
 }
 
@@ -522,16 +557,26 @@ struct NostrBindDeepLinkPayload {
     callback_url: Option<String>,
 }
 
+/// Nostr-bind's required-parameter reader. Was `.find()`, i.e. take the first
+/// value — the one policy this parser is meant to have applies to a bind link
+/// too, and these are the most security-sensitive params it reads.
 fn non_empty_param(url: &Url, name: &str) -> Result<String, String> {
-    url.query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("missing {name}"))
+    match read_single_param(url, name) {
+        SingleParam::Present(value) => Ok(value),
+        SingleParam::Absent => Err(format!("missing {name}")),
+        SingleParam::Repeated => Err(format!("repeated {name}")),
+    }
 }
 
-fn optional_non_empty_param(url: &Url, name: &str) -> Option<String> {
-    single_param(url, name)
+/// Nostr-bind's optional-parameter reader. A repeated `callback_url` must not
+/// read as "no callback supplied": that would hand the caller a bind payload
+/// whose callback never went through `validate_nostr_bind_callback_url`.
+fn optional_non_empty_param(url: &Url, name: &str) -> Result<Option<String>, String> {
+    match read_single_param(url, name) {
+        SingleParam::Absent => Ok(None),
+        SingleParam::Present(value) => Ok(Some(value)),
+        SingleParam::Repeated => Err(format!("repeated {name}")),
+    }
 }
 
 fn validate_nostr_bind_callback_url(callback_url: &str, origin: &str) -> Result<(), String> {
@@ -567,7 +612,7 @@ fn parse_nostr_bind_deep_link(url: &Url) -> Result<NostrBindDeepLinkPayload, Str
     let origin = non_empty_param(url, "origin")?;
     let expires_at = non_empty_param(url, "expires_at")?;
     let return_mode = non_empty_param(url, "return")?;
-    let callback_url = optional_non_empty_param(url, "callback_url");
+    let callback_url = optional_non_empty_param(url, "callback_url")?;
 
     nostr_bind::validate_challenge_id(&challenge_id)?;
     nostr_bind::validate_nonce(&nonce)?;
