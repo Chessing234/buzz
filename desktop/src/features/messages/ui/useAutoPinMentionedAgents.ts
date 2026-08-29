@@ -6,6 +6,7 @@ import {
   removePersistentAgentAudienceMembersIfUnchanged,
   usePersistentAgentAudience,
 } from "@/features/messages/lib/persistentAgentAudience";
+import { shouldPromoteExplicitAddress } from "@/features/messages/lib/shouldPromoteExplicitAddress";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 const CONFIRMATION_DURATION_MS = 4_000;
@@ -199,7 +200,7 @@ export function useAutoPinMentionedAgents({
       // With "Automatically mention agents" off, an explicit @mention is
       // one-shot: do not pin into the persistent audience or flip the
       // preference on (that was leaving the next composer auto-selected).
-      if (!enabled) return;
+      if (!shouldPromoteExplicitAddress(enabled)) return;
       promoteAgents({
         ...promotion,
         reinstateExcluded: true,
