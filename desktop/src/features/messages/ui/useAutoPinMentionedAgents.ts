@@ -196,6 +196,10 @@ export function useAutoPinMentionedAgents({
   );
   const promoteExplicitlyAddressedAgents = React.useCallback(
     (promotion: { expectedRevision?: number; pubkeys: readonly string[] }) => {
+      // With "Automatically mention agents" off, an explicit @mention is
+      // one-shot: do not pin into the persistent audience or flip the
+      // preference on (that was leaving the next composer auto-selected).
+      if (!enabled) return;
       promoteAgents({
         ...promotion,
         reinstateExcluded: true,
@@ -203,7 +207,7 @@ export function useAutoPinMentionedAgents({
       });
       requestPreferenceChange(true);
     },
-    [promoteAgents, requestPreferenceChange],
+    [enabled, promoteAgents, requestPreferenceChange],
   );
 
   const dismissConfirmation = clearConfirmation;
