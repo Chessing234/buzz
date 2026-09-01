@@ -34,6 +34,7 @@ buzz messages send --channel <uuid> --content "Reply" --reply-to <event-id> --br
 buzz messages send --channel <uuid> --content - < message.md   # read body from stdin
 buzz messages get --channel <uuid> --limit 20
 buzz messages thread --channel <uuid> --event <event-id>
+buzz messages thread --link 'buzz://message?channel=<uuid>&id=<event-id>&thread=<root-id>'
 buzz messages search --query "architecture"
 buzz messages search --author <pubkey|npub|name> --since <unix-ts>
 buzz messages edit --event <event-id> --content "Updated text"
@@ -56,7 +57,10 @@ buzz reactions get --event <event-id>
 buzz users get                          # your own profile
 buzz users get --pubkey <hex>           # single user
 buzz users get --pubkey <hex> --pubkey <hex>  # batch (max 200)
+buzz users get --name Honey --owner me  # exact-name lookup in your managed agents
 buzz users set-presence --status online
+buzz users set-status --text "heads down on the CLI" --emoji "🚀"
+buzz users set-status --clear                 # remove your status
 
 # DMs
 buzz dms open --pubkey <hex>
@@ -133,6 +137,7 @@ stored rules in `validation_error` so an owner can remove and repair them.
 | | `set-profile` | Update your profile |
 | | `presence` | Get presence status |
 | | `set-presence` | Set presence status |
+| | `set-status` | Set or clear your NIP-38 profile status |
 | `workflows` | `list` | List workflows |
 | | `get` | Get workflow definition |
 | | `create` | Create a workflow |

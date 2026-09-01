@@ -3,6 +3,7 @@ import {
   findReusableGenericAgent,
   findReusablePersonaAgent,
   pickPreferredManagedAgent,
+  resolveReusableAgentAccessPolicy,
 } from "@/features/agents/agentReuse";
 export { findReusableAgent } from "@/features/agents/agentReuse";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -14,10 +15,13 @@ import {
   listManagedAgents,
   updateManagedAgent,
 } from "@/shared/api/tauri";
+import { listPersonas } from "@/shared/api/tauriPersonas";
 import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
 import type {
   AcpRuntime,
+  AgentPersona,
   ChannelRole,
+  CreateManagedAgentInput,
   ManagedAgent,
   ManagedAgentBackend,
   RespondToMode,
@@ -72,7 +76,10 @@ export type CreateChannelManagedAgentInput = {
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
   backend?: ManagedAgentBackend;
-  /** Inbound author gate mode. Omitted = server default ("owner-only"). */
+  /**
+   * Inbound author gate mode. Omitted = linked persona default, then
+   * `"owner-only"` when the persona leaves it unset or no persona is linked.
+   */
   respondTo?: RespondToMode;
   /** Hex pubkeys for allowlist mode. */
   respondToAllowlist?: string[];
@@ -104,6 +111,37 @@ export type CreateChannelManagedAgentsResult = {
   failures: CreateChannelManagedAgentBatchFailure[];
 };
 
+type ChannelAgentReuseContext = {
+  managedAgents: ManagedAgent[];
+  channelMemberPubkeys: ReadonlySet<string>;
+  personas: readonly Pick<
+    AgentPersona,
+    "id" | "respondTo" | "respondToAllowlist"
+  >[];
+};
+
+export async function applyReusableAgentAccessPolicy(
+  agent: ManagedAgent,
+  request: Pick<CreateManagedAgentInput, "respondTo" | "respondToAllowlist">,
+  persona?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+) {
+  const policy = resolveReusableAgentAccessPolicy(request, persona);
+  const matches =
+    agent.respondTo === policy.respondTo &&
+    agent.respondToAllowlist.length === policy.respondToAllowlist.length &&
+    agent.respondToAllowlist.every(
+      (pubkey, index) => pubkey === policy.respondToAllowlist[index],
+    );
+  if (matches) return agent;
+
+  return (
+    await updateManagedAgent({
+      pubkey: agent.pubkey,
+      ...policy,
+    })
+  ).agent;
+}
+
 export async function attachManagedAgentToChannel(
   channelId: string,
   input: AttachManagedAgentToChannelInput,
@@ -132,8 +170,12 @@ export async function attachManagedAgentToChannel(
   if (ensureRunning) {
     // Running agents (local or provider) auto-discover new channel membership
     // via the harness's membership notifications — no restart needed. Only
-    // not-yet-running agents need a start/deploy call before the first
-    // mention can reach them.
+    // not-yet-running agents need a start/deploy call before the first mention
+    // can reach them. For a local agent the status check and the start are both
+    // pair-scoped to the active community: `agent.status` reflects that
+    // community's (agent, relay) pair, and `startManagedAgent` spawns that same
+    // pair — so this ensures the pair the caller is attaching to, never
+    // another community's.
     const isRemote = input.agent.backend.type === "provider";
     if (isRemote && input.agent.status !== "deployed") {
       agent = await startManagedAgent(input.agent.pubkey);
@@ -229,7 +271,9 @@ export async function ensureChannelAgentPresetInChannel(
     name: expectedName,
     acpCommand: "buzz-acp",
     agentCommand: input.runtime.command,
-    agentArgs: input.runtime.defaultArgs,
+    // Do NOT seed agentArgs from runtime.defaultArgs (see instanceInputForDefinition.ts
+    // for the rationale — empty args let spawn resolve definition args live).
+    agentArgs: [],
     mcpCommand: input.runtime.mcpCommand ?? "",
     spawnAfterCreate: false,
   });
@@ -248,10 +292,7 @@ export async function ensureChannelAgentPresetInChannel(
 
 export async function provisionChannelManagedAgent(
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context?: ChannelAgentReuseContext,
 ): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
 
@@ -273,22 +314,14 @@ export async function provisionChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      // Apply the caller's respondTo settings so the user's permission
-      // choice in the dialog is always honored, even when reusing.
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const definition = context.personas.find(
+        (persona) => persona.id === input.personaId,
+      );
+      const updatedAgent = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+        definition,
+      );
 
       return {
         agent: updatedAgent,
@@ -313,20 +346,10 @@ export async function provisionChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const updatedAgent = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+      );
 
       return {
         agent: updatedAgent,
@@ -350,7 +373,9 @@ export async function provisionChannelManagedAgent(
     acpCommand: "buzz-acp",
     agentCommand: input.runtime.command,
     harnessOverride: input.harnessOverride ?? false,
-    agentArgs: input.runtime.defaultArgs,
+    // Do NOT seed agentArgs from runtime.defaultArgs (see instanceInputForDefinition.ts
+    // for the rationale — empty args let spawn resolve definition args live).
+    agentArgs: [],
     mcpCommand: input.runtime.mcpCommand ?? "",
     personaId: input.personaId ?? undefined,
     teamId: input.teamId ?? undefined,
@@ -379,10 +404,7 @@ export async function provisionChannelManagedAgent(
 export async function createChannelManagedAgent(
   channelId: string,
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context?: ChannelAgentReuseContext,
 ): Promise<CreateChannelManagedAgentResult> {
   const provisioned = await provisionChannelManagedAgent(input, context);
   const attached = await attachManagedAgentToChannel(channelId, {
@@ -403,14 +425,21 @@ export async function createChannelManagedAgents(
   inputs: readonly CreateChannelManagedAgentInput[],
 ): Promise<CreateChannelManagedAgentsResult> {
   // Fetch managed agents and channel members once for smart reuse checks.
-  const [managedAgents, members] = await Promise.all([
+  const needsPersonaPolicy = inputs.some(
+    (input) =>
+      Boolean(input.personaId) &&
+      !input.forceNewInstance &&
+      input.respondTo === undefined,
+  );
+  const [managedAgents, members, personas] = await Promise.all([
     listManagedAgents(),
     getChannelMembers(channelId),
+    needsPersonaPolicy ? listPersonas() : Promise.resolve([]),
   ]);
   const channelMemberPubkeys = new Set(
     members.map((m) => normalizePubkey(m.pubkey)),
   );
-  const context = { managedAgents, channelMemberPubkeys };
+  const context = { managedAgents, channelMemberPubkeys, personas };
 
   // Sequential loop: each agent must be fully created and its relay membership
   // written before the next starts. Concurrent writes to the replaceable

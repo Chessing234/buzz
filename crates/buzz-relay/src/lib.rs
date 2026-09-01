@@ -3,6 +3,8 @@
 //! NIP-01 WebSocket relay for Buzz private team communication.
 
 mod admission;
+mod build_info;
+mod rejection;
 
 /// REST API route handlers.
 pub mod api;
@@ -37,6 +39,7 @@ pub mod push_runtime;
 pub mod router;
 /// Shared application state.
 pub mod state;
+pub mod storage_sweep;
 /// Subscription registry with (channel, kind) fan-out index.
 pub mod subscription;
 /// OpenTelemetry tracing initialisation (tracer provider + OTLP exporter).
