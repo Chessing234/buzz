@@ -52,7 +52,7 @@
 # discarded (verified empirically; a runtime GST_PLUGIN_SYSTEM_PATH_1_0 passed
 # into the AppImage does not survive). Keep bundled libzstd — NixOS/appimage-run
 # hosts often lack libzstd.so.1 on the FHS path, and zstd is not part of the
-# Mesa/GLib conflict set above. No tauri.conf.json knob can do this —
+# Mesa/GLib conflict set above. No tauri.conf.json knob can do this --
 # bundle.linux.appimage only exposes bundleMediaFramework, files (copy-only, no
 # remove/symlink), and bundleXdgOpen.
 

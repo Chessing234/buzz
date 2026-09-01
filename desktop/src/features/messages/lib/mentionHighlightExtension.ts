@@ -1,14 +1,302 @@
 import { Extension } from "@tiptap/core";
+import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import {
   Plugin,
   PluginKey,
   TextSelection,
-  type EditorState,
   type Transaction,
 } from "@tiptap/pm/state";
-import { Decoration, DecorationSet, type EditorView } from "@tiptap/pm/view";
+import { Decoration, DecorationSet } from "@tiptap/pm/view";
+
+import {
+  inlineChipIconClasses,
+  MENTION_CHIP_BASE_CLASSES,
+} from "@/shared/ui/mentionChip";
 
 export const mentionHighlightKey = new PluginKey("mentionHighlight");
+
+export type MentionCaretSettlement = {
+  arm: (pos: number) => void;
+  peek: () => number | null;
+  cancel: () => void;
+};
+
+export function createMentionCaretSettlement(): MentionCaretSettlement {
+  let pos: number | null = null;
+  return {
+    arm(nextPos: number) {
+      pos = nextPos;
+    },
+    peek() {
+      return pos;
+    },
+    cancel() {
+      pos = null;
+    },
+  };
+}
+
+/**
+ * Whether to move an empty caret from `from` to `next` after a mention
+ * trailing space. Settlement is per editor: autocomplete arms it, and
+ * ArrowLeft/click cancel it so we do not steal an intentional caret.
+ *
+ * Only an armed settlement may advance the caret. Advancing on any
+ * document change instead walked the caret across the separator on every
+ * keystroke, so typing `@name` before existing text interleaved spaces
+ * into the draft (`hello @q uworld`).
+ */
+export function shouldAdvanceMentionCaret({
+  from,
+  next,
+  settling,
+}: {
+  from: number;
+  next: number;
+  settling: boolean;
+}): boolean {
+  return next !== from && settling;
+}
+
+export type MentionTextInsertion = {
+  insertAt: number;
+  text: string;
+};
+
+const SPACE_RUN = /^[ \u00A0]+$/;
+const OUTER_SPACES = /^[ \u00A0]+|[ \u00A0]+$/g;
+
+/**
+ * Position just after the trailing space of the mention token that `pos` is
+ * adjacent to, or `null` when `pos` is nowhere near one.
+ *
+ * `pos` may sit at the token end (before the space) or already past the
+ * space: when Chromium rewrites the whitespace run around the caret it
+ * anchors the replacement at either edge, and both mean the same boundary.
+ */
+function mentionTrailingSpaceBoundary(
+  doc: ProseMirrorNode,
+  pos: number,
+): number | null {
+  const afterSpace = selectionAfterMentionTrailingSpace(doc, pos);
+  if (afterSpace !== pos) return afterSpace;
+  if (pos > 0 && selectionAfterMentionTrailingSpace(doc, pos - 1) === pos) {
+    return pos;
+  }
+  return null;
+}
+
+/**
+ * Where (and what) to insert when typed text arrives at the trailing space
+ * after an `@name` / `#channel` token.
+ *
+ * - Caret on the space: insert after it, so the next keystroke lands after
+ *   the token (`@bobhello` fix).
+ * - Whitespace replaced next to that space: keep every space the document
+ *   already has and insert only the typed characters after the token's
+ *   trailing space.
+ *
+ * The second rule matters because typing between the mention's trailing
+ * space and a pre-existing draft space makes Chromium re-emit the whole
+ * whitespace run — `replace("  " -> " a")`, usually with a non-breaking
+ * space, and anchored at either edge of the run. Applying any of those
+ * verbatim deletes the draft's space (`hello @bob abcworld`).
+ *
+ * Only whitespace is ever redirected, and only while autocomplete is
+ * settling — a window in which the user cannot have selected anything,
+ * because a selection cancels settlement. So a replacement arriving here
+ * is the browser normalizing whitespace, never an intentional delete, and
+ * preserving the document's spaces is the whole invariant. Recognizing one
+ * specific rewrite shape instead is what left the draft space exposed.
+ */
+export function insertionForMentionTextInput(
+  doc: ProseMirrorNode,
+  from: number,
+  to: number,
+  text: string,
+): MentionTextInsertion | null {
+  if (from === to) {
+    const next = selectionAfterMentionTrailingSpace(doc, from);
+    return next === from ? null : { insertAt: next, text };
+  }
+  const boundary = mentionTrailingSpaceBoundary(doc, from);
+  if (boundary === null) return null;
+  if (!SPACE_RUN.test(doc.textBetween(from, to, "\n", "\0"))) return null;
+  return { insertAt: boundary, text: text.replace(OUTER_SPACES, "") };
+}
+
+/**
+ * Redirect chip-edge typing only while autocomplete is settling. After a
+ * deliberate ArrowLeft or chip click, honor the caret so `x` lands in the
+ * token (`@bobx`) instead of after the space (`@bob x`).
+ */
+export function mentionTextInputInsertion(
+  doc: ProseMirrorNode,
+  from: number,
+  to: number,
+  text: string,
+  settling: boolean,
+): MentionTextInsertion | null {
+  if (!settling) return null;
+  return insertionForMentionTextInput(doc, from, to, text);
+}
+
+/** Caret just after a mention trailing space: ArrowLeft lands on the token end. */
+export function positionAfterArrowLeftThroughMentionSpace(
+  doc: ProseMirrorNode,
+  from: number,
+): number | null {
+  if (from <= 0) return null;
+  const chipEnd = from - 1;
+  if (selectionAfterMentionTrailingSpace(doc, chipEnd) === from) {
+    return chipEnd;
+  }
+  return null;
+}
+
+export function setDomCaretAtPos(
+  view: {
+    domAtPos: (pos: number) => { node: Node; offset: number };
+    root: Document | ShadowRoot;
+  },
+  pos: number,
+): void {
+  if (typeof document === "undefined") return;
+  let mapped: { node: Node; offset: number };
+  try {
+    mapped = view.domAtPos(pos);
+  } catch {
+    return;
+  }
+  const range = document.createRange();
+  try {
+    range.setStart(mapped.node, mapped.offset);
+  } catch {
+    return;
+  }
+  range.collapse(true);
+  const root = view.root;
+  const selection =
+    "getSelection" in root && typeof root.getSelection === "function"
+      ? root.getSelection()
+      : window.getSelection();
+  if (!selection) return;
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+export function reassertMentionCaretAfterFocus(view: {
+  state: {
+    doc: ProseMirrorNode;
+    selection: { empty: boolean; from: number };
+    tr: Transaction;
+  };
+  dispatch: (tr: Transaction) => void;
+  domAtPos: (pos: number) => { node: Node; offset: number };
+  root: Document | ShadowRoot;
+}): void {
+  if (!view.state.selection.empty) return;
+  const from = view.state.selection.from;
+  const next = selectionAfterMentionTrailingSpace(view.state.doc, from);
+  if (next !== from) {
+    view.dispatch(
+      view.state.tr.setSelection(TextSelection.create(view.state.doc, next)),
+    );
+  }
+  setDomCaretAtPos(view, view.state.selection.from);
+}
+
+export type MentionHighlightStorage = {
+  names: string[];
+  agentNames: string[];
+  channelNames: string[];
+};
+
+function sameNameList(current: string[], next: string[]): boolean {
+  return (
+    current.length === next.length &&
+    current.every((name, index) => name === next[index])
+  );
+}
+
+export function assignMentionHighlightNames(
+  storage: MentionHighlightStorage,
+  names: string[],
+  agentNames: string[],
+  channelNames: string[],
+): boolean {
+  if (
+    sameNameList(storage.names, names) &&
+    sameNameList(storage.agentNames, agentNames) &&
+    sameNameList(storage.channelNames, channelNames)
+  ) {
+    return false;
+  }
+  storage.names = names;
+  storage.agentNames = agentNames;
+  storage.channelNames = channelNames;
+  return true;
+}
+
+export function mentionHighlightStorage(editor: {
+  storage: object;
+}): MentionHighlightStorage | undefined {
+  if (!("mentionHighlight" in editor.storage)) return undefined;
+  return editor.storage.mentionHighlight as MentionHighlightStorage;
+}
+
+export function settleAutocompleteMentionInsert(
+  editor: { storage: object },
+  tr: Transaction,
+  text: string,
+  settleCaret = true,
+): void {
+  const storage = mentionHighlightStorage(editor);
+  const mentionInsert = /(?:^|[\s(])([@#])([^\s]+) $/.exec(text);
+  if (!mentionInsert) return;
+  const prefix = mentionInsert[1];
+  const label = mentionInsert[2];
+  if (storage) {
+    const known = [
+      ...storage.names,
+      ...storage.agentNames,
+      ...storage.channelNames,
+    ];
+    if (!known.some((name) => name.toLowerCase() === label.toLowerCase())) {
+      if (prefix === "#") {
+        storage.channelNames = [...storage.channelNames, label];
+      } else {
+        storage.names = [...storage.names, label];
+      }
+    }
+  }
+  if (settleCaret) tr.setMeta(mentionHighlightKey, true);
+}
+
+export function syncMentionHighlightFromProps(
+  editor: {
+    storage: object;
+    state: { tr: Transaction };
+    view: { dispatch: (tr: Transaction) => void };
+  },
+  names: string[] | undefined,
+  agentNames: string[] | undefined,
+  channelNames: string[] | undefined,
+): void {
+  const storage = mentionHighlightStorage(editor);
+  if (
+    !storage ||
+    !assignMentionHighlightNames(
+      storage,
+      names ?? [],
+      agentNames ?? [],
+      channelNames ?? [],
+    )
+  ) {
+    return;
+  }
+  editor.view.dispatch(editor.state.tr.setMeta(mentionHighlightKey, true));
+}
 
 /**
  * TipTap extension that applies inline `mention-chip` decorations
@@ -16,10 +304,6 @@ export const mentionHighlightKey = new PluginKey("mentionHighlight");
  *
  * Accepts `names` (display names) and `channelNames` storage options.
  * On every doc update the plugin scans text nodes and decorates matches.
- *
- * Agent mentions are treated as atomic for caret placement: the cursor
- * cannot rest inside `@AgentName` (which would break the chip when typing).
- * Arrow keys and backspace/delete also hop/delete the whole token.
  */
 export const MentionHighlightExtension = Extension.create({
   name: "mentionHighlight",
@@ -34,6 +318,7 @@ export const MentionHighlightExtension = Extension.create({
 
   addProseMirrorPlugins() {
     const extension = this;
+    const settlement = createMentionCaretSettlement();
 
     return [
       new Plugin({
@@ -48,6 +333,16 @@ export const MentionHighlightExtension = Extension.create({
             );
           },
           apply(tr, oldDecorations) {
+            if (
+              tr.getMeta(mentionHighlightKey) &&
+              tr.selection.empty &&
+              (tr.docChanged || settlement.peek() !== null)
+            ) {
+              settlement.arm(
+                selectionAfterMentionTrailingSpace(tr.doc, tr.selection.from),
+              );
+            }
+
             // Names/channels changed — full rebuild required.
             if (tr.getMeta(mentionHighlightKey)) {
               return buildDecorations(
@@ -91,28 +386,137 @@ export const MentionHighlightExtension = Extension.create({
           },
         },
         appendTransaction(_transactions, _oldState, newState) {
-          return snapSelectionOutOfAgentMentions(
-            newState,
-            extension.storage.agentNames,
+          if (!newState.selection.empty) {
+            settlement.cancel();
+            return null;
+          }
+          const from = newState.selection.from;
+          const next = selectionAfterMentionTrailingSpace(newState.doc, from);
+          if (
+            !shouldAdvanceMentionCaret({
+              from,
+              next,
+              settling: settlement.peek() !== null,
+            })
+          ) {
+            return null;
+          }
+          return newState.tr.setSelection(
+            TextSelection.create(newState.doc, next),
           );
+        },
+        view() {
+          let applying = false;
+          return {
+            update(view) {
+              if (applying || settlement.peek() === null) return;
+              if (!view.state.selection.empty) {
+                settlement.cancel();
+                return;
+              }
+              const from = view.state.selection.from;
+              const next = selectionAfterMentionTrailingSpace(
+                view.state.doc,
+                from,
+              );
+              if (next !== from) {
+                applying = true;
+                try {
+                  view.dispatch(
+                    view.state.tr.setSelection(
+                      TextSelection.create(view.state.doc, next),
+                    ),
+                  );
+                } finally {
+                  applying = false;
+                }
+              }
+              // Highlight refreshes can land after the user has moved focus to
+              // a popover. Keep settlement armed for the next keystroke, but
+              // never drag DOM selection back into an unfocused composer.
+              if (view.hasFocus()) {
+                setDomCaretAtPos(view, view.state.selection.from);
+              }
+            },
+            destroy() {
+              settlement.cancel();
+            },
+          };
         },
         props: {
           decorations(state) {
             return this.getState(state) ?? DecorationSet.empty;
           },
-          handleClick(view, pos) {
-            return snapViewSelectionToAgentMentionEdge(
-              view,
-              pos,
-              extension.storage.agentNames,
+          handleTextInput(view, from, to, text) {
+            const insertion = mentionTextInputInsertion(
+              view.state.doc,
+              from,
+              to,
+              text,
+              settlement.peek() !== null,
             );
+            if (insertion == null) {
+              settlement.cancel();
+              return false;
+            }
+            const tr = view.state.tr.insertText(
+              insertion.text,
+              insertion.insertAt,
+            );
+            const caret = tr.mapping.map(insertion.insertAt, 1);
+            tr.setSelection(TextSelection.create(tr.doc, caret));
+            view.dispatch(tr);
+            settlement.cancel();
+            setDomCaretAtPos(view, caret);
+            return true;
           },
           handleKeyDown(view, event) {
-            return handleAgentMentionKeyDown(
-              view,
-              event,
-              extension.storage.agentNames,
+            if (
+              event.key === "ArrowRight" ||
+              event.key === "ArrowUp" ||
+              event.key === "ArrowDown" ||
+              event.key === "Home" ||
+              event.key === "End"
+            ) {
+              settlement.cancel();
+              return false;
+            }
+            if (event.key !== "ArrowLeft" || !view.state.selection.empty) {
+              return false;
+            }
+            settlement.cancel();
+            const chipEnd = positionAfterArrowLeftThroughMentionSpace(
+              view.state.doc,
+              view.state.selection.from,
             );
+            if (chipEnd == null) return false;
+            view.dispatch(
+              view.state.tr.setSelection(
+                TextSelection.create(view.state.doc, chipEnd),
+              ),
+            );
+            setDomCaretAtPos(view, chipEnd);
+            return true;
+          },
+          handleClick(view, pos, event) {
+            const target = event.target;
+            const onChip =
+              target instanceof Element &&
+              Boolean(target.closest(".mention-chip"));
+            settlement.cancel();
+            if (!onChip) return false;
+            const chipEnd = positionAfterArrowLeftThroughMentionSpace(
+              view.state.doc,
+              pos,
+            );
+            if (chipEnd == null) return false;
+            view.dispatch(
+              view.state.tr.setSelection(
+                TextSelection.create(view.state.doc, chipEnd),
+              ),
+            );
+            setDomCaretAtPos(view, chipEnd);
+            return true;
           },
         },
       }),
@@ -159,6 +563,28 @@ export function buildHighlightPatterns(
   }
 
   return patterns;
+}
+
+/**
+ * If `pos` sits at the end of an `@name` / `#channel` token and the next
+ * character is a space, return the position after that space.
+ *
+ * Autocomplete inserts `@Name ` then chip decorations wrap the token. The
+ * browser can map the caret back to the chip edge, so the next keystroke
+ * lands before the space (`@quinnhello`). Callers use this to keep typing
+ * after the token.
+ */
+export function selectionAfterMentionTrailingSpace(
+  doc: ProseMirrorNode,
+  pos: number,
+): number {
+  if (pos < 0 || pos >= doc.content.size) return pos;
+  const nextChar = doc.textBetween(pos, pos + 1, "\n", "\0");
+  if (nextChar !== " ") return pos;
+  const lookbehind = Math.min(pos, 80);
+  const before = doc.textBetween(pos - lookbehind, pos, "\n", "\0");
+  if (!/(?:^|[\s(])[@#][^\s]+$/.test(before)) return pos;
+  return pos + 1;
 }
 
 /**
@@ -297,22 +723,24 @@ function buildDecorations(
       node.text,
       pos,
       mentionPatterns,
-      "mention-chip",
+      `${MENTION_CHIP_BASE_CLASSES} ${inlineChipIconClasses("human")}`,
+      { hidePrefix: true },
     );
     addMatchesForPatterns(
       decorations,
       node.text,
       pos,
       agentMentionPatterns,
-      "mention-chip agent-mention-highlight",
-      { hideMentionPrefix: true },
+      `${MENTION_CHIP_BASE_CLASSES} ${inlineChipIconClasses("agent")}`,
+      { hidePrefix: true },
     );
     addMatchesForPatterns(
       decorations,
       node.text,
       pos,
       channelPatterns,
-      "mention-chip",
+      `${MENTION_CHIP_BASE_CLASSES} ${inlineChipIconClasses("channel")}`,
+      { hidePrefix: true },
     );
   });
 
@@ -325,7 +753,7 @@ function addMatchesForPatterns(
   position: number,
   patterns: RegExp[],
   className: string,
-  options?: { hideMentionPrefix?: boolean },
+  options?: { hidePrefix?: boolean },
 ) {
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
@@ -333,153 +761,44 @@ function addMatchesForPatterns(
     while (match !== null) {
       const from = position + match.index;
       const to = from + match[0].length;
-      if (options?.hideMentionPrefix && match[0].startsWith("@")) {
+      const outsideEnd = { inclusiveEnd: false };
+      if (options?.hidePrefix && /^[@#]/.test(match[0])) {
         decorations.push(
-          Decoration.inline(from, from + 1, {
-            class: "agent-mention-at-hidden",
-            spellcheck: "false",
-          }),
+          Decoration.inline(
+            from,
+            from + 1,
+            {
+              class: "mention-prefix-hidden",
+              spellcheck: "false",
+            },
+            outsideEnd,
+          ),
         );
         decorations.push(
-          Decoration.inline(from + 1, to, {
-            class: className,
-            spellcheck: "false",
-          }),
+          Decoration.inline(
+            from + 1,
+            to,
+            {
+              class: className,
+              spellcheck: "false",
+            },
+            outsideEnd,
+          ),
         );
       } else {
         decorations.push(
-          Decoration.inline(from, to, {
-            class: className,
-            spellcheck: "false",
-          }),
+          Decoration.inline(
+            from,
+            to,
+            {
+              class: className,
+              spellcheck: "false",
+            },
+            outsideEnd,
+          ),
         );
       }
       match = pattern.exec(text);
     }
   }
-}
-
-type MentionRange = { from: number; to: number };
-
-/**
- * Locate `@AgentName` ranges in a ProseMirror doc for agent display names.
- * Exported for unit tests.
- */
-export function findAgentMentionRanges(
-  doc: EditorState["doc"],
-  agentNames: readonly string[],
-): MentionRange[] {
-  if (agentNames.length === 0) return [];
-
-  const patterns = buildHighlightPatterns([...agentNames], []);
-  const ranges: MentionRange[] = [];
-
-  doc.descendants((node, pos) => {
-    if (!node.isText || !node.text) return;
-    for (const match of findHighlightMatches(node.text, patterns)) {
-      ranges.push({ from: pos + match.from, to: pos + match.to });
-    }
-  });
-
-  return ranges;
-}
-
-/**
- * Snap a caret position out of an agent-mention interior.
- * Prefers the nearer edge; ties go to the end (after the chip).
- * Exported for unit tests.
- */
-export function snapPosOutOfAgentMention(
-  pos: number,
-  ranges: readonly MentionRange[],
-): number {
-  for (const range of ranges) {
-    if (pos > range.from && pos < range.to) {
-      const toStart = pos - range.from;
-      const toEnd = range.to - pos;
-      return toStart < toEnd ? range.from : range.to;
-    }
-  }
-  return pos;
-}
-
-function snapSelectionOutOfAgentMentions(
-  state: EditorState,
-  agentNames: readonly string[],
-): Transaction | null {
-  const { from, to, empty } = state.selection;
-  if (!empty || from !== to) return null;
-
-  const ranges = findAgentMentionRanges(state.doc, agentNames);
-  const snapped = snapPosOutOfAgentMention(from, ranges);
-  if (snapped === from) return null;
-
-  return state.tr.setSelection(TextSelection.create(state.doc, snapped));
-}
-
-function snapViewSelectionToAgentMentionEdge(
-  view: EditorView,
-  pos: number,
-  agentNames: readonly string[],
-): boolean {
-  const ranges = findAgentMentionRanges(view.state.doc, agentNames);
-  const snapped = snapPosOutOfAgentMention(pos, ranges);
-  if (snapped === pos) return false;
-
-  view.dispatch(
-    view.state.tr.setSelection(TextSelection.create(view.state.doc, snapped)),
-  );
-  return true;
-}
-
-function handleAgentMentionKeyDown(
-  view: EditorView,
-  event: KeyboardEvent,
-  agentNames: readonly string[],
-): boolean {
-  if (event.altKey || event.metaKey || event.ctrlKey) return false;
-
-  const ranges = findAgentMentionRanges(view.state.doc, agentNames);
-  if (ranges.length === 0) return false;
-
-  const { from, empty } = view.state.selection;
-  if (!empty) return false;
-
-  if (event.key === "ArrowLeft" && !event.shiftKey) {
-    const range = ranges.find((candidate) => candidate.to === from);
-    if (!range) return false;
-    view.dispatch(
-      view.state.tr.setSelection(
-        TextSelection.create(view.state.doc, range.from),
-      ),
-    );
-    return true;
-  }
-
-  if (event.key === "ArrowRight" && !event.shiftKey) {
-    const range = ranges.find((candidate) => candidate.from === from);
-    if (!range) return false;
-    view.dispatch(
-      view.state.tr.setSelection(
-        TextSelection.create(view.state.doc, range.to),
-      ),
-    );
-    return true;
-  }
-
-  if (event.key === "Backspace") {
-    const range = ranges.find((candidate) => candidate.to === from);
-    if (!range) return false;
-    view.dispatch(view.state.tr.delete(range.from, range.to));
-    return true;
-  }
-
-  if (event.key === "Delete") {
-    const range = ranges.find((candidate) => candidate.from === from);
-    if (!range) return false;
-    view.dispatch(view.state.tr.delete(range.from, range.to));
-    return true;
-  }
-
-  return false;
 }
