@@ -7,8 +7,11 @@ import {
   AlertDialogTitle,
 } from "@/shared/ui/alert-dialog";
 import { Button } from "@/shared/ui/button";
+import { PRIVATE_CHANNEL_ADD_DENIED_MESSAGE } from "@/features/channels/lib/channelMemberAdmission";
 
 type NonMemberMentionDialogProps = {
+  /** False in a private channel the viewer doesn't own/administer. */
+  canInvite: boolean;
   error: string | null;
   isInvitePending: boolean;
   names: string[];
@@ -19,6 +22,7 @@ type NonMemberMentionDialogProps = {
 };
 
 export function NonMemberMentionDialog({
+  canInvite,
   error,
   isInvitePending,
   names,
@@ -39,12 +43,14 @@ export function NonMemberMentionDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>
-            Mention someone outside this channel?
+            Mention people outside this channel?
           </AlertDialogTitle>
           <AlertDialogDescription>
             {names.join(", ")} {names.length === 1 ? "is" : "are"} not in this
-            channel. Invite them (this re-adds previously removed members), or
-            send without inviting them.
+            channel.{" "}
+            {canInvite
+              ? "Invite them (this re-adds previously removed members), or send without inviting them."
+              : `${PRIVATE_CHANNEL_ADD_DENIED_MESSAGE} You can still send without inviting them.`}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {error ? (
@@ -60,16 +66,18 @@ export function NonMemberMentionDialog({
             type="button"
             variant="outline"
           >
-            Do nothing
+            {canInvite ? "Do nothing" : "Send anyway"}
           </Button>
-          <Button
-            disabled={isInvitePending}
-            onClick={onInvite}
-            size="sm"
-            type="button"
-          >
-            {isInvitePending ? "Inviting..." : "Invite"}
-          </Button>
+          {canInvite ? (
+            <Button
+              disabled={isInvitePending}
+              onClick={onInvite}
+              size="sm"
+              type="button"
+            >
+              {isInvitePending ? "Inviting..." : "Invite"}
+            </Button>
+          ) : null}
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
