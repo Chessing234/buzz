@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn voice_models_follow_the_selected_build_nest() {
+    let home = PathBuf::from("/Users/example");
+    for nest_name in [
+        ".buzz",
+        ".buzz-demo-workstream-board",
+        ".buzz-demo-second-demo",
+    ] {
+        let nest = home.join(nest_name);
+        assert_eq!(models_dir(nest.clone()), nest.join("models"));
+    }
+}
+
 fn create_ready_model_dir(root: &Path) -> PathBuf {
     let model_dir = root.join(TTS_MODEL_DIR_NAME);
     std::fs::create_dir_all(&model_dir).expect("create model dir");
@@ -22,11 +35,8 @@ fn expected_files_match_april_int8_metadata() {
         .artifacts
         .iter()
         .map(|artifact| artifact.filename)
-        .chain([
-            TTS_LICENSE_ARTIFACT.filename,
-            TTS_REFERENCE_ARTIFACT.filename,
-            TTS_LICENSE_FILE_NAME,
-        ])
+        .chain([TTS_LICENSE_ARTIFACT.filename, TTS_LICENSE_FILE_NAME])
+        .chain(POCKET_VOICES.iter().map(|voice| voice.reference_file))
         .collect::<Vec<_>>();
     expected.sort_unstable();
     let mut actual = TTS_EXPECTED_FILES.to_vec();
@@ -36,6 +46,7 @@ fn expected_files_match_april_int8_metadata() {
     assert!(!actual.contains(&"flow_lm_main.onnx"));
     assert!(!actual.contains(&"flow_lm_flow.onnx"));
     assert!(!actual.contains(&"mimi_decoder.onnx"));
+    assert!(!actual.contains(&"marius.wav"));
 }
 
 #[test]
