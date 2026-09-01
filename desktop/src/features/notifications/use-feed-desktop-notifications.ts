@@ -5,15 +5,14 @@ import {
   resolveUserLabel,
   type UserProfileLookup,
 } from "@/features/profile/lib/identity";
-import { getThreadReference } from "@/features/messages/lib/threading";
 import type { FeedItem, HomeFeedResponse } from "@/shared/api/types";
 import {
   collectHomeAlertItems,
   eligibleFeedNotificationItems,
+  formatFeedNotification,
   type NotificationChannel,
-  notificationBody,
-  notificationTitle,
 } from "./lib/feed";
+import { buildFeedItemNotificationTarget } from "./lib/target";
 import {
   getDesktopNotificationPermissionState,
   requestDesktopNotificationAccess,
@@ -22,6 +21,7 @@ import {
 import {
   playNotificationSound,
   resolveSlotSound,
+  shouldPlayNotificationSound,
   slotForFeedKind,
 } from "./lib/sound";
 import type { NotificationSettings } from "./hooks";
@@ -73,9 +73,11 @@ export function useFeedDesktopNotifications(
   pubkey: string | undefined,
   settings: NotificationSettings,
   setDesktopEnabled: (enabled: boolean) => Promise<boolean>,
+  enabled: boolean,
   profiles?: UserProfileLookup,
   mutedChannelIds?: ReadonlySet<string>,
   channels: readonly NotificationChannel[] = [],
+  silentChannelIds?: ReadonlySet<string>,
 ) {
   const normalizedPubkey = pubkey?.trim().toLowerCase() ?? "";
   const seenItemIdsRef = React.useRef<Set<string>>(
@@ -109,30 +111,22 @@ export function useFeedDesktopNotifications(
 
   const deliverFeedNotification = React.useEffectEvent(
     async (item: FeedItem, senderName?: string) => {
-      const threadRootId = getThreadReference(item.tags).rootId ?? null;
+      const { title, body } = formatFeedNotification(item, senderName);
       const slot = slotForFeedKind(item.kind, item.category);
       // Sound is independent of OS toast delivery — WebKitGTK / permission
       // failures must not mute the chosen alert (#2562).
       void playNotificationSound(resolveSlotSound(settings, slot));
       await sendDesktopNotification({
-        body: notificationBody(item),
-        target: {
-          channelId: item.channelId,
-          channelName: item.channelName,
-          content: item.content,
-          createdAt: item.createdAt,
-          eventId: item.id,
-          kind: item.kind,
-          pubkey: item.pubkey,
-          threadRootId,
-        },
-        title: notificationTitle(item, senderName),
+        body,
+        target: buildFeedItemNotificationTarget(item),
+        title,
       });
+
     },
   );
 
   React.useEffect(() => {
-    if (!feed) {
+    if (!enabled || !feed) {
       return;
     }
 
@@ -213,6 +207,7 @@ export function useFeedDesktopNotifications(
       void deliverFeedNotification(item, senderName);
     }
   }, [
+    enabled,
     feed,
     channels,
     mutedChannelIds,
