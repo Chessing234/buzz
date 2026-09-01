@@ -1,57 +1,45 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import test from "node:test";
 
-import { isProjectHiddenByDeletion } from "./lib/projectDeletionFilter.ts";
+import {
+  buildProjectDeletionTemplate,
+  canDeleteProject,
+} from "./projectDeletion.ts";
 
-const OWNER = "aa".repeat(32);
-const COORDINATE = `30617:${OWNER}:bitchat`;
+const AGENT = "a".repeat(64);
+const OWNER = "b".repeat(64);
+const OTHER = "c".repeat(64);
+const PROJECT_ADDRESS = `30621:${AGENT}:platform`;
+const project = {
+  name: "Platform",
+  owner: AGENT,
+  projectAddress: PROJECT_ADDRESS,
+};
 
-function deletionEvent(createdAt) {
-  return {
-    id: `del-${createdAt}`,
-    pubkey: OWNER,
-    created_at: createdAt,
-    kind: 5,
-    tags: [["a", COORDINATE]],
-    content: "",
-    sig: "",
-  };
-}
-
-test("isProjectHiddenByDeletion ignores deletions older than the announcement", () => {
-  const project = {
-    owner: OWNER,
-    dtag: "bitchat",
-    createdAt: 2_000,
-  };
-
+test("project deletion capability includes direct and agent owners", () => {
+  assert.equal(canDeleteProject(project, AGENT, undefined), true);
   assert.equal(
-    isProjectHiddenByDeletion(project, [deletionEvent(1_000)]),
-    false,
-    "stale deletion must not hide a newer re-announcement",
-  );
-  assert.equal(
-    isProjectHiddenByDeletion(project, [deletionEvent(2_000)]),
+    canDeleteProject(project, OWNER, { [AGENT]: { ownerPubkey: OWNER } }),
     true,
-    "deletion at the same second applies",
-  );
-  assert.equal(
-    isProjectHiddenByDeletion(project, [deletionEvent(3_000)]),
-    true,
-    "deletion after the announcement applies",
   );
 });
 
-test("isProjectHiddenByDeletion ignores deletions from other authors", () => {
-  const project = {
-    owner: OWNER,
-    dtag: "bitchat",
-    createdAt: 100,
-  };
-  const foreignDeletion = {
-    ...deletionEvent(200),
-    pubkey: "bb".repeat(32),
-  };
+test("project deletion capability rejects unrelated viewers", () => {
+  assert.equal(canDeleteProject(project, OWNER, undefined), false);
+  assert.equal(
+    canDeleteProject(project, OTHER, { [AGENT]: { ownerPubkey: OWNER } }),
+    false,
+  );
+});
 
-  assert.equal(isProjectHiddenByDeletion(project, [foreignDeletion]), false);
+test("project deletion tombstone targets only the container and dominates its head", () => {
+  assert.deepEqual(
+    buildProjectDeletionTemplate(project, { created_at: 101 }, 100),
+    {
+      kind: 5,
+      content: "Delete project Platform",
+      createdAt: 102,
+      tags: [["a", PROJECT_ADDRESS]],
+    },
+  );
 });

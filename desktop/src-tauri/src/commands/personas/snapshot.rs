@@ -56,6 +56,25 @@ pub(crate) fn resolve_from_lists<'a>(
     Err(format!("agent {id:?} not found"))
 }
 
+/// Materialize persona-owned display metadata onto a cloned instance for
+/// portable snapshot construction. Keyless definition records already carry
+/// their own description.
+pub(crate) fn materialize_snapshot_description(
+    record: &mut ManagedAgentRecord,
+    is_definition: bool,
+    definitions: &[ManagedAgentRecord],
+) {
+    if is_definition {
+        return;
+    }
+    if let Some(persona_id) = record.persona_id.as_deref() {
+        record.description = definitions
+            .iter()
+            .find(|definition| definition.slug.as_deref() == Some(persona_id))
+            .and_then(|definition| definition.description.clone());
+    }
+}
+
 /// Validate that `memory_source_pubkey` is an appropriate source for a
 /// memory-bearing snapshot export.
 ///
@@ -142,7 +161,7 @@ pub(crate) fn validate_snapshot_encode_size(bytes_len: usize, is_png: bool) -> R
 }
 
 /// Parse a `memory_level` string to `MemoryLevel`.
-fn parse_memory_level(s: &str) -> Result<MemoryLevel, String> {
+pub(crate) fn parse_memory_level(s: &str) -> Result<MemoryLevel, String> {
     match s {
         "none" | "" => Ok(MemoryLevel::None),
         "core" => Ok(MemoryLevel::Core),
@@ -151,6 +170,32 @@ fn parse_memory_level(s: &str) -> Result<MemoryLevel, String> {
             "Invalid memory_level: {other:?} (expected 'none', 'core', or 'everything')"
         )),
     }
+}
+
+/// Flatten an owner-decrypted memory listing into manifest entries for
+/// `memory_level`: `Core` takes the core entry only; `Everything` appends all
+/// `mem/*` entries after it. Pure so both the export and card-mint paths share
+/// (and tests can pin) the level → entries selection.
+pub(crate) fn memory_entries_from_listing(
+    listing: crate::commands::engrams::AgentMemoryListing,
+    memory_level: MemoryLevel,
+) -> Vec<AgentSnapshotMemoryEntry> {
+    let mut entries = Vec::new();
+    if let Some(core) = listing.core {
+        entries.push(AgentSnapshotMemoryEntry {
+            slug: core.slug,
+            body: core.body,
+        });
+    }
+    if memory_level == MemoryLevel::Everything {
+        for mem in listing.memories {
+            entries.push(AgentSnapshotMemoryEntry {
+                slug: mem.slug,
+                body: mem.body,
+            });
+        }
+    }
+    entries
 }
 
 /// Parse a `format` string to a PNG flag.
@@ -224,6 +269,7 @@ pub(crate) async fn materialize_snapshot_bytes(
         let (def_record, is_definition) = resolve_from_lists(&id, &instances, &definitions)
             .map(|(r, is_def)| (r.clone(), is_def))?;
         let mut def_record = def_record;
+        materialize_snapshot_description(&mut def_record, is_definition, &definitions);
         // A snapshot is a verbatim portable copy of the effective runtime,
         // provider, and model configuration, not a pointer to the sender's
         // machine-wide defaults. This does not translate or substitute values
@@ -267,22 +313,7 @@ pub(crate) async fn materialize_snapshot_bytes(
     // ── Fetch memory ─────────────────────────────────────────────────────────
     let memory_entries: Vec<AgentSnapshotMemoryEntry> = if let Some(pubkey) = memory_pubkey {
         let listing = get_agent_memory(pubkey, app.clone(), state).await?;
-        let mut entries = Vec::new();
-        if let Some(core) = listing.core {
-            entries.push(AgentSnapshotMemoryEntry {
-                slug: core.slug,
-                body: core.body,
-            });
-        }
-        if memory_level == MemoryLevel::Everything {
-            for mem in listing.memories {
-                entries.push(AgentSnapshotMemoryEntry {
-                    slug: mem.slug,
-                    body: mem.body,
-                });
-            }
-        }
-        entries
+        memory_entries_from_listing(listing, memory_level)
     } else {
         Vec::new()
     };
