@@ -1,8 +1,9 @@
 import { Search } from "lucide-react";
 import * as React from "react";
-
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
+import { parseSearchOperators } from "@/features/search/lib/parseSearchOperators";
+import { buildSearchResultPreview } from "@/features/search/lib/searchMatch";
 import { useSearchResults } from "@/features/search/useSearchResults";
 import {
   resultIcon,
@@ -15,6 +16,7 @@ import {
   getChannelScopeLabel,
   SearchDialogInputRow,
 } from "@/features/search/ui/SearchScopeControls";
+import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
 import { useSearchMenuKeyboardNavigation } from "@/features/search/ui/useSearchMenuKeyboardNavigation";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -37,7 +39,7 @@ type TopbarSearchProps = {
   currentChannelId?: string | null;
   focusRequest?: number;
   onOpenChannel: (channelId: string) => void;
-  onOpenResult: (hit: SearchHit) => void;
+  onOpenResult: (hit: SearchHit, query: string) => void;
   onOpenUser?: (user: UserSearchResult) => void | Promise<void>;
   onBrowseChannels?: () => void | Promise<void>;
   onCreateAgent?: () => void | Promise<void>;
@@ -46,7 +48,6 @@ type TopbarSearchProps = {
   scopeFocusRequest?: number;
   variant?: "bar" | "icon";
 };
-
 const MAX_SEARCH_SUGGESTIONS = 4;
 const SEARCH_RESULT_LIMIT = 40;
 const SEARCH_SECTION_TITLE_CLASS =
@@ -59,15 +60,12 @@ const SEARCH_RESULT_SECTION_ORDER = [
   "messages",
   "actions",
 ] as const;
-
 type SearchResultSectionKey = (typeof SEARCH_RESULT_SECTION_ORDER)[number];
-
 type SearchResultSection = {
   key: SearchResultSectionKey;
   results: SearchResult[];
   title: string;
 };
-
 type SearchHitContextLabel = {
   channelLabel: string | null;
   text: string;
@@ -87,7 +85,6 @@ function truncateResultText(content: string, maxLength = 96) {
 
 function formatRelativeTime(unixSeconds: number) {
   const diff = Math.floor(Date.now() / 1_000) - unixSeconds;
-
   if (diff < 60) {
     return "just now";
   }
@@ -436,6 +433,10 @@ export function TopbarSearch({
     scopeChannelId,
   });
   const trimmedQuery = query.trim();
+  // Bind highlights to the debounced result source so stale results can never
+  // pair with newly typed text during the debounce window.
+  const resultQuery = parseSearchOperators(debouncedQuery).text;
+  const resultsAreCurrent = debouncedQuery === trimmedQuery;
   const isIconVariant = variant === "icon";
   const currentChannel = currentChannelId
     ? (channelLookup.get(currentChannelId) ?? null)
@@ -504,9 +505,10 @@ export function TopbarSearch({
       ),
     [currentPubkeyNormalized, results],
   );
+  const visibleSearchableResults = resultsAreCurrent ? searchableResults : [];
   const searchResultSections = React.useMemo(
-    () => groupSearchResults(searchableResults),
-    [searchableResults],
+    () => groupSearchResults(visibleSearchableResults),
+    [visibleSearchableResults],
   );
   const groupedSearchResults = React.useMemo(
     () => searchResultSections.flatMap((section) => section.results),
@@ -516,8 +518,11 @@ export function TopbarSearch({
     ? scopeChannel
       ? []
       : suggestionResults
-    : groupedSearchResults;
+    : resultsAreCurrent
+      ? groupedSearchResults
+      : [];
   const isSearchLoading =
+    (!isShowingSuggestions && !resultsAreCurrent) ||
     isWaitingOnFromResolution ||
     searchQuery.isLoading ||
     fuzzyUserCandidatesQuery.isLoading ||
@@ -581,7 +586,7 @@ export function TopbarSearch({
         return;
       }
 
-      onOpenResult(result.hit);
+      onOpenResult(result.hit, resultQuery);
     },
     [
       onBrowseChannels,
@@ -592,6 +597,7 @@ export function TopbarSearch({
       onOpenUser,
       openAfterExit,
       setQuery,
+      resultQuery,
     ],
   );
 
@@ -697,7 +703,7 @@ export function TopbarSearch({
           ? result.action.description
           : result.kind === "user"
             ? getUserSecondaryLabel(result.user)
-            : truncateResultText(result.hit.content);
+            : buildSearchResultPreview(result.hit.content, resultQuery);
     const trailingLabel =
       result.kind === "channel"
         ? getChannelSuggestionMeta(result.channel)
@@ -737,6 +743,12 @@ export function TopbarSearch({
               pubkey: result.hit.pubkey,
               preferResolvedSelfLabel: true,
             })}
+            shape={
+              resultProfiles?.[result.hit.pubkey.toLowerCase()]?.isAgent ===
+              true
+                ? "squircle"
+                : "circle"
+            }
             size="md"
           />
         ) : result.kind === "user" ? (
@@ -744,6 +756,7 @@ export function TopbarSearch({
             avatarUrl={result.user.avatarUrl}
             className="h-7 w-7"
             displayName={userDisplayName ?? result.user.pubkey}
+            shape={result.user.isAgent ? "squircle" : "circle"}
             size="sm"
           />
         ) : (
@@ -771,7 +784,7 @@ export function TopbarSearch({
               ) : null}
               {preview ? (
                 <span className="col-start-1 mt-1.5 block min-w-0 truncate text-sm leading-5 text-muted-foreground">
-                  {preview}
+                  <HighlightedSearchText query={resultQuery} text={preview} />
                 </span>
               ) : null}
             </span>
@@ -873,12 +886,13 @@ export function TopbarSearch({
         </div>
       </div>
     )
-  ) : isSearchLoading && searchableResults.length === 0 ? (
+  ) : isSearchLoading && visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <SearchResultsSkeleton />
     </div>
-  ) : searchQuery.error instanceof Error && searchableResults.length === 0 ? (
+  ) : searchQuery.error instanceof Error &&
+    visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <p
@@ -890,7 +904,7 @@ export function TopbarSearch({
         {searchQuery.error.message}
       </p>
     </div>
-  ) : searchableResults.length === 0 ? (
+  ) : visibleSearchableResults.length === 0 ? (
     <div className="max-h-[min(60vh,32rem)] overflow-y-auto">
       {currentChannelSearchAction}
       <p
@@ -964,7 +978,7 @@ export function TopbarSearch({
           )}
         </button>
         <DialogContent
-          aria-busy={isSearchLoading && searchableResults.length === 0}
+          aria-busy={isSearchLoading && visibleSearchableResults.length === 0}
           className="mt-[18vh] max-w-2xl self-start gap-0 overflow-hidden rounded-2xl p-0 shadow-2xl"
           data-testid="search-results"
           onOpenAutoFocus={(event) => {
