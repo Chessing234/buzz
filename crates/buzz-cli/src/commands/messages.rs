@@ -14,65 +14,37 @@ use buzz_sdk::mentions::{
 
 /// Extract the thread root event ID from a Nostr tag array.
 ///
-/// Parses `"e"` tags with NIP-10 markers:
-/// - If a `"root"` marker exists, returns that event ID.
-/// - Otherwise, if only a `"reply"` marker exists, returns the reply target
-///   (a direct reply's parent IS the root, and nested replies need that root
-///   to thread correctly).
-/// - If no thread markers exist, returns `None` (parent is a top-level message,
-///   so it is itself the root).
+/// Delegates marker parsing and collapse to [`buzz_core::nip10`] (shared with
+/// relay ingest and ACP) so id-validity, marker selection, and top-level
+/// classification cannot drift:
+/// - A `root`+`reply` parent returns its root event ID.
+/// - A `reply`-only parent returns the reply target (a direct reply's parent IS
+///   the root).
+/// - A root-only or marker-less parent returns `None` (it is top-level and its
+///   own root).
 fn find_root_from_tags(tags: &serde_json::Value) -> Option<String> {
-    fn valid_event_id(s: &str) -> bool {
-        s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
-    }
-    let arr = tags.as_array()?;
-    let mut root = None;
-    let mut reply = None;
-    for tag in arr {
-        let Some(parts) = tag.as_array() else {
-            continue;
-        };
-        if parts.len() >= 4 && parts[0].as_str() == Some("e") {
-            // Defensively ignore malformed marker values so a bad tag on the
-            // parent event can't block the reply — fall back to root == parent.
-            let id = parts[1].as_str().filter(|s| valid_event_id(s));
-            match (parts[3].as_str(), id) {
-                (Some("root"), Some(id)) => root = Some(id.to_string()),
-                (Some("reply"), Some(id)) => reply = Some(id.to_string()),
-                _ => {}
-            }
-        }
-    }
-    root.or(reply)
+    let parts: Vec<Vec<String>> = tags
+        .as_array()?
+        .iter()
+        .filter_map(|tag| {
+            tag.as_array().map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+        })
+        .collect();
+    buzz_core::nip10::parse_thread_markers_from_parts(parts.iter().map(Vec::as_slice))
+        .resolve()
+        .map(|(root, _)| root)
 }
 
-/// Build a `ThreadRef` for a reply, given the immediate parent's event ID.
-///
-/// Fetches the parent event from the relay and inspects its NIP-10 `e` tags to
-/// determine the thread root:
-/// - Direct reply (parent is top-level): `root == parent`.
-/// - Nested reply: `root` is the parent's own root marker; `parent` is unchanged.
-///
-/// Ensures CLI-sent replies thread correctly using the same NIP-10 logic.
-async fn resolve_thread_ref(
-    client: &BuzzClient,
+fn thread_ref_from_parent_tags(
+    parent_eid: nostr::EventId,
     parent_event_id: &str,
+    tags: &serde_json::Value,
 ) -> Result<ThreadRef, CliError> {
-    let parent_eid = parse_event_id(parent_event_id)?;
-    let filter = serde_json::json!({ "ids": [parent_event_id], "limit": 1 });
-    let raw = client.query(&filter).await?;
-    let events: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
-    let event = events
-        .as_array()
-        .and_then(|a| a.first())
-        .ok_or_else(|| CliError::Other(format!("parent event {parent_event_id} not found")))?;
-    let tags = event
-        .get("tags")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
-    let root_eid = match find_root_from_tags(&tags) {
+    let root_eid = match find_root_from_tags(tags) {
         Some(root_hex) if root_hex != parent_event_id => parse_event_id(&root_hex)?,
         _ => parent_eid,
     };
@@ -83,39 +55,72 @@ async fn resolve_thread_ref(
     })
 }
 
-/// Resolve the channel UUID for an event by querying for it via POST /query.
-/// Extracts the `h` tag value from the returned event's tags.
-async fn resolve_channel_id(client: &BuzzClient, event_id: &str) -> Result<Uuid, CliError> {
-    let filter = serde_json::json!({
-        "ids": [event_id]
-    });
+/// Build a `ThreadRef` for a reply, given the immediate parent's event ID.
+///
+/// Fetches the parent event from the relay and inspects its NIP-10 `e` tags to
+/// determine the thread root:
+/// - Direct reply (parent is top-level): `root == parent`.
+/// - Nested reply: `root` is the parent's own root marker; `parent` is unchanged.
+///
+/// Ensures CLI-sent replies thread correctly using the same NIP-10 logic.
+async fn fetch_event(client: &BuzzClient, event_id: &str) -> Result<serde_json::Value, CliError> {
+    let filter = serde_json::json!({ "ids": [event_id], "limit": 1 });
     let raw = client.query(&filter).await?;
     let events: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
-    let arr = events
+    events
         .as_array()
-        .ok_or_else(|| CliError::Other("query response is not an array".into()))?;
-    let event = arr
-        .first()
-        .ok_or_else(|| CliError::Other(format!("event {event_id} not found")))?;
+        .and_then(|events| events.first())
+        .cloned()
+        .ok_or_else(|| CliError::NotFound(format!("event {event_id} not found")))
+}
+
+async fn resolve_thread_ref(
+    client: &BuzzClient,
+    parent_event_id: &str,
+) -> Result<ThreadRef, CliError> {
+    let event = fetch_event(client, parent_event_id).await?;
+    thread_ref_from_event(parent_event_id, &event)
+}
+
+fn thread_ref_from_event(event_id: &str, event: &serde_json::Value) -> Result<ThreadRef, CliError> {
+    let parent_eid = parse_event_id(event_id)?;
     let tags = event
         .get("tags")
-        .and_then(|t| t.as_array())
-        .ok_or_else(|| CliError::Other("event missing 'tags' field".into()))?;
-    for tag in tags {
-        if let Some(arr) = tag.as_array() {
-            if arr.first().and_then(|v| v.as_str()) == Some("h") {
-                if let Some(uuid_str) = arr.get(1).and_then(|v| v.as_str()) {
-                    return Uuid::parse_str(uuid_str).map_err(|_| {
-                        CliError::Other(format!("event h-tag is not a valid UUID: {uuid_str}"))
-                    });
-                }
-            }
-        }
-    }
-    Err(CliError::Other(format!(
-        "event {event_id} has no h-tag — cannot determine channel"
-    )))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    thread_ref_from_parent_tags(parent_eid, event_id, &tags)
+}
+
+/// The channel an event says it belongs to: the first `h` tag whose value
+/// parses as a UUID.
+///
+/// Mirrors `buzz_sdk::extract_channel_id`, which is what the rest of the
+/// codebase reads an event's channel with — an `h` tag that is not a UUID is
+/// skipped rather than ending the search, so a garbage tag ahead of the real
+/// one does not hide it. (This path holds `serde_json::Value`, not
+/// `nostr::Event`, so the walk cannot be shared outright.)
+fn event_channel_id(event: &serde_json::Value) -> Option<Uuid> {
+    event.get("tags")?.as_array()?.iter().find_map(|tag| {
+        let tag = tag.as_array()?;
+        (tag.first()?.as_str()? == "h")
+            .then(|| Uuid::parse_str(tag.get(1)?.as_str()?).ok())
+            .flatten()
+    })
+}
+
+/// Resolve the channel UUID for an event from its tags.
+fn channel_id_from_event(event_id: &str, event: &serde_json::Value) -> Result<Uuid, CliError> {
+    event_channel_id(event).ok_or_else(|| {
+        CliError::Other(format!(
+            "event {event_id} has no readable channel (h) tag — cannot determine channel"
+        ))
+    })
+}
+
+async fn resolve_channel_id(client: &BuzzClient, event_id: &str) -> Result<Uuid, CliError> {
+    let event = fetch_event(client, event_id).await?;
+    channel_id_from_event(event_id, &event)
 }
 
 fn resolve_names_to_pubkeys(
@@ -391,69 +396,38 @@ pub async fn cmd_get_messages(
     Ok(())
 }
 
-/// The channel an event says it belongs to: the first `h` tag whose value
-/// parses as a UUID.
-///
-/// Mirrors `buzz_sdk::extract_channel_id`, which is what the rest of the
-/// codebase reads an event's channel with — an `h` tag that is not a UUID is
-/// skipped rather than ending the search, so a garbage tag ahead of the real
-/// one does not hide it. (This path holds `serde_json::Value`, not
-/// `nostr::Event`, so the walk cannot be shared outright.)
-fn event_channel_id(event: &serde_json::Value) -> Option<Uuid> {
-    event.get("tags")?.as_array()?.iter().find_map(|tag| {
-        let tag = tag.as_array()?;
-        (tag.first()?.as_str()? == "h")
-            .then(|| Uuid::parse_str(tag.get(1)?.as_str()?).ok())
-            .flatten()
-    })
-}
-
-/// Fail when the thread root does not live in the requested channel.
-///
-/// Only the reply filter is scoped by `#h`; the root is fetched by id alone,
-/// so a `--channel` that does not match the event returns the root with none
-/// of its replies and exits 0. That is indistinguishable from a real thread
-/// with no replies, and reads as "nobody answered". Writes already reject the
-/// same mismatch ("parent event belongs to a different channel"); this makes
-/// the read say so too.
-///
-/// Compares UUID values, not their text: `--channel` is parsed by
-/// `Uuid::parse_str`, which accepts uppercase, braced and unhyphenated forms,
-/// while `h` tags are `uuid-v4-lowercase` on the wire (NIP-PL `h_grammar`).
-///
-/// A root that came back without a readable `h` tag fails closed: the command
-/// cannot show that it belongs to the requested channel, and printing it with
-/// no replies is the exact silence this check exists to remove. A root the
-/// relay did not return at all is left alone, so a genuinely missing event
-/// still prints an empty array.
-fn check_thread_channel(
-    events: &[serde_json::Value],
+pub fn resolve_thread_target(
+    expected_channel_id: Uuid,
     event_id: &str,
-    channel: Uuid,
-) -> Result<(), CliError> {
-    let Some(root) = events
-        .iter()
-        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(event_id))
-    else {
-        return Ok(());
-    };
-    let Some(actual) = event_channel_id(root) else {
+    expected_root_id: Option<&str>,
+    selected_event: &serde_json::Value,
+) -> Result<String, CliError> {
+    let actual_channel_id = event_channel_id(selected_event).ok_or_else(|| {
+        CliError::Usage(format!(
+            "event {event_id} carries no readable channel (h) tag, so it cannot be shown as a thread in {expected_channel_id}"
+        ))
+    })?;
+    if actual_channel_id != expected_channel_id {
         return Err(CliError::Usage(format!(
-            "event {event_id} carries no readable channel (h) tag, so it cannot be shown as a thread in {channel}"
+            "event belongs to a different channel: --channel is {expected_channel_id}, event {event_id} is in {actual_channel_id}"
         )));
-    };
-    if actual == channel {
-        return Ok(());
     }
-    Err(CliError::Usage(format!(
-        "event belongs to a different channel: --channel is {channel}, event {event_id} is in {actual}"
-    )))
+    let root_event_id = thread_ref_from_event(event_id, selected_event)?
+        .root_event_id
+        .to_hex();
+    if expected_root_id.is_some_and(|expected| expected != root_event_id) {
+        return Err(CliError::Usage(
+            "Buzz message link thread root does not match the selected message".into(),
+        ));
+    }
+    Ok(root_event_id)
 }
 
 pub async fn cmd_get_thread(
     client: &BuzzClient,
     channel_id: &str,
     event_id: &str,
+    expected_root_id: Option<&str>,
     limit: Option<u32>,
     depth_limit: Option<u32>,
     format: &crate::OutputFormat,
@@ -464,31 +438,40 @@ pub async fn cmd_get_thread(
     // is the wrong thing to put in the filter as well as the wrong thing to
     // compare with. Sending a non-canonical spelling matches no replies, which
     // is the same "nobody answered" silence this command is fixing.
-    let channel = parse_uuid(channel_id)?;
-    let channel_id = channel.hyphenated().to_string();
+    let expected_channel_id = parse_uuid(channel_id)?;
+    let channel_id = expected_channel_id.hyphenated().to_string();
     validate_hex64(event_id)?;
+    let selected_event = fetch_event(client, event_id).await?;
+    let root_event_id = resolve_thread_target(
+        expected_channel_id,
+        event_id,
+        expected_root_id,
+        &selected_event,
+    )?;
     let limit = limit.unwrap_or(100).min(500);
 
-    // Two filters ORed in a single HTTP call:
-    // 1. Replies referencing this event via e-tag (no kind restriction)
-    // 2. The root event itself by ID
     let mut reply_filter = serde_json::json!({
         "kinds": [9, 40002, 40003, 40008, 45003],
         "#h": [channel_id],
-        "#e": [event_id],
+        "#e": [root_event_id.as_str()],
         "limit": limit
     });
     if let Some(d) = depth_limit {
         reply_filter["depth_limit"] = serde_json::json!(d);
     }
     let root_filter = serde_json::json!({
-        "ids": [event_id],
+        "ids": [root_event_id.as_str()],
+        "#h": [channel_id],
         "limit": 1
     });
     let resp = client.query_multi(&[reply_filter, root_filter]).await?;
     let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    check_thread_channel(&events, event_id, channel)?;
-    events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
+    events.sort_by_key(|event| {
+        event
+            .get("created_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    });
     let normalized = normalize_events(&events);
     println!("{}", format_events(&normalized, format));
     Ok(())
@@ -1032,9 +1015,35 @@ pub async fn dispatch(
         MessagesCmd::Thread {
             channel,
             event,
+            link,
             limit,
             depth_limit,
-        } => cmd_get_thread(client, &channel, &event, limit, depth_limit, format).await,
+        } => {
+            let (channel, event, expected_root) =
+                match link {
+                    Some(link) => {
+                        let parsed = crate::links::parse_message_link(&link)?;
+                        (parsed.channel_id, parsed.message_id, parsed.thread_root_id)
+                    }
+                    None => match (channel, event) {
+                        (Some(channel), Some(event)) => (channel, event, None),
+                        _ => return Err(CliError::Usage(
+                            "messages thread requires either --link or both --channel and --event"
+                                .into(),
+                        )),
+                    },
+                };
+            cmd_get_thread(
+                client,
+                &channel,
+                &event,
+                expected_root.as_deref(),
+                limit,
+                depth_limit,
+                format,
+            )
+            .await
+        }
         MessagesCmd::Search {
             query,
             author,
@@ -1060,13 +1069,16 @@ pub async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::{
-        event_mention_pubkeys, find_root_from_tags, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
-        resolve_names_to_pubkeys,
+        channel_id_from_event, cmd_get_thread, event_mention_pubkeys, find_root_from_tags,
+        format_events, match_profiles_by_name, merge_message_mentions, missing_members,
+        normalize_explicit_mentions, parse_member_pubkeys, resolve_names_to_pubkeys,
+        resolve_thread_target, thread_ref_from_event, thread_ref_from_parent_tags, BuzzClient,
+        CliError, Uuid,
     };
     use buzz_sdk::mentions::{
         extract_at_mentions_with_known, extract_at_names, match_names_to_profiles, MentionProfile,
     };
+    use nostr::Keys;
     use serde_json::json;
 
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1080,6 +1092,119 @@ mod tests {
     const PK_VALID_C: &str = "f4a42a97e594b77bdbd8ee35191c8b28a94a4cb871d96f32921558275421fb68";
 
     #[test]
+    fn compact_event_format_remains_the_three_key_contract() {
+        let normalized = serde_json::json!([{
+            "id": ID_A,
+            "pubkey": PUBKEY,
+            "kind": 9,
+            "content": "compact content",
+            "created_at": 1_787_754_972_u64,
+            "tags": [["h", "channel-id"]],
+            "sig": "d".repeat(128),
+        }])
+        .to_string();
+
+        let output: Vec<serde_json::Value> =
+            serde_json::from_str(&format_events(&normalized, &crate::OutputFormat::Compact))
+                .unwrap();
+
+        assert_eq!(
+            output[0],
+            serde_json::json!({
+                "id": ID_A,
+                "content": "compact content",
+                "created_at": 1_787_754_972_u64,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_channel_is_rejected_before_thread_fetch() {
+        let client =
+            BuzzClient::new("http://127.0.0.1:1".into(), Keys::generate(), None, None).unwrap();
+        let error = cmd_get_thread(
+            &client,
+            "not-a-uuid",
+            ID_A,
+            None,
+            None,
+            None,
+            &crate::OutputFormat::Json,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::Usage(_)));
+        assert!(error.to_string().contains("invalid UUID"));
+    }
+
+    #[test]
+    fn selected_event_derives_authoritative_channel_and_root() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let event = json!({
+            "tags": [
+                ["h", channel],
+                ["e", ID_A, "", "root"],
+                ["e", ID_B, "", "reply"],
+            ]
+        });
+
+        assert_eq!(
+            channel_id_from_event(ID_B, &event).unwrap().to_string(),
+            channel
+        );
+        assert_eq!(
+            thread_ref_from_event(ID_B, &event)
+                .unwrap()
+                .root_event_id
+                .to_hex(),
+            ID_A
+        );
+    }
+
+    #[test]
+    fn selected_event_requires_a_valid_channel_tag() {
+        let missing = json!({"tags": []});
+        let malformed = json!({"tags": [["h", "not-a-uuid"]]});
+        assert!(channel_id_from_event(ID_A, &missing).is_err());
+        assert!(channel_id_from_event(ID_A, &malformed).is_err());
+    }
+
+    #[test]
+    fn thread_target_rejects_wrong_channel_or_root_hint() {
+        let channel = "123e4567-e89b-12d3-a456-426614174000";
+        let other_channel = "123e4567-e89b-12d3-a456-426614174001";
+        let selected = json!({
+            "tags": [["h", channel], ["e", ID_A, "", "root"], ["e", ID_B, "", "reply"]]
+        });
+
+        assert!(resolve_thread_target(
+            Uuid::parse_str(other_channel).unwrap(),
+            ID_B,
+            Some(ID_A),
+            &selected,
+        )
+        .is_err());
+        assert!(resolve_thread_target(
+            Uuid::parse_str(channel).unwrap(),
+            ID_B,
+            Some(ID_B),
+            &selected,
+        )
+        .is_err());
+        assert_eq!(
+            resolve_thread_target(
+                Uuid::parse_str(channel).unwrap(),
+                ID_B,
+                Some(ID_A),
+                &selected,
+            )
+            .unwrap(),
+            ID_A
+        );
+    }
+
+    #[test]
     fn root_marker_wins_over_reply_marker() {
         let tags = json!([
             ["e", ID_A, "", "root"],
@@ -1087,6 +1212,23 @@ mod tests {
             ["p", PUBKEY],
         ]);
         assert_eq!(find_root_from_tags(&tags).as_deref(), Some(ID_A));
+    }
+
+    #[test]
+    fn root_marker_without_reply_is_top_level() {
+        let tags = json!([["e", ID_A, "", "root"], ["p", PUBKEY],]);
+        assert!(find_root_from_tags(&tags).is_none());
+    }
+
+    #[test]
+    fn root_only_parent_starts_cli_reply_thread_at_parent() {
+        let tags = json!([["e", ID_A, "", "root"]]);
+        let parent = nostr::EventId::from_hex(ID_B).expect("valid parent id");
+
+        let thread_ref = thread_ref_from_parent_tags(parent, ID_B, &tags).expect("thread ref");
+
+        assert_eq!(thread_ref.parent_event_id, parent);
+        assert_eq!(thread_ref.root_event_id, parent);
     }
 
     #[test]
@@ -1112,14 +1254,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_tags_are_skipped() {
+    fn malformed_tags_are_skipped_and_root_only_is_top_level() {
+        // Invalid entries are ignored, leaving a valid root-only marker; the
+        // shared collapse rule still classifies that parent as top-level.
         let tags = json!([
             "not-an-array",
             ["e"],
             ["e", "short"],
             ["e", ID_A, "", "root"],
         ]);
-        assert_eq!(find_root_from_tags(&tags).as_deref(), Some(ID_A));
+        assert!(find_root_from_tags(&tags).is_none());
     }
 
     #[test]
@@ -1443,7 +1587,7 @@ mod tests {
 
 #[cfg(test)]
 mod thread_channel_tests {
-    use super::{check_thread_channel, event_channel_id};
+    use super::{event_channel_id, resolve_thread_target};
     use uuid::Uuid;
 
     const ROOT: &str = "0a9882747d0029df3fc9742b0755068a4ae24426b7e1f18cf44800409fdb437f";
@@ -1463,13 +1607,16 @@ mod thread_channel_tests {
 
     #[test]
     fn accepts_a_root_in_the_requested_channel() {
-        assert!(check_thread_channel(&[root_event(CHANNEL_A)], ROOT, uuid(CHANNEL_A)).is_ok());
+        assert_eq!(
+            resolve_thread_target(uuid(CHANNEL_A), ROOT, None, &root_event(CHANNEL_A)).unwrap(),
+            ROOT
+        );
     }
 
     #[test]
     fn rejects_a_root_from_another_channel() {
         let err =
-            check_thread_channel(&[root_event(CHANNEL_A)], ROOT, uuid(CHANNEL_B)).unwrap_err();
+            resolve_thread_target(uuid(CHANNEL_B), ROOT, None, &root_event(CHANNEL_A)).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(CHANNEL_A),
@@ -1491,34 +1638,16 @@ mod thread_channel_tests {
             format!("{{{CHANNEL_A}}}"),
         ] {
             assert!(
-                check_thread_channel(&[root_event(CHANNEL_A)], ROOT, uuid(&spelling)).is_ok(),
+                resolve_thread_target(uuid(&spelling), ROOT, None, &root_event(CHANNEL_A)).is_ok(),
                 "spelling {spelling} must be accepted"
             );
         }
     }
 
     #[test]
-    fn ignores_replies_when_locating_the_root() {
-        // Only the event whose id matches is checked; a reply carrying some
-        // other channel tag must not decide the outcome.
-        let events = vec![
-            serde_json::json!({"id": "deadbeef", "tags": [["h", CHANNEL_B]]}),
-            root_event(CHANNEL_A),
-        ];
-        assert!(check_thread_channel(&events, ROOT, uuid(CHANNEL_A)).is_ok());
-    }
-
-    #[test]
-    fn passes_through_when_the_root_was_not_returned() {
-        assert!(check_thread_channel(&[], ROOT, uuid(CHANNEL_A)).is_ok());
-    }
-
-    #[test]
     fn rejects_a_root_with_no_h_tag() {
-        // The command cannot establish that this root is in the requested
-        // channel, so it must not print it as that channel's thread.
         let event = serde_json::json!({"id": ROOT, "tags": [["p", "abc"]]});
-        let err = check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).unwrap_err();
+        let err = resolve_thread_target(uuid(CHANNEL_A), ROOT, None, &event).unwrap_err();
         assert!(
             err.to_string().contains("no readable channel"),
             "unexpected error: {err}"
@@ -1528,7 +1657,7 @@ mod thread_channel_tests {
     #[test]
     fn rejects_a_root_whose_h_tag_is_not_a_uuid() {
         let event = serde_json::json!({"id": ROOT, "tags": [["h", "not-a-uuid"]]});
-        assert!(check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).is_err());
+        assert!(resolve_thread_target(uuid(CHANNEL_A), ROOT, None, &event).is_err());
     }
 
     #[test]
@@ -1540,7 +1669,7 @@ mod thread_channel_tests {
             "tags": [["h", "not-a-uuid"], ["h", CHANNEL_A]],
         });
         assert_eq!(event_channel_id(&event), Some(uuid(CHANNEL_A)));
-        assert!(check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).is_ok());
+        assert!(resolve_thread_target(uuid(CHANNEL_A), ROOT, None, &event).is_ok());
     }
 
     #[test]
@@ -1548,6 +1677,6 @@ mod thread_channel_tests {
         // Nothing on the wire should produce this, but an `h` tag written by a
         // client that skipped canonicalization must not read as a mismatch.
         let event = root_event(&CHANNEL_A.to_uppercase());
-        assert!(check_thread_channel(&[event], ROOT, uuid(CHANNEL_A)).is_ok());
+        assert!(resolve_thread_target(uuid(CHANNEL_A), ROOT, None, &event).is_ok());
     }
 }
