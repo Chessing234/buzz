@@ -1,6 +1,6 @@
 import '../../../shared/mentions/agent_identity_provider.dart';
 import '../../../shared/identity_archive/archived_identities_provider.dart';
-import '../../profile/user_profile.dart';
+import '../../../shared/profile/user_profile.dart';
 import '../channel_management_provider.dart';
 import 'mention_ranking.dart';
 
