@@ -1,18 +1,47 @@
 use super::types::{ExtensionEntry, RuntimeFileConfig};
 use std::path::{Path, PathBuf};
 
-/// Read Claude Code config from `~/.claude/settings.json` and `~/.claude.json`,
-/// with the project's settings files layered on top.
+/// Read Claude Code config from `settings.json` and `.claude.json`, with the
+/// project's settings files layered on top.
 ///
-/// Claude Code itself reads every scope and lets the narrower one win, so the
-/// panel showed values that were not the ones in effect: an agent whose nest
-/// sets `effortLevel: medium` really does run at medium, while the panel
-/// reported the user-level `low` (#5826).
-pub(super) fn read_config_file(workdir: Option<&Path>) -> Option<RuntimeFileConfig> {
+/// `config_dir` — when `Some`, reads both `settings.json` and `.claude.json`
+/// from that directory (the agent's effective `CLAUDE_CONFIG_DIR`).
+/// Defaults to `~/.claude/settings.json` and `~/.claude.json` when `None`.
+///
+/// Both files are resolved from the same directory: the claude 2.1.x binary
+/// resolves `.claude.json` as `join(process.env.CLAUDE_CONFIG_DIR || homedir(),
+/// ".claude.json")`, mirroring the `settings.json` resolver. A user-set
+/// `CLAUDE_CONFIG_DIR` therefore remaps both files — honoring only
+/// `settings.json` would misrepresent the agent's actual MCP config.
+///
+/// Claude Code itself also reads every project scope and lets the narrower one
+/// win, so the panel must layer `<workdir>/.claude/settings.json` and
+/// `settings.local.json` on top of the user file — otherwise an agent whose
+/// nest sets `effortLevel: medium` really does run at medium while the panel
+/// reports the user-level `low` (#5826).
+pub(super) fn read_config_file(
+    config_dir: Option<&Path>,
+    workdir: Option<&Path>,
+) -> Option<RuntimeFileConfig> {
     let home = dirs::home_dir()?;
-    let mcp_path = home.join(".claude.json");
 
-    let settings = read_settings(&home, workdir);
+    // #3493: honor user-set CLAUDE_CONFIG_DIR for both settings.json and
+    // .claude.json — the binary resolves both relative to CLAUDE_CONFIG_DIR.
+    let mcp_path = config_dir
+        .map(|d| d.join(".claude.json"))
+        .unwrap_or_else(|| home.join(".claude.json"));
+
+    let settings = match config_dir {
+        Some(dir) => {
+            let user_path = dir.join("settings.json");
+            let mut settings = read_json_file(&user_path);
+            for path in project_settings_paths(workdir, &user_path) {
+                settings = merge_settings(settings, read_json_file(&path));
+            }
+            settings
+        }
+        None => read_settings(&home, workdir),
+    };
     let mcp_config = read_json_file(&mcp_path);
 
     if settings.is_none() && mcp_config.is_none() {
@@ -160,6 +189,22 @@ mod tests {
         let mut cfg = RuntimeFileConfig::default();
         apply_settings(&mut cfg, &val);
         cfg
+    }
+
+    /// #3493: read_config_file(Some(dir), None) must read settings.json from the
+    /// custom dir, not ~/.claude/settings.json — proves CLAUDE_CONFIG_DIR
+    /// actually remaps the settings read (not just the reported MCP path).
+    #[test]
+    fn reads_settings_from_custom_config_dir() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = std::fs::File::create(dir.path().join("settings.json")).unwrap();
+        f.write_all(br#"{"model": "claude-opus-4", "effortLevel": "high"}"#)
+            .unwrap();
+
+        let cfg = read_config_file(Some(dir.path()), None).expect("settings.json in custom dir is read");
+        assert_eq!(cfg.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(cfg.thinking_effort.as_deref(), Some("high"));
     }
 
     #[test]
