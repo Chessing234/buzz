@@ -99,10 +99,12 @@ export function usePersonaActions() {
   const [personaToShare, setPersonaToShare] = React.useState<{
     persona: AgentPersona;
     linkedAgentPubkey: string | null;
+    effectiveAvatarUrl: string | null;
   } | null>(null);
   const [personaToExportSnapshot, setPersonaToExportSnapshot] = React.useState<{
     persona: AgentPersona;
     linkedAgentPubkey: string | null;
+    effectiveAvatarUrl: string | null;
   } | null>(null);
   const [snapshotImportState, setSnapshotImportState] = React.useState<{
     fileBytes: number[];
@@ -113,7 +115,6 @@ export function usePersonaActions() {
     React.useState<AgentSnapshotImportResult | null>(null);
   const [snapshotImportConfirmError, setSnapshotImportConfirmError] =
     React.useState<string | null>(null);
-  const [isCatalogDialogOpen, setIsCatalogDialogOpen] = React.useState(false);
   const [personaNoticeMessage, setPersonaNoticeMessage] = React.useState<
     string | null
   >(null);
@@ -252,10 +253,6 @@ export function usePersonaActions() {
             setPersonaErrorMessage(
               `${persona.displayName} was created, but it did not start: ${created.spawnError}`,
             );
-          } else {
-            setPersonaNoticeMessage(
-              `Created and started ${created.agent.name}.`,
-            );
           }
           if (created.profileSyncError) {
             setPersonaErrorMessage(
@@ -299,9 +296,10 @@ export function usePersonaActions() {
     persona: AgentPersona,
     active: boolean,
     surface: PersonaFeedbackSurface,
-  ) {
+  ): Promise<AgentPersona | null> {
     clearFeedback(surface);
     try {
+      let updatedPersona: AgentPersona;
       if (active && isCatalogPersona(persona)) {
         const localPersona = findLocalPersonaForCatalogEntry(
           personas,
@@ -310,15 +308,18 @@ export function usePersonaActions() {
 
         if (localPersona) {
           if (!localPersona.isActive) {
-            await setPersonaActiveMutation.mutateAsync({
+            updatedPersona = await setPersonaActiveMutation.mutateAsync({
               id: localPersona.id,
               active: true,
             });
+          } else {
+            updatedPersona = localPersona;
           }
         } else {
-          await createPersonaMutation.mutateAsync({
+          updatedPersona = await createPersonaMutation.mutateAsync({
             displayName: persona.displayName,
             avatarUrl: persona.avatarUrl ?? undefined,
+            description: persona.description ?? undefined,
             systemPrompt: persona.systemPrompt,
             runtime: persona.runtime ?? undefined,
             model: persona.model ?? undefined,
@@ -340,13 +341,17 @@ export function usePersonaActions() {
           });
         }
       } else {
-        await setPersonaActiveMutation.mutateAsync({ id: persona.id, active });
+        updatedPersona = await setPersonaActiveMutation.mutateAsync({
+          id: persona.id,
+          active,
+        });
       }
       setPersonaNoticeMessage(
         active
           ? `Selected ${persona.displayName} for My Agents.`
           : `Deselected ${persona.displayName} from My Agents.`,
       );
+      return updatedPersona;
     } catch (error) {
       setPersonaErrorMessage(
         error instanceof Error
@@ -355,6 +360,7 @@ export function usePersonaActions() {
             ? "Failed to select agent for My Agents."
             : "Failed to deselect agent from My Agents.",
       );
+      return null;
     }
   }
 
@@ -433,12 +439,6 @@ export function usePersonaActions() {
     setPersonaDialogState(duplicatePersonaDialogState(persona));
   }
 
-  function openCatalog() {
-    clearFeedback("catalog");
-    void catalogQuery.refetch();
-    setIsCatalogDialogOpen(true);
-  }
-
   function openDelete(persona: AgentPersona) {
     clearFeedback("library");
     setPersonaToDelete(persona);
@@ -447,17 +447,20 @@ export function usePersonaActions() {
   function openShare(
     persona: AgentPersona,
     linkedAgent: ManagedAgent | undefined,
+    effectiveAvatarUrl: string | null,
   ) {
     clearFeedback("library");
     setPersonaToShare({
       persona,
       linkedAgentPubkey: linkedAgent?.pubkey ?? null,
+      effectiveAvatarUrl,
     });
   }
 
   function handleExportSnapshot(
     persona: AgentPersona,
     linkedAgentPubkey: string | null,
+    effectiveAvatarUrl: string | null,
     memoryLevel: SnapshotMemoryLevel,
     format: SnapshotFormat,
   ) {
@@ -469,7 +472,7 @@ export function usePersonaActions() {
         memoryLevel,
         format,
         memorySourcePubkey: linkedAgentPubkey,
-        avatarUrl: persona.avatarUrl,
+        avatarUrl: effectiveAvatarUrl,
       },
       {
         onSuccess: (saved) => {
@@ -576,8 +579,6 @@ export function usePersonaActions() {
     setPersonaToDelete,
     personaToShare,
     setPersonaToShare,
-    isCatalogDialogOpen,
-    setIsCatalogDialogOpen,
     personaNoticeMessage,
     personaErrorMessage,
     personaFeedbackSurface,
@@ -588,7 +589,6 @@ export function usePersonaActions() {
     prepareCreate,
     openEdit,
     openDuplicate,
-    openCatalog,
     openDelete,
     openShare,
     personaToExportSnapshot,
