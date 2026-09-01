@@ -9,12 +9,12 @@ use crate::{
     managed_agents::{
         apply_persona_behavior, effective_agent_command, load_managed_agents, load_personas,
         managed_agent_avatar_url, save_managed_agents, save_personas, try_regenerate_nest,
-        AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
+        validate_agent_definition_text, AgentDefinition, ManagedAgentRecord, UpdatePersonaRequest,
     },
     util::now_iso,
 };
 
-use super::{pending, propagate, retain_persona_pending, trim_optional, trim_required};
+use super::{normalize_description, pending, propagate, retain_persona_pending, trim_optional, trim_required};
 
 use propagate::{propagate_persona_name_rename, propagate_persona_respond_to};
 
@@ -30,8 +30,18 @@ pub struct UpdatePersonaResult {
     persona: AgentDefinition,
 }
 
-/// Profile sync params collected under the store lock for async relay publish.
-type ProfileSyncParams = Vec<(nostr::Keys, String, String, Option<String>, Option<String>)>;
+
+/// Profile sync params collected under the store lock for async relay publish:
+/// (agent keys, relay url, display name, avatar url, kind:0 about, auth tag).
+type ProfileSyncParams = Vec<(
+    nostr::Keys,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)>;
+
 
 #[tauri::command]
 pub async fn update_persona(
@@ -40,6 +50,10 @@ pub async fn update_persona(
 ) -> Result<UpdatePersonaResult, String> {
     let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
         retain_persona_pending(app, state, persona);
+        // F2: immediately refresh any shared 30178 heads that include this
+        // persona as a member. Best-effort inside retain so a hiccup cannot
+        // fail the persona edit itself.
+        crate::commands::refresh_team_catalog_heads_for_persona(app, state, &persona.id);
         Ok(())
     })
     .await?;
@@ -67,6 +81,8 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let state = app.state::<AppState>();
             let display_name = trim_required(&input.display_name, "Display name")?;
             let system_prompt = input.system_prompt.clone();
+            validate_agent_definition_text(&display_name, &system_prompt)?;
+            let description = normalize_description(input.description)?;
             let avatar_url = trim_optional(input.avatar_url);
             let runtime = trim_optional(input.runtime);
             let model = trim_optional(input.model);
@@ -87,9 +103,17 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let avatar_changed = persona.avatar_url != avatar_url;
             let name_changed = persona.display_name != display_name;
             let old_display_name = persona.display_name.clone();
+            // The kind:0 `about` is the authored description, so a
+            // description edit changes what should be published.
+            let old_about =
+                crate::managed_agents::effective_agent_description(persona.description.as_deref());
+            let new_about =
+                crate::managed_agents::effective_agent_description(description.as_deref());
+            let about_changed = old_about != new_about;
 
             persona.display_name = display_name;
             persona.avatar_url = avatar_url;
+            persona.description = description;
             persona.system_prompt = system_prompt;
             persona.runtime = runtime;
             persona.model = model;
@@ -114,6 +138,7 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let retained = retain(&app, &state, &result)?;
             try_regenerate_nest(&app);
 
+
             // Propagate definition edits that instances must mirror (avatar,
             // display name, respond-to gate) and collect relay profile sync
             // params for the async phase.
@@ -124,8 +149,10 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             // without toggling the behavior control.
             let sync_params: ProfileSyncParams = if avatar_changed
                 || name_changed
+                || about_changed
                 || behavior_present
                 || result.respond_to.is_some()
+
             {
                 let mut records = load_managed_agents(&app)?;
                 let mut params: ProfileSyncParams = Vec::new();
@@ -158,28 +185,17 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     if record.persona_id.as_deref() != Some(&result.id) {
                         continue;
                     }
-                    let mut record_changed = renamed.contains(&record.pubkey);
+                    let was_renamed = renamed.contains(&record.pubkey);
+                    let update = prepare_linked_profile_update(
+                        record,
+                        &result,
+                        was_renamed,
+                        avatar_changed,
+                        about_changed,
+                    );
 
-                    if avatar_changed {
-                        // Update the persisted avatar so reconciliation on next
-                        // start agrees with what we're about to publish.
-                        // When the persona avatar is cleared, fall back to the
-                        // command-default icon so the record never stores `None`
-                        // (which reconcile_agent_profile treats as "un-migrated").
-                        let effective_cmd = effective_agent_command(
-                            record.persona_id.as_deref(),
-                            std::slice::from_ref(&result),
-                            record.agent_command_override.as_deref(),
-                        );
-                        record.avatar_url = result
-                            .avatar_url
-                            .clone()
-                            .or_else(|| managed_agent_avatar_url(&effective_cmd));
-                        record_changed = true;
-                    }
-
-                    if record_changed {
-                        agents_modified = true;
+                    agents_modified = agents_modified || update.record_changed;
+                    if update.profile_sync_required {
                         if let Ok(agent_keys) = nostr::Keys::parse(&record.private_key_nsec) {
                             let relay_url = crate::relay::effective_agent_relay_url(
                                 &record.relay_url,
@@ -189,7 +205,8 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                                 agent_keys,
                                 relay_url,
                                 record.name.clone(),
-                                record.avatar_url.clone(),
+                                update.profile_avatar,
+                                new_about.clone(),
                                 record.auth_tag.clone(),
                             ));
                         }
@@ -220,19 +237,23 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
 
-    // Phase 2: await relay profile sync for linked agents whose avatar or
-    // display_name was just updated. We await (rather than fire-and-forget)
+    // Phase 2: await relay profile sync for linked agents whose avatar,
+    // display_name, or effective description (kind:0 about) was just
+    // updated. We await (rather than fire-and-forget)
     // so the frontend cache invalidation that follows the mutation settlement
     // sees the fresh relay profile. Best-effort — failures are logged, not surfaced.
     if !profile_sync_params.is_empty() {
         let state = app.state::<AppState>();
-        for (agent_keys, relay_url, display_name, avatar_url, auth_tag) in profile_sync_params {
+        for (agent_keys, relay_url, display_name, avatar_url, about, auth_tag) in
+            profile_sync_params
+        {
             if let Err(e) = crate::relay::sync_managed_agent_profile(
                 &state,
                 &relay_url,
                 &agent_keys,
                 &display_name,
                 avatar_url.as_deref(),
+                about.as_deref(),
                 auth_tag.as_deref(),
             )
             .await

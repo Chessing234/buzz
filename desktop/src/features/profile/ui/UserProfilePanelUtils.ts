@@ -31,13 +31,13 @@ export type ProfilePanelTab = "info" | "runtime" | "channels" | "memories";
 
 export const PROFILE_PANEL_VIEW_TITLES: Record<ProfilePanelView, string> = {
   summary: "Profile",
-  instructions: "Instructions",
+  instructions: "Agent instructions",
   info: "Agent info",
   configuration: "Runtime",
-  diagnostics: "Harness Log",
+  diagnostics: "Harness log",
   memories: "Memories",
   channels: "Channels",
-  logs: "Harness Log",
+  logs: "Harness log",
 };
 
 const PROFILE_PANEL_VIEWS = new Set<ProfilePanelView>(
@@ -88,8 +88,14 @@ export function profilePanelTabFromSearch(value: unknown): ProfilePanelTab {
   return parseProfilePanelTab(value) ?? "info";
 }
 
+export function profilePanelTargetKey(
+  pubkey: string | undefined,
+  personaId: string | undefined,
+): string {
+  return pubkey ?? `persona:${personaId ?? "unknown"}`;
+}
+
 export type UserProfilePanelProps = {
-  callerChannelId?: string | null;
   canResetWidth?: boolean;
   currentPubkey?: string;
   isSinglePanelView?: boolean;
@@ -292,19 +298,17 @@ export function personaManagedAgentUpdate(
     hasChanges = true;
   }
 
-  // Unset on the definition means "leave the instance alone" — never coerce
-  // null/undefined to owner-only, or an unrelated persona edit (prompt, model)
-  // silently downgrades an instance that was set to anyone/allowlist.
-  if (
-    persona.respondTo != null &&
-    persona.respondTo !== agent.respondTo
-  ) {
+  // Definition edits expose the access policy in the same dialog as identity
+  // and runtime settings. Keep the exact linked instance in sync when the
+  // definition carries an explicit policy; otherwise the dialog reopens with
+  // the new value while the running agent and sidebar retain the old one.
+  if (persona.respondTo != null && persona.respondTo !== agent.respondTo) {
     input.respondTo = persona.respondTo;
     hasChanges = true;
   }
   if (
     persona.respondTo === "allowlist" &&
-    persona.respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
+    !stringArrayEqual(persona.respondToAllowlist, agent.respondToAllowlist)
   ) {
     input.respondToAllowlist = [...persona.respondToAllowlist];
     hasChanges = true;

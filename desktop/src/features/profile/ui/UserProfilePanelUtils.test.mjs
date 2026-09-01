@@ -6,6 +6,7 @@ import {
   parseProfilePanelView,
   personaManagedAgentUpdate,
   profilePanelTabFromSearch,
+  profilePanelTargetKey,
   profilePanelViewFromSearch,
 } from "./UserProfilePanelUtils.ts";
 
@@ -57,6 +58,8 @@ function persona(overrides = {}) {
     namePool: [],
     isBuiltIn: false,
     isActive: true,
+    respondTo: "owner-only",
+    respondToAllowlist: [],
     envVars: { NEW_KEY: "2" },
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-01T00:00:00Z",
@@ -92,11 +95,11 @@ test("personaManagedAgentUpdate syncs edited persona identity to linked agent", 
   });
 });
 
-test("personaManagedAgentUpdate syncs respondTo gate to linked agent", () => {
+test("personaManagedAgentUpdate syncs definition access to the linked agent", () => {
   assert.deepEqual(
     personaManagedAgentUpdate(
-      agent(),
-      persona({ respondTo: "anyone", respondToAllowlist: [] }),
+      agent({ respondTo: "anyone" }),
+      persona({ respondTo: "owner-only" }),
     ),
     {
       pubkey: "deadbeef".repeat(8),
@@ -104,10 +107,30 @@ test("personaManagedAgentUpdate syncs respondTo gate to linked agent", () => {
       systemPrompt: "New prompt",
       model: "new-model",
       envVars: { NEW_KEY: "2" },
-      respondTo: "anyone",
+      respondTo: "owner-only",
+    },
+  );
+
+  assert.deepEqual(
+    personaManagedAgentUpdate(
+      agent({ respondTo: "anyone" }),
+      persona({
+        respondTo: "allowlist",
+        respondToAllowlist: ["a".repeat(64)],
+      }),
+    ),
+    {
+      pubkey: "deadbeef".repeat(8),
+      name: "Fizz Prime",
+      systemPrompt: "New prompt",
+      model: "new-model",
+      envVars: { NEW_KEY: "2" },
+      respondTo: "allowlist",
+      respondToAllowlist: ["a".repeat(64)],
     },
   );
 });
+
 
 test("personaManagedAgentUpdate prompt-only save leaves unset respondTo alone", () => {
   // Instance already anyone; persona gate unset. A prompt tweak must not
@@ -125,27 +148,6 @@ test("personaManagedAgentUpdate prompt-only save leaves unset respondTo alone", 
     {
       pubkey: "deadbeef".repeat(8),
       systemPrompt: "New prompt",
-    },
-  );
-});
-
-test("personaManagedAgentUpdate syncs allowlist when mode is allowlist", () => {
-  const allow = "a".repeat(64);
-  assert.deepEqual(
-    personaManagedAgentUpdate(
-      agent({ respondTo: "allowlist", respondToAllowlist: [] }),
-      persona({
-        displayName: "Fizz",
-        systemPrompt: "Old prompt",
-        model: "old-model",
-        envVars: { OLD_KEY: "1" },
-        respondTo: "allowlist",
-        respondToAllowlist: [allow],
-      }),
-    ),
-    {
-      pubkey: "deadbeef".repeat(8),
-      respondToAllowlist: [allow],
     },
   );
 });
@@ -246,4 +248,20 @@ test("profilePanelTabFromSearch falls back to info for invalid values", () => {
   assert.equal(parseProfilePanelTab("missing"), null);
   assert.equal(profilePanelTabFromSearch("missing"), "info");
   assert.equal(profilePanelTabFromSearch(null), "info");
+});
+
+test("profile target identity stays stable while a requested pubkey is canonicalized", () => {
+  const historicalPubkey = "a".repeat(64);
+  assert.equal(
+    profilePanelTargetKey(historicalPubkey, undefined),
+    historicalPubkey,
+  );
+  assert.equal(
+    profilePanelTargetKey(historicalPubkey, "resolved-persona"),
+    historicalPubkey,
+  );
+  assert.equal(
+    profilePanelTargetKey(undefined, "requested-persona"),
+    "persona:requested-persona",
+  );
 });
