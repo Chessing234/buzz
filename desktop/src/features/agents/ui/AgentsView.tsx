@@ -8,7 +8,7 @@ import { AddAgentToChannelDialog } from "./AddAgentToChannelDialog";
 import { AddTeamToChannelDialog } from "./AddTeamToChannelDialog";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentDialog } from "./AgentDialog";
-import { PersonaCatalogDialog } from "./PersonaCatalogDialog";
+import { CommunityCatalogDialog } from "./CommunityCatalogDialog";
 import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
 import { PersonaShareDialog } from "./PersonaShareDialog";
 import { AgentSnapshotExportDialog } from "./AgentSnapshotExportDialog";
@@ -16,7 +16,6 @@ import { AgentSnapshotImportDialog } from "./AgentSnapshotImportDialog";
 import { TeamSnapshotExportDialog } from "./TeamSnapshotExportDialog";
 import { TeamSnapshotImportDialog } from "./TeamSnapshotImportDialog";
 import { TeamShareDialog } from "./TeamShareDialog";
-import { SecretRevealDialog } from "./SecretRevealDialog";
 import { TeamDeleteDialog } from "./TeamDeleteDialog";
 import { TeamDialog } from "./TeamDialog";
 import { TeamsSection } from "./TeamsSection";
@@ -52,14 +51,6 @@ export function AgentsView() {
   const fullAiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const compactActionsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
-  // Exclusivity: create never sets `personaDialogState` (edit/dup/import do),
-  // so the create-mode and definition-edit AgentDialog mounts never coexist.
-  const [isCreateDialogOpen, setIsCreateDialogOpen] = React.useState(false);
-
-  function openUnifiedCreate() {
-    personas.prepareCreate();
-    setIsCreateDialogOpen(true);
-  }
 
   function openAiDefaults(trigger: HTMLButtonElement | null) {
     aiDefaultsTriggerRef.current = trigger;
@@ -86,6 +77,21 @@ export function AgentsView() {
       refetchRelayAgents: agents.refetchRelayAgents,
     },
   );
+
+  // Parent-owned unified catalog state per Thufir's corrective:
+  // - discriminated launch target so both sections refetch on open
+  // - one close owner via this boolean
+  const [catalogLaunchTarget, setCatalogLaunchTarget] = React.useState<
+    "agents" | "teams" | null
+  >(null);
+
+  function openCommunityCatalog(target: "agents" | "teams") {
+    personas.clearFeedback("catalog");
+    personas.prepareCreate();
+    void personas.catalogQuery.refetch();
+    void teamActions.catalogQuery.refetch();
+    setCatalogLaunchTarget(target);
+  }
 
   const isActionPending =
     agents.isPending ||
@@ -246,6 +252,7 @@ export function AgentsView() {
               isActionPending={isActionPending}
               isAgentsLoading={agents.managedAgentsQuery.isLoading}
               startingAgentPubkey={agents.startingAgentPubkey}
+              restartingAgentPubkey={agents.restartingAgentPubkey}
               startingPersonaIds={agents.startingPersonaIds}
               onOpenAgentProfile={(pubkey, options) => {
                 openProfilePanel?.(pubkey, options);
@@ -255,6 +262,9 @@ export function AgentsView() {
               }}
               onStartAgent={(pubkey) => {
                 void agents.handleStart(pubkey);
+              }}
+              onRestartAgent={(pubkey) => {
+                void agents.handleRestart(pubkey);
               }}
               onStartPersona={(persona) => {
                 void agents.handleStartPersona(persona);
@@ -278,8 +288,7 @@ export function AgentsView() {
               }
               isPersonasLoading={personas.personasQuery.isLoading}
               isPersonasPending={personas.isPending}
-              onCreatePersona={openUnifiedCreate}
-              onDiscoverPersonas={personas.openCatalog}
+              onOpenCatalog={() => openCommunityCatalog("agents")}
               onDuplicatePersona={personas.openDuplicate}
               onEditPersona={personas.openEdit}
               onSharePersona={personas.openShare}
@@ -287,9 +296,6 @@ export function AgentsView() {
                 void personas.handleSetActive(persona, false, "library");
               }}
               onDeletePersona={handleDeletePersonaFromLibrary}
-              onImportSnapshotFile={(fileBytes, fileName) => {
-                void personas.handleImportSnapshotFile(fileBytes, fileName);
-              }}
             />
 
             <TeamsSection
@@ -309,6 +315,7 @@ export function AgentsView() {
               onDuplicate={teamActions.openDuplicateDialog}
               onEdit={teamActions.openEditDialog}
               onAddToChannel={teamActions.setTeamToAddToChannel}
+              onDiscover={() => openCommunityCatalog("teams")}
               onShare={teamActions.openShare}
               onImport={() => {
                 teamImportInputRef.current?.click();
@@ -326,23 +333,6 @@ export function AgentsView() {
         returnFocusRef={aiDefaultsTriggerRef}
       />
 
-      {isCreateDialogOpen ? (
-        <AgentDialog
-          definitionError={
-            personas.createPersonaMutation.error instanceof Error
-              ? personas.createPersonaMutation.error
-              : null
-          }
-          isDefinitionPending={personas.isPending}
-          mode="definition"
-          onOpenChange={(open) => {
-            if (!open) setIsCreateDialogOpen(false);
-          }}
-          onSubmitDefinition={personas.handleSubmit}
-          runtimes={personas.acpRuntimesQuery.data ?? []}
-          runtimesLoading={personas.acpRuntimesQuery.isLoading}
-        />
-      ) : null}
       {agents.agentToAddToChannel ? (
         <AddAgentToChannelDialog
           agent={agents.agentToAddToChannel}
@@ -353,24 +343,6 @@ export function AgentsView() {
             }
           }}
           open={agents.agentToAddToChannel !== null}
-        />
-      ) : null}
-      {agents.createdAgent ? (
-        <SecretRevealDialog
-          created={agents.createdAgent}
-          onOpenChange={(open) => {
-            if (!open) {
-              agents.setCreatedAgent(null);
-            }
-          }}
-        />
-      ) : null}
-      {personas.createdAgent ? (
-        <SecretRevealDialog
-          created={personas.createdAgent}
-          onOpenChange={(open) => {
-            if (!open) personas.dismissCreatedAgent();
-          }}
         />
       ) : null}
       {personas.personaDialogState ? (
@@ -389,7 +361,13 @@ export function AgentsView() {
           isPending={personas.isPending}
           mode="definition-edit"
           runtimes={personas.acpRuntimesQuery.data ?? []}
-          runtimesLoading={personas.acpRuntimesQuery.isLoading}
+          runtimeCatalogStatus={
+            personas.acpRuntimesQuery.isLoading
+              ? "loading"
+              : personas.acpRuntimesQuery.isError
+                ? "error"
+                : "ready"
+          }
           onOpenChange={(open) => {
             if (!open) {
               personas.setPersonaDialogState(null);
@@ -506,13 +484,43 @@ export function AgentsView() {
           }}
         />
       ) : null}
-      {personas.isCatalogDialogOpen ? (
-        <PersonaCatalogDialog
-          error={
+      {catalogLaunchTarget !== null ? (
+        <CommunityCatalogDialog
+          createContent={({ onDirtyChange, onRequestClose }) => (
+            <AgentDialog
+              definitionError={
+                personas.createPersonaMutation.error instanceof Error
+                  ? personas.createPersonaMutation.error
+                  : null
+              }
+              embedded
+              isDefinitionPending={personas.isPending}
+              mode="definition"
+              onDirtyChange={onDirtyChange}
+              onOpenChange={(open) => {
+                if (!open) onRequestClose();
+              }}
+              onSubmitDefinition={personas.handleSubmit}
+              runtimes={personas.acpRuntimesQuery.data ?? []}
+              runtimeCatalogStatus={
+                personas.acpRuntimesQuery.isLoading
+                  ? "loading"
+                  : personas.acpRuntimesQuery.isError
+                    ? "error"
+                    : "ready"
+              }
+              submitLabel="Add agent"
+            />
+          )}
+          // Persona side
+          personas={personas.catalogPersonas}
+          personasError={
             personas.catalogQuery.error instanceof Error
               ? personas.catalogQuery.error
               : null
           }
+          personasLoading={personas.catalogQuery.isLoading}
+          personasPending={personas.isPending}
           feedbackErrorMessage={
             personas.personaFeedbackSurface === "catalog"
               ? personas.personaErrorMessage
@@ -523,17 +531,43 @@ export function AgentsView() {
               ? personas.personaNoticeMessage
               : null
           }
-          isLoading={personas.catalogQuery.isLoading}
-          isPending={personas.isPending}
           onClearFeedback={() => {
             personas.clearFeedback("catalog");
           }}
-          onOpenChange={personas.setIsCatalogDialogOpen}
-          onSelectPersona={(persona, active) => {
-            void personas.handleSetActive(persona, active, "catalog");
+          onImportFile={(fileBytes, fileName) => {
+            void personas.handleImportSnapshotFile(fileBytes, fileName);
           }}
-          open={personas.isCatalogDialogOpen}
-          personas={personas.catalogPersonas}
+          onSelectPersona={async (persona, active) => {
+            const addedPersona = await personas.handleSetActive(
+              persona,
+              active,
+              "catalog",
+            );
+            if (!active || !addedPersona) return;
+
+            setCatalogLaunchTarget(null);
+            openPersonaProfilePanel?.(addedPersona);
+          }}
+          // Team side
+          teams={teamActions.catalogTeams}
+          teamsError={
+            teamActions.catalogQuery.error instanceof Error
+              ? teamActions.catalogQuery.error
+              : null
+          }
+          teamsLoading={teamActions.catalogQuery.isLoading}
+          teamsAdding={teamActions.isAddingFromCatalog}
+          onAddTeam={(team) => {
+            void teamActions.handleAddTeamFromCatalog(team, () =>
+              setCatalogLaunchTarget(null),
+            );
+          }}
+          // Dialog
+          open={catalogLaunchTarget !== null}
+          preferSection={catalogLaunchTarget}
+          onOpenChange={(open) => {
+            if (!open) setCatalogLaunchTarget(null);
+          }}
         />
       ) : null}
       {teamActions.teamDialogState ? (
@@ -593,11 +627,23 @@ export function AgentsView() {
       ) : null}
       {teamActions.teamToShare ? (
         <TeamShareDialog
+          catalogShareLevel={teamActions.getTeamCatalogShareLevel(
+            teamActions.teamToShare,
+          )}
           isPending={
             teamActions.createTeamMutation.isPending ||
             teamActions.updateTeamMutation.isPending ||
-            teamActions.deleteTeamMutation.isPending
+            teamActions.deleteTeamMutation.isPending ||
+            teamActions.isCatalogSharePending
           }
+          onCatalogShareLevelChange={(shareLevel) => {
+            if (teamActions.teamToShare) {
+              void teamActions.setTeamCatalogShareLevel(
+                teamActions.teamToShare,
+                shareLevel,
+              );
+            }
+          }}
           onExport={() => {
             if (teamActions.teamToShare) {
               const team = teamActions.teamToShare;
