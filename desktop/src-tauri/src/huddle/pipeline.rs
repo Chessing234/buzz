@@ -3,9 +3,12 @@
 //! Handles starting, hot-starting, and spawning transcription tasks for
 //! the voice pipelines. Extracted from mod.rs to keep the command layer thin.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use nostr::JsonUtil;
@@ -17,7 +20,7 @@ use crate::events;
 
 use super::models;
 use super::relay_api::{self, fetch_channel_members, parse_channel_uuid};
-use super::state::{HuddlePhase, VoiceInputMode};
+use super::state::{HuddlePhase, HuddleState, VoiceInputMode};
 use super::stt;
 use super::tts;
 
@@ -52,7 +55,7 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
         let mut hs = state.huddle()?;
         if let Some(ref p) = hs.stt_pipeline {
             if p.is_finished() {
-                hs.stt_pipeline = None;
+                hs.take_stt_pipeline();
             }
         }
         if let Some(ref p) = hs.tts_pipeline {
@@ -79,7 +82,7 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
         .map(|m| m.take_tts_ready())
         .unwrap_or(false);
 
-    // Start TTS first (so STT can capture tts_cancel).
+    // Start TTS first so STT can observe its active-playback gate.
     if !has_tts && (tts_ready || models::is_tts_ready()) {
         if let Err(e) = maybe_start_tts_pipeline(&state).await {
             eprintln!("buzz-desktop: TTS hotstart failed: {e}");
@@ -127,24 +130,44 @@ pub async fn check_pipeline_hotstart(state: State<'_, AppState>) -> Result<(), S
                 .await
                 .ok();
             let fresh_members = fetch_channel_members(eph_id, None, &state).await.ok();
-            let transcription_auto_enabled = if fresh_agents.is_some() || fresh_members.is_some() {
-                let mut hs = state.huddle()?;
-                if !hs.is_current_huddle(eph_id, huddle_generation) {
-                    return Ok(());
-                }
-                if let Some(agents) = fresh_agents {
-                    *hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner()) = agents;
-                }
-                if let Some(members) = fresh_members {
-                    hs.participants = members;
-                }
-                hs.last_agent_refresh = Some(std::time::Instant::now());
-                hs.maybe_auto_enable_transcription_for_agents()
-            } else {
-                false
-            };
+            let (roster_changed, transcription_auto_enabled) =
+                if fresh_agents.is_some() || fresh_members.is_some() {
+                    let mut hs = state.huddle()?;
+                    if !hs.is_current_huddle(eph_id, huddle_generation) {
+                        return Ok(());
+                    }
+                    let mut roster_changed = false;
+                    if let Some(agents) = fresh_agents {
+                        let mut current_agents =
+                            hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner());
+                        if *current_agents != agents {
+                            *current_agents = agents;
+                            roster_changed = true;
+                        }
+                    }
+                    if let Some(members) = fresh_members {
+                        if hs.participants != members {
+                            hs.participants = members;
+                            roster_changed = true;
+                        }
+                    }
+                    hs.last_agent_refresh = Some(std::time::Instant::now());
+                    (
+                        roster_changed,
+                        hs.maybe_auto_enable_transcription_for_agents(),
+                    )
+                } else {
+                    (false, false)
+                };
             if transcription_auto_enabled {
                 start_auto_enabled_transcription(&state, eph_id).await;
+            }
+            // Audio authentication auto-adds a joining human to the ephemeral
+            // channel. Emit whenever that authoritative roster changes so the
+            // desktop participant strip updates immediately instead of waiting
+            // for its slow fallback IPC read.
+            if roster_changed || transcription_auto_enabled {
+                state.emit_huddle_state_changed();
             }
         }
     }
@@ -170,23 +193,32 @@ pub(crate) async fn post_connect_setup(
         fetch_channel_members(ephemeral_channel_id, Some("bot"), state),
         fetch_channel_members(ephemeral_channel_id, None, state),
     );
-    let transcription_auto_enabled = {
+    let (roster_changed, transcription_auto_enabled) = {
         let mut hs = state.huddle()?;
         if !hs.is_current_huddle(ephemeral_channel_id, huddle_generation) {
             return Ok(PostConnectOutcome::Stale);
         }
+        let mut roster_changed = false;
         if let Ok(agents) = agents_result {
-            *hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner()) = agents;
-        }
-        if let Ok(all_members) = all_members_result {
-            if !all_members.is_empty() {
-                hs.participants = all_members;
+            let mut current_agents = hs.agent_pubkeys.lock().unwrap_or_else(|e| e.into_inner());
+            if *current_agents != agents {
+                *current_agents = agents;
+                roster_changed = true;
             }
         }
-        hs.maybe_auto_enable_transcription_for_agents()
+        if let Ok(all_members) = all_members_result {
+            if !all_members.is_empty() && hs.participants != all_members {
+                hs.participants = all_members;
+                roster_changed = true;
+            }
+        }
+        (
+            roster_changed,
+            hs.maybe_auto_enable_transcription_for_agents(),
+        )
     };
 
-    if transcription_auto_enabled {
+    if roster_changed || transcription_auto_enabled {
         state.emit_huddle_state_changed();
     }
 
@@ -245,10 +277,6 @@ pub(crate) async fn post_connect_setup(
 ///
 /// Returns `Ok(true)` if the pipeline was started, `Ok(false)` if models are
 /// not ready (voice-only mode), or `Err` on a real failure.
-///
-/// Creates the shared `tts_active` flag and passes it to the STT pipeline
-/// for barge-in / echo gating. The same flag is later passed to the TTS
-/// pipeline so it can signal when audio is playing.
 pub(crate) async fn maybe_start_stt_pipeline(
     state: &AppState,
     ephemeral_channel_id: &str,
@@ -277,13 +305,14 @@ pub(crate) async fn maybe_start_stt_pipeline(
     // Take the old pipeline OUT of the lock before dropping — Drop joins
     // the worker thread (~200ms) and must not block under the mutex.
     let (
-        tts_active,
-        tts_cancel,
         agent_pubkeys_arc,
         session_gen,
         expected_generation,
         stt_starting,
         ptt_active_for_stt,
+        manual_mic_unmuted_for_stt,
+        human_floor,
+        output_device,
         old_stt,
     ) = {
         let mut hs = state.huddle()?;
@@ -298,7 +327,7 @@ pub(crate) async fn maybe_start_stt_pipeline(
         if hs.stt_pipeline.is_some() {
             hs.session_generation.fetch_add(1, Ordering::Release);
         }
-        let old = hs.stt_pipeline.take();
+        let old = hs.take_stt_pipeline();
         if let Some(ref p) = old {
             p.shutdown();
         }
@@ -307,14 +336,25 @@ pub(crate) async fn maybe_start_stt_pipeline(
         } else {
             None
         };
+        let manual_mic_unmuted = if hs.voice_input_mode == VoiceInputMode::PushToTalk {
+            Some(Arc::clone(&hs.manual_mic_unmuted))
+        } else {
+            None
+        };
         (
-            Arc::clone(&hs.tts_active),
-            Some(Arc::clone(&hs.tts_cancel)),
             Arc::clone(&hs.agent_pubkeys),
             Arc::clone(&hs.session_generation),
             hs.session_generation.load(Ordering::Acquire),
             stt_starting,
             ptt,
+            manual_mic_unmuted,
+            hs.human_floor.clone(),
+            state
+                .huddle_audio
+                .output_device
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             old,
         )
     };
@@ -322,7 +362,13 @@ pub(crate) async fn maybe_start_stt_pipeline(
     drop(old_stt);
 
     let constructed = tokio::task::spawn_blocking(move || {
-        stt::SttPipeline::new(model_dir, tts_active, tts_cancel, ptt_active_for_stt)
+        stt::SttPipeline::new(
+            model_dir,
+            ptt_active_for_stt,
+            manual_mic_unmuted_for_stt,
+            human_floor,
+            output_device,
+        )
     })
     .await;
     let (pipeline, text_rx) = match constructed {
@@ -351,7 +397,7 @@ pub(crate) async fn maybe_start_stt_pipeline(
         {
             return Ok(false);
         }
-        hs.stt_pipeline = Some(Arc::clone(&pipeline));
+        hs.set_stt_pipeline(Arc::clone(&pipeline));
     }
 
     spawn_transcription_task(text_rx, channel_uuid, agent_pubkeys_arc, session_gen, state);
@@ -389,10 +435,44 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         None => return Ok(false),
     };
 
+    // Avoid resolving and hashing imported voice files on every hot-start poll
+    // when TTS is already disabled or running. The guarded claim below repeats
+    // these checks after the fallible work to close the race.
+    {
+        let huddle = state.huddle()?;
+        if huddle.tts_pipeline.is_some() || !huddle.tts_enabled {
+            return Ok(false);
+        }
+    }
+
+    // Resolve all fallible construction inputs before claiming the sentinel so
+    // an unreadable optional voice registry cannot wedge future start attempts.
+    let output_device = state
+        .huddle_audio
+        .output_device
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let app = state
+        .app_handle
+        .lock()
+        .map_err(|error| format!("app handle lock poisoned: {error}"))?
+        .clone();
+    let voice_preferences = state
+        .huddle_audio
+        .tts
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+        .map(|settings| settings.voice_preferences.clone())?;
+    let initial_voice = match app.as_ref() {
+        Some(app) => super::tts_settings::pocket_voice_reference(app, &voice_preferences)?,
+        None => super::tts_settings::bundled_pocket_voice_reference(&voice_preferences),
+    };
+
     // Atomically check preconditions and claim the construction slot.
     // The sentinel prevents a second caller from starting construction
     // while we're building outside the lock.
-    let (tts_active, tts_cancel) = {
+    let (tts_active, tts_cancel, human_floor, tts_starting) = {
         let hs = state.huddle()?;
         if hs.tts_pipeline.is_some() {
             return Ok(false);
@@ -403,18 +483,28 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         if hs.tts_starting.swap(true, Ordering::AcqRel) {
             return Ok(false); // Another caller is already constructing.
         }
-        (Arc::clone(&hs.tts_active), Arc::clone(&hs.tts_cancel))
+        (
+            Arc::clone(&hs.tts_active),
+            Arc::clone(&hs.tts_cancel),
+            hs.human_floor.clone(),
+            Arc::clone(&hs.tts_starting),
+        )
     };
+    let _starting_guard = TtsStartingGuard(tts_starting);
 
     // Construct outside the lock — this spawns the TTS worker thread and
     // loads ONNX sessions (~200ms). If this fails, clear the sentinel.
-    let output_device = state
-        .audio_output_device
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let constructed_voice = initial_voice.clone();
     let constructed = tokio::task::spawn_blocking(move || {
-        tts::TtsPipeline::new(model_dir, tts_active, tts_cancel, output_device)
+        tts::TtsPipeline::new_with_voice(
+            model_dir,
+            tts_active,
+            tts_cancel,
+            human_floor,
+            &initial_voice,
+            output_device,
+            app,
+        )
     })
     .await;
     let pipeline = match constructed {
@@ -431,21 +521,85 @@ pub(crate) async fn maybe_start_tts_pipeline(state: &AppState) -> Result<bool, S
         }
     };
 
-    {
-        let mut hs = state.huddle()?;
-        hs.tts_starting.store(false, Ordering::Release);
-        // Phase check: huddle may have been torn down during construction.
-        if !matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active) {
-            return Ok(false);
+    finalize_tts_pipeline_start(state, move |voice, huddle| {
+        if should_reselect_constructed_voice(&constructed_voice, voice) {
+            pipeline.select_voice_before_publish(voice);
         }
-        // Final check: another path may have created a pipeline while we were constructing.
-        if hs.tts_pipeline.is_some() {
-            return Ok(false);
-        }
-        hs.tts_pipeline = Some(pipeline);
-    }
+        huddle.tts_pipeline = Some(pipeline);
+    })
+}
 
+/// Wait for a concurrent TTS constructor to publish or fail.
+///
+/// `maybe_start_tts_pipeline` deliberately lets only one caller construct the
+/// engine. A live message that loses that race must wait for the owner instead
+/// of observing the temporary empty slot and being dropped.
+pub(crate) async fn await_inflight_tts_start(state: &AppState) -> Result<(), String> {
+    let starting = {
+        let huddle = state.huddle()?;
+        Arc::clone(&huddle.tts_starting)
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while starting.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| "TTS pipeline startup did not finish before timeout".to_string())?;
+    // The owner clears the sentinel while holding the huddle lock, before it
+    // publishes. Reacquiring that lock ensures publication is visible before
+    // the losing caller looks up the sender.
+    drop(state.huddle()?);
+    Ok(())
+}
+
+struct TtsStartingGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for TtsStartingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Publish a constructed TTS pipeline against the latest settings.
+///
+/// Construction happens outside locks and can overlap a voice change or OFF
+/// transition. Holding the huddle lock while re-reading settings gives either
+/// transition a safe ordering: it updates the installed pipeline afterward,
+/// or this finalizer observes the new setting before publishing.
+fn finalize_tts_pipeline_start(
+    state: &AppState,
+    publish: impl FnOnce(&str, &mut HuddleState),
+) -> Result<bool, String> {
+    let mut huddle = state.huddle()?;
+    huddle.tts_starting.store(false, Ordering::Release);
+    if !huddle.tts_enabled
+        || !matches!(huddle.phase, HuddlePhase::Connected | HuddlePhase::Active)
+        || huddle.tts_pipeline.is_some()
+    {
+        return Ok(false);
+    }
+    let app = state
+        .app_handle
+        .lock()
+        .map_err(|error| format!("app handle lock poisoned: {error}"))?
+        .clone();
+    let preferences = state
+        .huddle_audio
+        .tts
+        .lock()
+        .map_err(|error| format!("text-to-speech settings lock poisoned: {error}"))
+        .map(|settings| settings.voice_preferences.clone())?;
+    let voice = match app {
+        Some(app) => super::tts_settings::pocket_voice_reference(&app, &preferences)?,
+        None => super::tts_settings::bundled_pocket_voice_reference(&preferences),
+    };
+    publish(&voice, &mut huddle);
     Ok(true)
+}
+
+fn should_reselect_constructed_voice(constructed_voice: &str, latest_voice: &str) -> bool {
+    constructed_voice != latest_voice
 }
 
 /// Sign an STT transcript event and produce the guarded POST body.
@@ -511,14 +665,24 @@ pub(crate) fn spawn_transcription_task(
                 .clone();
 
             let p_tags: Vec<&str> = agent_pubkeys.iter().map(|s| s.as_str()).collect();
-            let builder =
-                match events::build_message(channel_uuid, &t, None, &p_tags, &[], &[], &[]) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("buzz-desktop: STT build_message: {e}");
-                        continue;
-                    }
-                };
+            let builder = match events::build_message(
+                channel_uuid,
+                &t,
+                None,
+                &p_tags,
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                &crate::relay::relay_api_base_url(),
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("buzz-desktop: STT build_message: {e}");
+                    continue;
+                }
+            };
             // Wait before signing: the relay enforces NIP-98 freshness (±60s)
             // and the gate may hold for up to MAX_HINT_SECONDS (300s). Sign
             // the kind event and build NIP-98 auth after the wait so both
@@ -569,4 +733,149 @@ pub(crate) fn spawn_transcription_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tts_start_race_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier, Mutex,
+    };
+    use std::time::Duration;
+
+    use crate::app_state::build_app_state;
+
+    use super::{
+        await_inflight_tts_start, finalize_tts_pipeline_start, should_reselect_constructed_voice,
+        HuddlePhase,
+    };
+
+    #[tokio::test]
+    async fn a_losing_starter_observes_publication_before_resuming() {
+        let state = Arc::new(build_app_state());
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.phase = HuddlePhase::Active;
+            huddle.tts_enabled = true;
+            huddle.tts_starting.store(true, Ordering::Release);
+        }
+        let published = Arc::new(AtomicBool::new(false));
+        let owner_state = Arc::clone(&state);
+        let owner_published = Arc::clone(&published);
+        let owner = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            finalize_tts_pipeline_start(&owner_state, |_, _| {
+                owner_published.store(true, Ordering::Release);
+            })
+        });
+
+        await_inflight_tts_start(&state)
+            .await
+            .expect("wait for pipeline owner");
+        assert!(published.load(Ordering::Acquire));
+        assert!(owner.join().expect("pipeline owner").expect("finalize"));
+    }
+
+    #[test]
+    fn constructor_fallback_survives_unchanged_preference_at_publication() {
+        let selected_voice = Mutex::new(super::super::pocket::DEFAULT_VOICE.to_string());
+        let constructed_voice = "eve";
+        let latest_voice = "eve";
+
+        if should_reselect_constructed_voice(constructed_voice, latest_voice) {
+            *selected_voice.lock().expect("selected voice") = latest_voice.to_string();
+        }
+
+        assert_eq!(
+            selected_voice.lock().expect("selected voice").as_str(),
+            super::super::pocket::DEFAULT_VOICE
+        );
+    }
+
+    #[test]
+    fn construction_reconciles_a_voice_selected_while_starting() {
+        let state = Arc::new(build_app_state());
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.phase = HuddlePhase::Active;
+            huddle.tts_enabled = true;
+            huddle.tts_starting.store(true, Ordering::Release);
+        }
+
+        let constructed = Arc::new(Barrier::new(2));
+        let publish = Arc::new(Barrier::new(2));
+        let selected_voice = Arc::new(Mutex::new(None));
+        let worker_state = Arc::clone(&state);
+        let worker_constructed = Arc::clone(&constructed);
+        let worker_publish = Arc::clone(&publish);
+        let worker_voice = Arc::clone(&selected_voice);
+        let worker = std::thread::spawn(move || {
+            worker_constructed.wait();
+            worker_publish.wait();
+            finalize_tts_pipeline_start(&worker_state, |voice, _| {
+                *worker_voice.lock().expect("selected voice") = Some(voice.to_string());
+            })
+        });
+
+        constructed.wait();
+        assert!(state
+            .huddle()
+            .expect("huddle state")
+            .tts_starting
+            .load(Ordering::Acquire));
+        state
+            .huddle_audio
+            .tts
+            .lock()
+            .expect("text-to-speech settings")
+            .voice_preferences = vec!["pocket:eve".to_string()];
+        publish.wait();
+
+        assert!(worker.join().expect("starter thread").expect("finalize"));
+        assert_eq!(
+            *selected_voice.lock().expect("selected voice"),
+            Some("eve".to_string())
+        );
+    }
+
+    #[test]
+    fn construction_is_discarded_when_disabled_while_starting() {
+        let state = Arc::new(build_app_state());
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.phase = HuddlePhase::Active;
+            huddle.tts_enabled = true;
+            huddle.tts_starting.store(true, Ordering::Release);
+        }
+
+        let constructed = Arc::new(Barrier::new(2));
+        let publish = Arc::new(Barrier::new(2));
+        let did_publish = Arc::new(Mutex::new(false));
+        let worker_state = Arc::clone(&state);
+        let worker_constructed = Arc::clone(&constructed);
+        let worker_publish = Arc::clone(&publish);
+        let worker_did_publish = Arc::clone(&did_publish);
+        let worker = std::thread::spawn(move || {
+            worker_constructed.wait();
+            worker_publish.wait();
+            finalize_tts_pipeline_start(&worker_state, |_, _| {
+                *worker_did_publish.lock().expect("publish flag") = true;
+            })
+        });
+
+        constructed.wait();
+        {
+            let mut huddle = state.huddle().expect("huddle state");
+            huddle.tts_enabled = false;
+        }
+        publish.wait();
+
+        assert!(!worker.join().expect("starter thread").expect("finalize"));
+        assert!(!*did_publish.lock().expect("publish flag"));
+        assert!(!state
+            .huddle()
+            .expect("huddle state")
+            .tts_starting
+            .load(Ordering::Acquire));
+    }
 }
