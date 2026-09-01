@@ -1,3 +1,5 @@
+import type { ProjectRepoUnavailableReason } from "./projectRepoAvailability";
+
 export type ProjectGitErrorPresentation = {
   title: string;
   description: string;
@@ -35,9 +37,18 @@ function isBuzzRelayUrl(cloneUrl: string | null | undefined) {
 export function projectCloneErrorPresentation(
   error: unknown,
   cloneUrl?: string | null,
+  unavailableReason?: ProjectRepoUnavailableReason,
 ): ProjectGitErrorPresentation {
   const message = errorText(error);
   const github = isGitHubUrl(cloneUrl);
+
+  if (unavailableReason === "access") {
+    return {
+      title: "Repository access restricted",
+      description:
+        "You need access to the repository’s channel before you can clone it.",
+    };
+  }
 
   // Buzz runs git with `credential.helper` cleared, `GIT_CONFIG_GLOBAL`
   // pointed at /dev/null and `GIT_TERMINAL_PROMPT=0` (`project_git_exec.rs`)
