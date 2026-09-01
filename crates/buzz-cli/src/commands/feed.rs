@@ -14,6 +14,27 @@ const FEED_LIMITS: ReadLimits = ReadLimits {
     paging: Paging::SinceOnly,
 };
 
+fn format_events(normalized: &str, format: &crate::OutputFormat) -> String {
+    match format {
+        crate::OutputFormat::Compact => {
+            let events: Vec<serde_json::Value> =
+                serde_json::from_str(normalized).unwrap_or_default();
+            let compact: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "id": e.get("id").cloned().unwrap_or_default(),
+                        "content": e.get("content").cloned().unwrap_or_default(),
+                        "created_at": e.get("created_at").cloned().unwrap_or_default(),
+                    })
+                })
+                .collect();
+            serde_json::to_string(&compact).unwrap_or_default()
+        }
+        crate::OutputFormat::Json => normalized.to_string(),
+    }
+}
+
 /// Get activity feed — query events mentioning our pubkey (via p-tag).
 pub async fn cmd_get_feed(
     client: &BuzzClient,
@@ -51,25 +72,7 @@ pub async fn cmd_get_feed(
     let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
     events.sort_by_key(|e| Reverse(e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0)));
     let normalized = normalize_events(&events);
-    let output = match format {
-        crate::OutputFormat::Compact => {
-            let evts: Vec<serde_json::Value> =
-                serde_json::from_str(&normalized).unwrap_or_default();
-            let compact: Vec<serde_json::Value> = evts
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "id": e.get("id").cloned().unwrap_or_default(),
-                        "content": e.get("content").cloned().unwrap_or_default(),
-                        "created_at": e.get("created_at").cloned().unwrap_or_default(),
-                    })
-                })
-                .collect();
-            serde_json::to_string(&compact).unwrap_or_default()
-        }
-        crate::OutputFormat::Json => normalized,
-    };
-    println!("{output}");
+    println!("{}", format_events(&normalized, format));
     if let Some(notice) = truncation_notice(events.len(), requested_limit, FEED_LIMITS) {
         eprintln!("{notice}");
     }
@@ -88,5 +91,37 @@ pub async fn dispatch(
             limit,
             types,
         } => cmd_get_feed(client, since, limit, types.as_deref(), format).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_events;
+
+    #[test]
+    fn compact_event_format_remains_the_three_key_contract() {
+        let normalized = serde_json::json!([{
+            "id": "a".repeat(64),
+            "pubkey": "b".repeat(64),
+            "kind": 9,
+            "content": "compact content",
+            "created_at": 1_787_754_972_u64,
+            "tags": [["p", "c".repeat(64)]],
+            "sig": "d".repeat(128),
+        }])
+        .to_string();
+
+        let output: Vec<serde_json::Value> =
+            serde_json::from_str(&format_events(&normalized, &crate::OutputFormat::Compact))
+                .unwrap();
+
+        assert_eq!(
+            output[0],
+            serde_json::json!({
+                "id": "a".repeat(64),
+                "content": "compact content",
+                "created_at": 1_787_754_972_u64,
+            })
+        );
     }
 }
