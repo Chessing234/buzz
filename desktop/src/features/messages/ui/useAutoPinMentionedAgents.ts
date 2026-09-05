@@ -196,11 +196,19 @@ export function useAutoPinMentionedAgents({
     [promoteAgents],
   );
   const promoteExplicitlyAddressedAgents = React.useCallback(
-    (promotion: { expectedRevision?: number; pubkeys: readonly string[] }) => {
-      // With "Automatically mention agents" off, an explicit @mention is
-      // one-shot: do not pin into the persistent audience or flip the
-      // preference on (that was leaving the next composer auto-selected).
-      if (!shouldPromoteExplicitAddress(enabled)) return;
+    (promotion: {
+      expectedRevision?: number;
+      persist?: boolean;
+      pubkeys: readonly string[];
+    }) => {
+      // Ordinary @mentions stay one-shot when auto-mention is off. An intentional
+      // "Always address" / pin action passes persist:true and must still opt in.
+      if (
+        !promotion.persist &&
+        !shouldPromoteExplicitAddress(enabled)
+      ) {
+        return;
+      }
       promoteAgents({
         ...promotion,
         reinstateExcluded: true,
