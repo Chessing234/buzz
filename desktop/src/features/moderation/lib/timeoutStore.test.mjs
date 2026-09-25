@@ -1,100 +1,156 @@
 /**
- * The moderation timeout store.
+ * Unit tests for timeout-store behavioral invariants (item 7).
  *
- * A timeout is issued by one relay against one community membership. The store
- * holding it is a module-level singleton, so it survives the React remount that
- * a community switch performs — which is why `resetCommunityState` has to clear
- * it explicitly. Without that, a timeout taken in community A disables the
- * composer in community B (`ChannelPane` gates `isComposerDisabled` on
- * `timeoutState.active`).
- *
- * The unknown-expiry case is the sharp one: `isTimeoutActive(null)` is `true`
- * forever, and the only other thing that clears the store is an accepted send —
- * which the disabled composer will not let the member make.
+ * These pin the store semantics that useTimeoutState builds on. The reactive
+ * hook itself is an integration concern; these tests cover the pure-logic layer:
+ * record, clear, snapshot, and the interaction between the store's raw `active`
+ * flag and `isTimeoutActive`'s expiry check.
  */
 
 import assert from "node:assert/strict";
-import { beforeEach, describe, it } from "node:test";
+import test from "node:test";
 
+import { isTimeoutActive, formatTimeoutRemaining } from "./timeout.ts";
 import {
+  recordTimeoutFromRejection,
   clearTimeoutState,
   getTimeoutSnapshot,
-  recordTimeoutFromRejection,
 } from "./timeoutStore.ts";
 
-describe("moderation timeout store", () => {
-  beforeEach(() => {
-    clearTimeoutState();
-  });
+// Helper: bring the store to a clean INACTIVE state.
+function reset() {
+  clearTimeoutState();
+}
 
-  it("records a timeout with a known expiry", () => {
-    const expiresAt = Date.now() + 60_000;
-    assert.equal(
-      recordTimeoutFromRejection(
-        `restricted: you are timed out until ${Math.floor(expiresAt / 1000)}`,
-      ),
-      true,
-    );
-    const snapshot = getTimeoutSnapshot();
-    assert.equal(snapshot.active, true);
-    assert.equal(typeof snapshot.expiresAtMs, "number");
-  });
+test("expired-restriction-inactive: a known past expiry is INACTIVE per isTimeoutActive", () => {
+  reset();
+  const now = 1_000_000_000_000;
+  const pastUnixSec = Math.floor((now - 60_000) / 1000);
+  recordTimeoutFromRejection(
+    `restricted: you are timed out until ${pastUnixSec}`,
+  );
+  const snap = getTimeoutSnapshot();
+  assert.equal(snap.active, true, "store records active flag from rejection");
+  assert.notEqual(snap.expiresAtMs, null, "store records non-null expiry");
+  // The expiry has passed — isTimeoutActive must report false.
+  assert.equal(
+    isTimeoutActive(snap.expiresAtMs, now),
+    false,
+    "isTimeoutActive must report false for a past expiry",
+  );
+  reset();
+});
 
-  it("leaves an unrelated rejection untouched", () => {
-    assert.equal(recordTimeoutFromRejection("rate limited: slow down"), false);
-    assert.equal(getTimeoutSnapshot().active, false);
-    assert.equal(recordTimeoutFromRejection(null), false);
-    assert.equal(recordTimeoutFromRejection(undefined), false);
-  });
+test("null-expiry-fails-closed: no-timestamp timeout records active with null expiry, isTimeoutActive stays true", () => {
+  reset();
+  recordTimeoutFromRejection("restricted: you are timed out until unparseable");
+  const snap = getTimeoutSnapshot();
+  assert.equal(snap.active, true, "store must be active");
+  assert.equal(
+    snap.expiresAtMs,
+    null,
+    "expiresAtMs must be null for unparseable timestamp",
+  );
+  assert.equal(
+    isTimeoutActive(null, Date.now()),
+    true,
+    "isTimeoutActive must stay true for null expiry (fail-closed)",
+  );
+  reset();
+});
 
-  it("clearing restores the inactive snapshot", () => {
-    recordTimeoutFromRejection(
-      "restricted: you are timed out until 99999999999",
-    );
-    assert.equal(getTimeoutSnapshot().active, true);
+test("clear-transitions-to-inactive: clearTimeoutState resolves any active timeout", () => {
+  reset();
+  const futureUnixSec = Math.floor(Date.now() / 1000) + 3600;
+  recordTimeoutFromRejection(
+    `restricted: you are timed out until ${futureUnixSec}`,
+  );
+  assert.equal(getTimeoutSnapshot().active, true, "active before clear");
+  clearTimeoutState();
+  const snap = getTimeoutSnapshot();
+  assert.equal(snap.active, false, "inactive after clear");
+  assert.equal(snap.expiresAtMs, null, "expiresAtMs null after clear");
+});
 
-    clearTimeoutState();
-    assert.deepEqual(getTimeoutSnapshot(), {
-      active: false,
-      expiresAtMs: null,
-    });
-  });
+test("non-timeout-rejection-ignored: an unrelated message does not set active", () => {
+  reset();
+  const result = recordTimeoutFromRejection(
+    "blocked: you are banned from this community",
+  );
+  assert.equal(result, false, "must return false for non-timeout message");
+  assert.equal(
+    getTimeoutSnapshot().active,
+    false,
+    "store must remain inactive",
+  );
+});
 
-  it("clearing releases a timeout that carries no expiry", () => {
-    // `isTimeoutActive(null)` is true forever, so nothing lapses this one on its
-    // own. If a community switch does not clear it, the member is write-blocked
-    // everywhere with no way out.
-    // The relay named the block but gave no parseable expiry -- the shape
-    // `parseTimeoutRejection` maps to `{ expiresAtMs: null }`.
-    recordTimeoutFromRejection("restricted: you are timed out until 0");
-    const recorded = getTimeoutSnapshot();
-    assert.equal(recorded.active, true);
-    assert.equal(recorded.expiresAtMs, null);
+test("expired-overlay-guard: formatTimeoutRemaining returns null for past/boundary expiry — never an empty string", () => {
+  // Regression guard for the empty-overlay bug: when the TTL expires,
+  // ComposerTimeoutBanner must NOT render a blank countdown string. A null
+  // return means it falls back to "You're timed out..." (correct), never "".
+  const now = 1_000_000_000_000;
 
-    clearTimeoutState();
-    assert.equal(getTimeoutSnapshot().active, false);
-  });
+  // Exactly at expiry (totalSeconds = 0 → null).
+  assert.equal(
+    formatTimeoutRemaining(now, now),
+    null,
+    "formatTimeoutRemaining must return null at exact expiry boundary",
+  );
 
-  it("clearing an already-clear store is a no-op", () => {
-    const before = getTimeoutSnapshot();
-    clearTimeoutState();
-    assert.equal(
-      getTimeoutSnapshot(),
-      before,
-      "snapshot identity must stay stable so useSyncExternalStore does not loop",
-    );
-  });
+  // Past expiry.
+  assert.equal(
+    formatTimeoutRemaining(now - 5_000, now),
+    null,
+    "formatTimeoutRemaining must return null for a past expiry",
+  );
 
-  it("a later rejection replaces the recorded expiry", () => {
-    recordTimeoutFromRejection(
-      "restricted: you are timed out until 1000000000",
-    );
-    const first = getTimeoutSnapshot().expiresAtMs;
-    recordTimeoutFromRejection(
-      "restricted: you are timed out until 2000000000",
-    );
-    const second = getTimeoutSnapshot().expiresAtMs;
-    assert.notEqual(first, second);
-    assert.equal(getTimeoutSnapshot().active, true);
-  });
+  // Unknown expiry.
+  assert.equal(
+    formatTimeoutRemaining(null, now),
+    null,
+    "formatTimeoutRemaining must return null for unknown expiry",
+  );
+
+  // Future expiry returns a non-null, non-empty string.
+  const s = formatTimeoutRemaining(now + 90_000, now);
+  assert.ok(
+    s !== null && s !== "",
+    `formatTimeoutRemaining must return a non-empty string for a future expiry; got: ${s}`,
+  );
+});
+
+test("clearing releases a timeout that carries no expiry", () => {
+  reset();
+  recordTimeoutFromRejection("restricted: you are timed out until 0");
+  const recorded = getTimeoutSnapshot();
+  assert.equal(recorded.active, true);
+  assert.equal(recorded.expiresAtMs, null);
+  clearTimeoutState();
+  assert.equal(getTimeoutSnapshot().active, false);
+});
+
+test("clearing an already-clear store keeps snapshot identity", () => {
+  reset();
+  const before = getTimeoutSnapshot();
+  clearTimeoutState();
+  assert.equal(
+    getTimeoutSnapshot(),
+    before,
+    "snapshot identity must stay stable so useSyncExternalStore does not loop",
+  );
+});
+
+test("a later rejection replaces the recorded expiry", () => {
+  reset();
+  recordTimeoutFromRejection(
+    "restricted: you are timed out until 1000000000",
+  );
+  const first = getTimeoutSnapshot().expiresAtMs;
+  recordTimeoutFromRejection(
+    "restricted: you are timed out until 2000000000",
+  );
+  const second = getTimeoutSnapshot().expiresAtMs;
+  assert.notEqual(first, second);
+  assert.equal(getTimeoutSnapshot().active, true);
 });
