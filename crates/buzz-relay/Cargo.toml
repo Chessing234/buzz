@@ -4,7 +4,7 @@ default-run = "buzz-relay"
 # Independent version: buzz-relay ships as a pinnable artifact
 # (ghcr.io/block/buzz), released on its own cadence via `just release-relay`.
 # It does NOT inherit the workspace version.
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,6 +19,8 @@ path = "src/main.rs"
 buzz-core = { workspace = true }
 buzz-conformance = { workspace = true }
 buzz-db = { workspace = true }
+buzz-datastore-tracing = { workspace = true }
+buzz-deletion = { workspace = true }
 buzz-auth = { workspace = true }
 buzz-pubsub = { workspace = true }
 buzz-audit = { workspace = true }
@@ -84,8 +86,10 @@ async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
 dev = ["buzz-auth/dev"]
 
 [dev-dependencies]
-mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.74.0", package = "mesh-llm-sdk", default-features = false, features = ["client", "serving"] }
-mesh-llm-host-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.74.0", package = "mesh-llm-host-runtime", default-features = false, features = ["dynamic-native-runtime"] }
+# The mesh-llm smoke harnesses moved to `crates/buzz-mesh-smoke`. A
+# dev-dependency feeds every target of its package, so keeping the mesh-llm
+# SDK here forced the entire mesh-llm/skippy/rmcp tree to compile before any
+# relay unit test could build — the Desktop E2E Relay 30m timeout.
 buzz-core = { workspace = true, features = ["test-utils"] }
 buzz-auth = { workspace = true, features = ["dev"] }
 reqwest = { workspace = true }
