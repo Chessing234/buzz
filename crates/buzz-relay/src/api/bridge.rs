@@ -3,6 +3,8 @@
 //! These endpoints provide HTTP access to the relay's Nostr protocol,
 //! authenticated via NIP-98 signed events.
 
+mod read_state_snapshot;
+
 use std::sync::Arc;
 
 use axum::{
@@ -20,6 +22,9 @@ use crate::handlers::ingest::{IngestAuth, IngestError};
 use crate::state::AppState;
 
 use super::{api_error, internal_error, not_found};
+
+mod thread_roots;
+mod thread_window;
 
 pub(crate) async fn enforce_http_admission(
     state: &AppState,
@@ -39,14 +44,14 @@ pub(crate) async fn enforce_http_admission(
     {
         Ok(()) => Ok(()),
         Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota").increment(1);
+            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota", "bucket" => "api_calls").increment(1);
             Err(api_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 &format!("rate-limited: quota exceeded; retry in {reset_in_secs}s"),
             ))
         }
         Err(crate::admission::AdmissionError::Unavailable) => {
-            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "unavailable").increment(1);
+            metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "unavailable", "bucket" => "api_calls").increment(1);
             Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "rate-limited: shared admission unavailable",
@@ -55,17 +60,28 @@ pub(crate) async fn enforce_http_admission(
     }
 }
 
+/// Values retained from an already-verified bridge authentication event.
+#[derive(Debug)]
+pub(crate) struct VerifiedBridgeAuth {
+    pub(crate) pubkey: nostr::PublicKey,
+    pub(crate) event_id_bytes: [u8; 32],
+    pub(crate) signed_created_at: Option<u64>,
+}
+
+type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
+
 /// Verify bridge auth: NIP-98 (production) or X-Pubkey (dev mode).
 ///
-/// Returns the authenticated public key and an event ID for replay detection.
-/// For X-Pubkey dev mode, the event ID is a zero hash (no replay concern).
+/// Returns the authenticated public key, an event ID for replay detection, and
+/// the verified signed auth timestamp. For X-Pubkey dev mode, the event ID is
+/// a zero hash and the timestamp is absent.
 pub(crate) fn verify_bridge_auth(
     headers: &HeaderMap,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     require_auth_token: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
     verify_bridge_auth_with_options(headers, method, url, body, require_auth_token, false)
 }
 
@@ -76,7 +92,7 @@ pub(crate) fn verify_bridge_auth_with_options(
     body: Option<&[u8]>,
     require_auth_token: bool,
     require_payload: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
     // Try NIP-98 first (Authorization: Nostr <base64>)
     if let Some(auth_str) = headers
         .get("authorization")
@@ -111,7 +127,11 @@ pub(crate) fn verify_bridge_auth_with_options(
         let pubkey = buzz_auth::verify_nip98_event(&event_json, url, method, body)
             .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")))?;
 
-        return Ok((pubkey, event_id_bytes));
+        return Ok(VerifiedBridgeAuth {
+            pubkey,
+            event_id_bytes,
+            signed_created_at: Some(event.created_at.as_secs()),
+        });
     }
 
     // Dev-mode fallback: X-Pubkey header (only when require_auth_token is false)
@@ -120,7 +140,11 @@ pub(crate) fn verify_bridge_auth_with_options(
             let pubkey = nostr::PublicKey::from_hex(hex_val)
                 .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid X-Pubkey hex"))?;
             // Zero event ID — no replay detection needed for dev mode
-            return Ok((pubkey, [0u8; 32]));
+            return Ok(VerifiedBridgeAuth {
+                pubkey,
+                event_id_bytes: [0u8; 32],
+                signed_created_at: None,
+            });
         }
     }
 
@@ -274,6 +298,68 @@ fn extract_before_id(raw: &Value) -> BeforeId {
     }
 }
 
+/// The `consistency` extension field: a read-your-writes opt-in. A
+/// write-influencing read (a canvas save's head precondition or its post-write
+/// ancestry verification) sets `"consistency": "strong"` so the relay serves it
+/// from the writer pool, never a replica that may lag behind the caller's own
+/// just-accepted write. Absent = the default routed path (replica-eligible when
+/// `BUZZ_REPLICA_READ_MAX_AGE_MS` is set).
+///
+/// This only ever forces the *writer*, which is always the sound direction (a
+/// replica can be stale, the writer never is), so it cannot be abused to skip
+/// data — there is deliberately no inverse "force replica" value. Any value
+/// other than the single accepted `"strong"` is rejected, so a typo fails loud
+/// rather than silently degrading to routed.
+enum Consistency {
+    /// Absent: route normally (replica-eligible under the read budget).
+    Default,
+    /// `"strong"`: pin this filter's read to the writer pool.
+    Strong,
+    /// Present but not `"strong"`: reject the request.
+    Malformed,
+}
+
+fn extract_consistency(raw: &Value) -> Consistency {
+    let Some(value) = raw.get("consistency") else {
+        return Consistency::Default;
+    };
+    match value.as_str() {
+        Some("strong") => Consistency::Strong,
+        _ => Consistency::Malformed,
+    }
+}
+
+/// Which pool a catchall filter's read is dispatched to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRoute {
+    /// The default replica-eligible path (`query_events_routed`).
+    Routed,
+    /// The writer pool (`query_events`), pinned by `"consistency": "strong"`.
+    Writer,
+}
+
+/// Resolve the pool a filter reads from, folding the `consistency` extension
+/// into a routing direction. `"strong"` pins the writer; absent routes
+/// normally; any other value is a client error (`Err`), rejected before any DB
+/// work. This is the single seam that maps client-carried intent to a pool, so
+/// a refactor that drops the field flips the mapping this function returns and
+/// its tests fail.
+fn resolve_read_route(raw: &Value) -> Result<ReadRoute, ()> {
+    match extract_consistency(raw) {
+        Consistency::Default => Ok(ReadRoute::Routed),
+        Consistency::Strong => Ok(ReadRoute::Writer),
+        Consistency::Malformed => Err(()),
+    }
+}
+
+fn extract_buzz_channel(raw: &Value) -> Option<&str> {
+    raw.get("#buzz-channel")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+}
+
 /// True when the raw filter opts into a bridge extension flag (`top_level`,
 /// `include_summaries`, `include_aux`). Absent or non-boolean = false.
 fn extension_flag(raw: &Value, key: &str) -> bool {
@@ -393,6 +479,83 @@ const WINDOW_AUX_DELETE_KINDS: [u32; 2] = [
     buzz_core::kind::KIND_NIP29_DELETE_EVENT,
 ];
 
+/// Page size for one aux-closure hop. Matches the DB clamp
+/// (`buzz_db::DEFAULT_MAX_PAGE_LIMIT`) so each page is one full query.
+const AUX_PAGE_LIMIT: i64 = buzz_db::DEFAULT_MAX_PAGE_LIMIT;
+/// Upper bound on pages drained per hop: 64k aux events referencing one page
+/// of rows is far past any real thread; past it we log and stop rather than
+/// loop forever against a pathological write pattern.
+const AUX_MAX_PAGES: usize = 64;
+
+fn build_aux_query(
+    community: buzz_core::CommunityId,
+    target_ids: Vec<String>,
+    kinds: &[u32],
+) -> buzz_db::EventQuery {
+    let mut query = buzz_db::EventQuery::for_community(community);
+    query.kinds = Some(kinds.iter().map(|kind| *kind as i32).collect());
+    query.e_tags = Some(target_ids);
+    query
+}
+
+/// Where an aux hop reads from: the window path pins the request's proved
+/// read session; the thread path takes the routed display-read fast path.
+enum AuxReader<'a> {
+    Session(&'a mut buzz_db::ReadSession),
+    Routed(&'a buzz_db::Db, &'static str),
+    #[cfg(test)]
+    Fake(&'a mut (dyn FnMut(&buzz_db::EventQuery) -> Vec<buzz_core::StoredEvent> + Send)),
+}
+
+impl AuxReader<'_> {
+    async fn fetch(
+        &mut self,
+        query: &buzz_db::EventQuery,
+    ) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+        match self {
+            AuxReader::Session(session) => session.query_events(query).await,
+            AuxReader::Routed(db, path) => db.query_events_routed(path, query).await,
+            #[cfg(test)]
+            AuxReader::Fake(fetch) => Ok(fetch(query)),
+        }
+    }
+}
+
+/// Drain every event matching `query`, walking the `(created_at, id)` keyset
+/// cursor `query_events` already orders by until a short page. An aux hop
+/// over a reaction-heavy page can exceed a single page clamp, and because
+/// results are newest-first a one-shot query silently drops the *oldest*
+/// edits and deletions — rendering original or deleted content, not merely
+/// losing decoration.
+async fn query_all_pages(
+    mut query: buzz_db::EventQuery,
+    page_limit: i64,
+    reader: &mut AuxReader<'_>,
+) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+    query.limit = Some(page_limit);
+    let mut events = Vec::new();
+    for _ in 0..AUX_MAX_PAGES {
+        let page = reader.fetch(&query).await?;
+        let next = if page.len() as i64 >= page_limit {
+            page.last().map(|se| (se.event.created_at, se.event.id))
+        } else {
+            None
+        };
+        events.extend(page);
+        let Some((created_at, id)) = next else {
+            return Ok(events);
+        };
+        query.until = chrono::DateTime::from_timestamp(created_at.as_secs() as i64, 0);
+        query.before_id = Some(id.to_bytes().to_vec());
+    }
+    tracing::warn!(
+        pages = AUX_MAX_PAGES,
+        events = events.len(),
+        "aux closure hop exceeded page cap; returning truncated closure"
+    );
+    Ok(events)
+}
+
 /// Serve one `top_level: true` channel-window filter on the bridge `/query`
 /// path (docs/bridge-channel-window.md). Appends, in order: row events, the
 /// aux closure (`include_aux`), `39005` thread-summary overlays
@@ -496,14 +659,15 @@ async fn handle_channel_window_filter(
             std::collections::HashSet::new();
         let mut hop_ids = row_ids_hex.clone();
         for hop_kinds in [&WINDOW_AUX_KINDS[..], &WINDOW_AUX_DELETE_KINDS[..]] {
-            let mut aux_query = buzz_db::EventQuery::for_community(tenant.community());
-            aux_query.kinds = Some(hop_kinds.iter().map(|k| *k as i32).collect());
-            aux_query.e_tags = Some(std::mem::take(&mut hop_ids));
-            aux_query.limit = Some(1000);
-            let aux_events = session
-                .query_events(&aux_query)
-                .await
-                .map_err(|e| internal_error(&format!("window aux error: {e}")))?;
+            let aux_query =
+                build_aux_query(tenant.community(), std::mem::take(&mut hop_ids), hop_kinds);
+            let aux_events = query_all_pages(
+                aux_query,
+                AUX_PAGE_LIMIT,
+                &mut AuxReader::Session(&mut session),
+            )
+            .await
+            .map_err(|e| internal_error(&format!("window aux error: {e}")))?;
             for se in aux_events {
                 if !seen_aux.insert(se.event.id) {
                     continue;
@@ -637,7 +801,11 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -650,8 +818,16 @@ pub async fn submit_event(
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome =
-        submit_event_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let outcome = submit_event_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, kind, .. } => {
@@ -681,11 +857,15 @@ pub async fn submit_event(
                 "HTTP bridge request"
             );
         }
-        SubmitOutcome::Rejected { kind, reason, .. } => {
+        SubmitOutcome::Rejected {
+            kind,
+            reason,
+            response,
+        } => {
             tracing::warn!(
                 pubkey = %pubkey_hex,
                 route = "/events",
-                status = 400u16,
+                status = response.0.as_u16(),
                 accepted = false,
                 kind,
                 reason = %reason,
@@ -724,7 +904,10 @@ enum SubmitOutcome {
         column: usize,
         response: (StatusCode, Json<Value>),
     },
-    /// IngestError::Rejected — log kind + truncated reason.
+    /// IngestError::Rejected or IngestError::CanvasConflict — log kind + truncated reason.
+    ///
+    /// Generic rejections yield HTTP 400; canvas CAS conflicts yield HTTP 409.
+    /// The logged `status` reflects the actual response status carried in `response`.
     Rejected {
         kind: u32,
         reason: String,
@@ -760,6 +943,7 @@ async fn submit_event_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    signed_auth_created_at: Option<u64>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
@@ -802,18 +986,23 @@ async fn submit_event_authed(
     };
 
     // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     let nip_oa_owner = match super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await
     {
         Ok(owner) => owner.or_else(|| {
             if !state.config.require_relay_membership {
-                super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+                super::relay_members::extract_nip_oa_owner(
+                    &pubkey_bytes,
+                    auth_tag,
+                    signed_auth_created_at,
+                )
             } else {
                 None
             }
@@ -862,6 +1051,19 @@ async fn submit_event_authed(
                 response: api_error(StatusCode::BAD_REQUEST, &msg),
             }
         }
+        Err(IngestError::CanvasConflict(msg)) => {
+            // Canvas CAS precondition failures are a distinct HTTP 409 so the
+            // CLI's reconciliation branch (which gates on `status == 409`) is
+            // reachable against the live relay.  The message body is unchanged;
+            // the desktop TypeScript layer matches on message text, not status.
+            let reason = truncate_reason(&msg, REJECT_REASON_MAX_BYTES).to_owned();
+            crate::handlers::ingest::reject_with_transport("http", "invalid");
+            SubmitOutcome::Rejected {
+                kind: kind_u32,
+                reason,
+                response: api_error(StatusCode::CONFLICT, &msg),
+            }
+        }
         Err(IngestError::AuthFailed(msg)) => {
             crate::handlers::ingest::reject_with_transport("http", "auth");
             let e = api_error(StatusCode::FORBIDDEN, &msg);
@@ -908,7 +1110,11 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -921,8 +1127,16 @@ pub async fn query_events(
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = query_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
     match &result {
         Ok(Json(Value::Array(events))) => {
             tracing::info!(
@@ -958,17 +1172,19 @@ async fn query_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await?;
 
@@ -976,11 +1192,14 @@ async fn query_events_authed(
     // depth_limit, feed_types) that nostr::Filter silently drops.
     let raw_filters: Vec<Value> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    let thread_windows = thread_window::parse(&raw_filters)?;
     let filters: Vec<nostr::Filter> = raw_filters
         .iter()
         .map(|v| serde_json::from_value(v.clone()))
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    crate::handlers::req::extract_channel_ids_from_filters_limited(&filters)
+        .map_err(|()| api_error(StatusCode::BAD_REQUEST, "too many explicit channels"))?;
 
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
@@ -1004,11 +1223,43 @@ async fn query_events_authed(
         ));
     }
 
+    if thread_windows.iter().any(Option::is_some) {
+        if thread_windows.iter().any(Option::is_none) {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "thread_window cannot mix with other query modes",
+            ));
+        }
+        return tokio::time::timeout(
+            thread_window::DEADLINE,
+            thread_window::query_batch(state, tenant, &pubkey, thread_windows.iter().flatten()),
+        )
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "thread window deadline exceeded",
+            )
+        })?
+        .map(|events| Json(Value::Array(events)));
+    }
+    if read_state_snapshot::requested(&raw_filters) {
+        return read_state_snapshot::query(state, tenant, &pubkey, &raw_filters).await;
+    }
+
     // Get channels this user can access — same enforcement as WS REQ handler.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    repair_requested_channel_access(
+        state,
+        tenant,
+        &filters,
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await?;
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
@@ -1029,17 +1280,39 @@ async fn query_events_authed(
         .await;
     }
 
-    if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
-        return Ok(Json(Value::Array(presence_events)));
+    if let Some(presence_result) =
+        synthesize_presence(&state.pubsub, &state.relay_keypair, tenant, &filters).await
+    {
+        return presence_result.map(|events| Json(Value::Array(events)));
     }
 
     let mut events: Vec<Value> = Vec::new();
     let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    let ownership_targets: usize = raw_filters
+        .iter()
+        .zip(&filters)
+        .filter(|(raw, _)| extension_flag(raw, "resolve_thread_roots"))
+        .map(|(_, filter)| filter.ids.as_ref().map_or(0, |ids| ids.len()))
+        .sum();
+    if ownership_targets > 100 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "resolve_thread_roots permits at most 100 targets per request",
+        ));
+    }
+    // Resolve reply owners from retained thread metadata, including tombstones.
+    for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
+        if extension_flag(raw, "resolve_thread_roots") {
+            events.extend(thread_roots::query(state, tenant, filter, &accessible_channels).await?);
+            handled.insert(idx);
+        }
+    }
+
     // Channel-window filters (`top_level: true`) — the GUI read-model surface.
     // Dispatched first: a window filter is never a feed/thread/catchall query.
     for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
-        if !extension_flag(raw, "top_level") {
+        if handled.contains(&idx) || !extension_flag(raw, "top_level") {
             continue;
         }
         handle_channel_window_filter(
@@ -1193,6 +1466,8 @@ async fn query_events_authed(
             .await
             .map_err(|e| internal_error(&format!("thread query error: {e}")))?;
 
+        let mut thread_row_ids = Vec::with_capacity(thread_replies.len() + 1);
+        thread_row_ids.push(root_hex.to_string());
         for reply in thread_replies {
             let se = reply.stored_event;
             if !event_in_accessible_channel(&se, &accessible_channels) {
@@ -1204,8 +1479,43 @@ async fn query_events_authed(
             if !buzz_core::filter::reader_authorized_for_event(&se.event, &authed_pubkey_hex) {
                 continue;
             }
+            thread_row_ids.push(se.event.id.to_hex());
             if let Ok(v) = serde_json::to_value(&se.event) {
                 events.push(v);
+            }
+        }
+
+        if extension_flag(raw, "include_aux") && !thread_row_ids.is_empty() {
+            let mut seen_aux = std::collections::HashSet::new();
+            let mut hop_ids = thread_row_ids;
+            for hop_kinds in [&WINDOW_AUX_KINDS[..], &WINDOW_AUX_DELETE_KINDS[..]] {
+                let aux_query =
+                    build_aux_query(tenant.community(), std::mem::take(&mut hop_ids), hop_kinds);
+                let aux_events = query_all_pages(
+                    aux_query,
+                    AUX_PAGE_LIMIT,
+                    &mut AuxReader::Routed(&state.db, "bridge_thread_aux"),
+                )
+                .await
+                .map_err(|e| internal_error(&format!("thread aux query error: {e}")))?;
+                for se in aux_events {
+                    if !seen_aux.insert(se.event.id)
+                        || !event_in_accessible_channel(&se, &accessible_channels)
+                        || !buzz_core::filter::reader_authorized_for_event(
+                            &se.event,
+                            &authed_pubkey_hex,
+                        )
+                    {
+                        continue;
+                    }
+                    hop_ids.push(se.event.id.to_hex());
+                    if let Ok(value) = serde_json::to_value(&se.event) {
+                        events.push(value);
+                    }
+                }
+                if hop_ids.is_empty() {
+                    break;
+                }
             }
         }
         handled.insert(idx);
@@ -1215,7 +1525,7 @@ async fn query_events_authed(
     // skips and the `before_id` BAD_REQUEST are decided here, before any DB
     // work is issued (validation errors are deterministic client mistakes, so
     // surfacing them ahead of transient DB errors is strictly more predictable).
-    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery)> = Vec::new();
+    let mut catchall_queries: Vec<(usize, buzz_db::EventQuery, ReadRoute)> = Vec::new();
     for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
         if handled.contains(&idx) {
             continue;
@@ -1227,6 +1537,17 @@ async fn query_events_authed(
             }
         }
 
+        // Read-your-writes opt-in: a write-influencing read pins to the writer
+        // pool so a lagging replica cannot hide the caller's own just-accepted
+        // write. Rejected before any DB work, like the `before_id` grammar
+        // error below — a malformed value is a deterministic client mistake.
+        let read_route = resolve_read_route(raw).map_err(|()| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "consistency must be \"strong\" when present",
+            )
+        })?;
+
         let mut query = crate::handlers::req::build_event_query_from_filter(
             filter,
             &pubkey_bytes,
@@ -1234,11 +1555,15 @@ async fn query_events_authed(
             tenant.community(),
         )
         .await;
-        crate::handlers::req::apply_access_scope_to_query(
+        crate::handlers::req::apply_channel_scope_to_query(
             &mut query,
+            filter,
             extract_channel_from_filter(filter),
             &accessible_channels,
         );
+        if let Some(channel) = extract_buzz_channel(raw) {
+            query.custom_tag = Some(("buzz-channel".into(), channel.into()));
+        }
         // Shared-gated visibility pushdown: must mirror WS REQ so that a page of
         // newer private events does not starve older shared ones off the page.
         if crate::handlers::req::filter_can_match_shared_gated_kinds(filter) {
@@ -1276,7 +1601,7 @@ async fn query_events_authed(
             query.offset = Some(offset);
         }
 
-        catchall_queries.push((idx, query));
+        catchall_queries.push((idx, query, read_route));
     }
 
     // Phase 2 — DB reads, bounded-concurrent, order-preserving (`buffered`).
@@ -1284,10 +1609,23 @@ async fn query_events_authed(
     // and error semantics match the previous serial loop.
     use futures_util::stream::{self, StreamExt};
     let db = state.db.clone();
-    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(|(idx, query)| {
-        let db = db.clone();
-        async move { (idx, db.query_events_routed("bridge_query", &query).await) }
-    }))
+    let mut catchall_results = stream::iter(catchall_queries.into_iter().map(
+        |(idx, query, read_route)| {
+            let db = db.clone();
+            async move {
+                // The route was resolved from client-carried `consistency`
+                // intent in phase 1 (`resolve_read_route`). `Writer` pins the
+                // read to the writer pool (`query_events`); `Routed` takes the
+                // replica-eligible path. Only these two directions exist — the
+                // inverse "force replica" is deliberately unrepresentable.
+                let result = match read_route {
+                    ReadRoute::Writer => db.query_events(&query).await,
+                    ReadRoute::Routed => db.query_events_routed("bridge_query", &query).await,
+                };
+                (idx, result)
+            }
+        },
+    ))
     .buffered(crate::handlers::req::FILTER_QUERY_CONCURRENCY);
 
     // Phase 3 — post-processing, strictly in filter order.
@@ -1324,6 +1662,39 @@ async fn query_events_authed(
     Ok(Json(Value::Array(events)))
 }
 
+async fn repair_requested_channel_access(
+    state: &AppState,
+    tenant: &TenantContext,
+    filters: &[nostr::Filter],
+    pubkey_bytes: &[u8],
+    accessible_channels: &mut Vec<uuid::Uuid>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    for filter in filters {
+        let Some(requested) =
+            crate::handlers::req::extract_channel_ids_from_filters(std::slice::from_ref(filter))
+        else {
+            continue;
+        };
+        for channel_id in requested {
+            if accessible_channels.contains(&channel_id) {
+                continue;
+            }
+            let is_member = state
+                .db
+                .is_member(tenant.community(), channel_id, pubkey_bytes)
+                .await
+                .map_err(|e| internal_error(&format!("channel membership confirmation: {e}")))?;
+            crate::handlers::req::resolve_request_local_access(
+                accessible_channels,
+                channel_id,
+                true,
+                Some(is_member),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Count events via HTTP bridge (NIP-98 auth). Returns `{"count": N}`.
 ///
 /// Enforces channel access: only counts events in channels the user can access.
@@ -1351,7 +1722,11 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -1364,8 +1739,16 @@ pub async fn count_events(
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        count_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = count_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
     match &result {
         Ok(Json(value)) => {
             let count = value.get("count").and_then(Value::as_u64);
@@ -1399,22 +1782,26 @@ async fn count_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await?;
 
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
+    crate::handlers::req::extract_channel_ids_from_filters_limited(&filters)
+        .map_err(|()| api_error(StatusCode::BAD_REQUEST, "too many explicit channels"))?;
 
     // P-gated kinds enforcement — same as WS REQ and /query.
     let authed_pubkey_hex = pubkey.to_hex();
@@ -1438,10 +1825,18 @@ async fn count_events_authed(
     }
 
     // Get channels this user can access.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    repair_requested_channel_access(
+        state,
+        tenant,
+        &filters,
+        &pubkey_bytes,
+        &mut accessible_channels,
+    )
+    .await?;
 
     let mut total: u64 = 0;
     for filter in &filters {
@@ -1463,9 +1858,19 @@ async fn count_events_authed(
             crate::handlers::req::filter_can_match_shared_gated_kinds(filter);
 
         // If filter targets a specific channel, verify access.
-        if let Some(ch_id) = extract_channel_from_filter(filter) {
-            if !accessible_channels.contains(&ch_id) {
-                continue; // Skip filters targeting inaccessible channels.
+        if crate::handlers::req::extract_channel_ids_from_filters(std::slice::from_ref(filter))
+            .is_some()
+        {
+            let ch_id = extract_channel_from_filter(filter);
+            let requested = crate::handlers::req::extract_channel_ids_from_filters(
+                std::slice::from_ref(filter),
+            )
+            .unwrap_or_default();
+            if !requested
+                .iter()
+                .any(|channel_id| accessible_channels.contains(channel_id))
+            {
+                continue;
             }
             // Channel is accessible — count with pushability check.
             let mut query = crate::handlers::req::build_event_query_from_filter(
@@ -1475,6 +1880,12 @@ async fn count_events_authed(
                 tenant.community(),
             )
             .await;
+            crate::handlers::req::apply_channel_scope_to_query(
+                &mut query,
+                filter,
+                ch_id,
+                &accessible_channels,
+            );
             // Shared-gated visibility pushdown: same as REQ and /query paths, so
             // the fallback's query_events call doesn't over-fetch private rows.
             if needs_shared_gate_filtering {
@@ -1980,12 +2391,19 @@ pub async fn workflow_webhook(
 /// presence from Redis instead of querying the DB (ephemeral events are never
 /// stored, and kind:40902 snapshots are relay-generated on demand).
 ///
-/// Returns `Some(events)` if handled, `None` to fall through to normal query.
+/// Returns `None` when the filters are not a presence query (fall through to
+/// the normal query path). Returns `Some(Ok(events))` when a presence snapshot
+/// was produced — an empty vec is an authoritative "all offline" answer.
+/// Returns `Some(Err(_))` when the backing Redis lookup failed: callers must
+/// propagate that as an error response rather than a fake-empty success, so a
+/// consumer cannot mistake a backend outage for an authoritative snapshot.
+#[allow(clippy::type_complexity)]
 async fn synthesize_presence(
-    state: &AppState,
+    pubsub: &buzz_pubsub::PubSubManager,
+    relay_keypair: &nostr::Keys,
     tenant: &buzz_core::tenant::TenantContext,
     filters: &[nostr::Filter],
-) -> Option<Vec<Value>> {
+) -> Option<Result<Vec<Value>, (StatusCode, Json<Value>)>> {
     use buzz_core::kind::{KIND_PRESENCE_SNAPSHOT, KIND_PRESENCE_UPDATE};
 
     // Only intercept if every filter targets kind:20001 or 40902 with authors.
@@ -2005,22 +2423,23 @@ async fn synthesize_presence(
     }
 
     if all_pubkeys.is_empty() {
-        return Some(Vec::new());
+        return Some(Ok(Vec::new()));
     }
 
     // Dedup pubkeys.
     all_pubkeys.sort_by_key(|pk| pk.to_hex());
     all_pubkeys.dedup();
 
-    // Look up Redis.
-    let presence_map = state
-        .pubsub
-        .get_presence_bulk(tenant, &all_pubkeys)
-        .await
-        .unwrap_or_default();
+    // Look up Redis. A lookup failure must surface as an error, not a
+    // fake-empty success — otherwise a Redis outage is indistinguishable from
+    // an authoritative all-offline snapshot to the consumer.
+    let presence_map = match pubsub.get_presence_bulk(tenant, &all_pubkeys).await {
+        Ok(map) => map,
+        Err(e) => return Some(Err(internal_error(&format!("presence lookup: {e}")))),
+    };
 
     if presence_map.is_empty() {
-        return Some(Vec::new());
+        return Some(Ok(Vec::new()));
     }
 
     // Synthesize kind:20001 events signed by the relay.
@@ -2032,20 +2451,30 @@ async fn synthesize_presence(
     let mut events = Vec::with_capacity(presence_map.len());
     for (pubkey_hex, status) in &presence_map {
         // Build a synthetic event: relay-signed, content = status, p-tag = subject.
-        let tags = vec![nostr::Tag::parse(["p", pubkey_hex]).ok()?];
-        let event =
-            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_PRESENCE_UPDATE as u16), status)
-                .tags(tags)
-                .custom_created_at(nostr::Timestamp::from(now))
-                .sign_with_keys(&state.relay_keypair)
-                .ok()?;
+        // A build/sign failure here is an internal fault, not a "not a presence
+        // query" signal, so surface it as an error rather than falling through.
+        let tags = match nostr::Tag::parse(["p", pubkey_hex]) {
+            Ok(tag) => vec![tag],
+            Err(e) => return Some(Err(internal_error(&format!("presence tag: {e}")))),
+        };
+        let event = match nostr::EventBuilder::new(
+            nostr::Kind::Custom(KIND_PRESENCE_UPDATE as u16),
+            status,
+        )
+        .tags(tags)
+        .custom_created_at(nostr::Timestamp::from(now))
+        .sign_with_keys(relay_keypair)
+        {
+            Ok(event) => event,
+            Err(e) => return Some(Err(internal_error(&format!("presence sign: {e}")))),
+        };
 
         if let Ok(v) = serde_json::to_value(&event) {
             events.push(v);
         }
     }
 
-    Some(events)
+    Some(Ok(events))
 }
 
 // ── Moderation queue reads (L6 — Quinn) ───────────────────────────────────────
@@ -2093,8 +2522,11 @@ async fn authorize_moderation_read(
         _ => path.to_string(),
     };
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
-    let (pubkey, event_id_bytes) =
-        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        ..
+    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -2246,7 +2678,7 @@ fn ban_json(b: &buzz_db::moderation::BanRecord) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use super::*;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
@@ -2303,6 +2735,155 @@ mod tests {
         assert!(!has_mixed_search_filters(&filters));
     }
 
+    /// Production-wiring seam for the Redis-outage boundary. Drives the real
+    /// `synthesize_presence` with a `PubSubManager` whose pool points at a
+    /// closed port, so the `get_presence_bulk` lookup fails. A presence-snapshot
+    /// filter must yield `Some(Err(500))` — never `Some(Ok([]))`, which would
+    /// let a consumer mistake a backend outage for an authoritative all-offline
+    /// snapshot. Restoring `unwrap_or_default()` inside `synthesize_presence`
+    /// turns this red (it would return `Some(Ok([]))`), which is what protects
+    /// the error-mapping seam Thufir found otherwise mutation-unprotected.
+    #[tokio::test]
+    async fn synthesize_presence_surfaces_redis_failure_as_error_response() {
+        use buzz_core::kind::KIND_PRESENCE_SNAPSHOT;
+
+        // Pool at a closed port: get_presence_bulk's connection attempt fails.
+        let dead_pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool builds lazily");
+        let pubsub = buzz_pubsub::PubSubManager::new("redis://127.0.0.1:1", dead_pool)
+            .await
+            .expect("PubSubManager::new performs no IO");
+        let relay_keypair = Keys::generate();
+        let tenant = fresh_tenant("relay.example");
+
+        // A presence-snapshot query for a concrete author reaches the Redis
+        // lookup (an empty author set would short-circuit to an empty snapshot).
+        let filters = vec![nostr::Filter::new()
+            .kind(Kind::Custom(KIND_PRESENCE_SNAPSHOT as u16))
+            .author(Keys::generate().public_key())];
+
+        let result = synthesize_presence(&pubsub, &relay_keypair, &tenant, &filters).await;
+
+        match result {
+            Some(Err((status, _))) => assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a Redis lookup failure must surface as HTTP 500"
+            ),
+            other => panic!(
+                "a Redis outage must yield Some(Err(500)), not a fake-empty success: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn thread_aux_query_targets_root_and_replies() {
+        let tenant = fresh_tenant("relay.example");
+        let targets = vec!["root".to_string(), "reply".to_string()];
+        let query = build_aux_query(tenant.community(), targets.clone(), &WINDOW_AUX_KINDS);
+
+        assert_eq!(query.e_tags, Some(targets));
+        assert_eq!(
+            query.kinds,
+            Some(WINDOW_AUX_KINDS.iter().map(|kind| *kind as i32).collect())
+        );
+        assert_eq!(query.limit, None);
+        assert_eq!(query.until, None);
+        assert_eq!(query.before_id, None);
+    }
+
+    fn aux_event(keys: &Keys, created_at: u64, content: &str) -> buzz_core::StoredEvent {
+        let ev = EventBuilder::new(Kind::Custom(7), content)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .unwrap();
+        buzz_core::StoredEvent::new(ev, None)
+    }
+
+    /// Carl/#6572: a one-shot `limit=1000` aux query is newest-first, so the
+    /// oldest reactions/edits/deletions past the clamp vanished. The paged
+    /// drain must walk the keyset cursor until a short page and return every
+    /// event exactly once.
+    #[tokio::test]
+    async fn query_all_pages_drains_past_the_page_clamp() {
+        let keys = Keys::generate();
+        // Newest-first store: 5 events, two sharing a second so the id
+        // tiebreak is exercised.
+        let mut store = [
+            aux_event(&keys, 50, "e"),
+            aux_event(&keys, 40, "d1"),
+            aux_event(&keys, 40, "d2"),
+            aux_event(&keys, 30, "c"),
+            aux_event(&keys, 10, "a"),
+        ];
+        store.sort_by(|l, r| {
+            r.event
+                .created_at
+                .cmp(&l.event.created_at)
+                .then(l.event.id.cmp(&r.event.id))
+        });
+        let expected: Vec<_> = store.iter().map(|se| se.event.id).collect();
+        let mut calls = Vec::new();
+
+        let tenant = fresh_tenant("relay.example");
+        let query = build_aux_query(tenant.community(), vec!["root".into()], &WINDOW_AUX_KINDS);
+        let mut fetch = |q: &buzz_db::EventQuery| {
+            calls.push((q.limit, q.until, q.before_id.clone()));
+            // Emulate `query_events_on`: `created_at < until OR
+            // (created_at = until AND id > before_id)`, newest-first, limit.
+            let page: Vec<_> = store
+                .iter()
+                .filter(|se| match (q.until, q.before_id.as_deref()) {
+                    (Some(until), Some(before)) => {
+                        let ts = se.event.created_at.as_secs() as i64;
+                        ts < until.timestamp()
+                            || (ts == until.timestamp()
+                                && se.event.id.as_bytes().as_slice() > before)
+                    }
+                    _ => true,
+                })
+                .take(q.limit.unwrap() as usize)
+                .cloned()
+                .collect();
+            page
+        };
+        let events = query_all_pages(query, 2, &mut AuxReader::Fake(&mut fetch))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            events.iter().map(|se| se.event.id).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(calls.len(), 3, "2 full pages + 1 short page");
+        assert!(calls.iter().all(|(limit, _, _)| *limit == Some(2)));
+        assert_eq!(calls[0].1, None);
+        // Second page resumes from the last row of the first (ts 40, larger id).
+        assert_eq!(calls[1].1.unwrap().timestamp(), 40);
+        assert_eq!(
+            calls[1].2.as_deref(),
+            Some(store[1].event.id.as_bytes().as_slice())
+        );
+        assert_eq!(calls[2].1.unwrap().timestamp(), 30);
+    }
+
+    #[tokio::test]
+    async fn query_all_pages_stops_at_one_short_page() {
+        let tenant = fresh_tenant("relay.example");
+        let query = build_aux_query(tenant.community(), vec!["root".into()], &WINDOW_AUX_KINDS);
+        let mut calls = 0;
+        let mut fetch = |_q: &buzz_db::EventQuery| {
+            calls += 1;
+            Vec::new()
+        };
+        let events = query_all_pages(query, 1000, &mut AuxReader::Fake(&mut fetch))
+            .await
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(calls, 1);
+    }
+
     #[test]
     fn bridge_search_mode_extension_defaults_to_full_text() {
         assert_eq!(
@@ -2332,8 +2913,6 @@ mod tests {
     /// replay of the same event id in the same community is rejected. The same
     /// id in a different community still succeeds, proving the key is scoped by
     /// server-resolved tenant rather than global process memory.
-    #[tokio::test]
-    #[ignore = "requires Redis"]
     async fn nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path() {
         let pool = redis_pool();
         let pod_a = buzz_pubsub::RedisNip98ReplayGuard::new(pool.clone());
@@ -2361,8 +2940,6 @@ mod tests {
     /// rejection. A single guard instance, called twice with the same
     /// `TenantContext` and the same event id, MUST reject the second call.
     /// Bites if `try_mark`'s admit/reject mapping is reversed or no-op'd.
-    #[tokio::test]
-    #[ignore = "requires Redis"]
     async fn nip98_replay_guard_rejects_same_pod_same_community_replay() {
         let pool = redis_pool();
         let pod = buzz_pubsub::RedisNip98ReplayGuard::new(pool);
@@ -2377,6 +2954,20 @@ mod tests {
             .await
             .expect_err("same-pod replay of the same id+community must reject");
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    mod external_infra_redis_tests {
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path() {
+            super::nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path().await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn nip98_replay_guard_rejects_same_pod_same_community_replay() {
+            super::nip98_replay_guard_rejects_same_pod_same_community_replay().await;
+        }
     }
 
     /// Attack 3 fail-closed guard: a stateless worker that loses Redis MUST
@@ -2556,13 +3147,20 @@ mod tests {
         let tenant_a = fresh_tenant("host-a.example");
         let expected_url = nip98_expected_url(config_relay_url, &tenant_a, "/events");
 
-        let (pubkey, _event_id_bytes) =
-            verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
-                .expect("matching-host NIP-98 event must verify");
+        let VerifiedBridgeAuth {
+            pubkey,
+            signed_created_at,
+            ..
+        } = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
+            .expect("matching-host NIP-98 event must verify");
         assert_eq!(
             pubkey,
             keys.public_key(),
             "returned pubkey must be the signer's"
+        );
+        assert!(
+            signed_created_at.is_some(),
+            "verified NIP-98 auth must retain its signed timestamp"
         );
     }
 
@@ -2605,7 +3203,7 @@ mod tests {
             Some("limit=20&status=open"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-bearing moderation read must verify against the same query");
         assert_eq!(pubkey, keys.public_key());
@@ -2662,7 +3260,7 @@ mod tests {
             Some("limit=20"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("audit query-bearing read must verify");
         assert_eq!(pubkey, keys.public_key());
@@ -2687,7 +3285,7 @@ mod tests {
         );
         assert_eq!(expected_url, "https://host-a.example/moderation/restricted");
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-less restricted read must verify against the bare path");
         assert_eq!(pubkey, keys.public_key());
@@ -2957,6 +3555,22 @@ mod tests {
     }
 
     #[test]
+    fn extract_buzz_channel_requires_one_string_value() {
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": ["channel-a"]})),
+            Some("channel-a")
+        );
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": ["channel-a", "channel-b"]})),
+            None
+        );
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": [42]})),
+            None
+        );
+    }
+
+    #[test]
     fn extract_before_id_valid_hex() {
         let hex = "a".repeat(64);
         let raw = serde_json::json!({ "before_id": hex });
@@ -2994,6 +3608,76 @@ mod tests {
     fn extract_before_id_non_string() {
         let raw = serde_json::json!({ "before_id": 12345 });
         assert!(matches!(extract_before_id(&raw), BeforeId::Malformed));
+    }
+
+    #[test]
+    fn extract_consistency_strong_pins_to_writer() {
+        let raw = serde_json::json!({ "consistency": "strong" });
+        assert!(matches!(extract_consistency(&raw), Consistency::Strong));
+    }
+
+    #[test]
+    fn extract_consistency_absent_is_default_routed() {
+        let raw = serde_json::json!({ "kinds": [40100] });
+        assert!(matches!(extract_consistency(&raw), Consistency::Default));
+    }
+
+    #[test]
+    fn extract_consistency_unknown_value_is_malformed() {
+        // A typo or an attempt to name the inverse "force replica" direction
+        // must reject the request, never silently degrade to routed.
+        for bad in [
+            serde_json::json!({ "consistency": "weak" }),
+            serde_json::json!({ "consistency": "replica" }),
+            serde_json::json!({ "consistency": "eventual" }),
+            serde_json::json!({ "consistency": "STRONG" }),
+            serde_json::json!({ "consistency": true }),
+            serde_json::json!({ "consistency": 1 }),
+        ] {
+            assert!(
+                matches!(extract_consistency(&bad), Consistency::Malformed),
+                "{bad} must be rejected as malformed"
+            );
+        }
+    }
+
+    /// The routing direction the catchall loop dispatches on. A filter carrying
+    /// `"consistency": "strong"` MUST resolve to the writer pool
+    /// (`ReadRoute::Writer` → `query_events`); one without MUST resolve to the
+    /// replica-eligible path (`ReadRoute::Routed` → `query_events_routed`).
+    /// Both directions are pinned here so a refactor that drops the field on
+    /// the floor — reading every filter from one pool — flips one of these and
+    /// fails. The writer-vs-replica pool divergence itself is exercised by the
+    /// two-pool `routed_reads_are_confined_to_the_requested_community` test in
+    /// buzz-db (`#[ignore]`, requires Postgres).
+    #[test]
+    fn resolve_read_route_pins_strong_to_writer() {
+        let strong = serde_json::json!({ "consistency": "strong" });
+        assert_eq!(resolve_read_route(&strong), Ok(ReadRoute::Writer));
+    }
+
+    #[test]
+    fn resolve_read_route_defaults_to_routed_replica() {
+        let absent = serde_json::json!({ "kinds": [40100], "limit": 1 });
+        assert_eq!(resolve_read_route(&absent), Ok(ReadRoute::Routed));
+    }
+
+    #[test]
+    fn resolve_read_route_rejects_unknown_values() {
+        // Malformed never degrades to a pool — it is a client error, so the
+        // catchall loop turns this `Err` into a BAD_REQUEST before any DB work.
+        for bad in [
+            serde_json::json!({ "consistency": "weak" }),
+            serde_json::json!({ "consistency": "replica" }),
+            serde_json::json!({ "consistency": "STRONG" }),
+            serde_json::json!({ "consistency": true }),
+        ] {
+            assert_eq!(
+                resolve_read_route(&bad),
+                Err(()),
+                "{bad} must be a client error, never a pool"
+            );
+        }
     }
 
     /// Extension flags opt in only on a literal JSON `true` — absent,
@@ -3363,8 +4047,6 @@ mod tests {
         }
     }
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     /// Build an AppState suitable for handler-level bridge tests.
     ///
     /// - `require_auth_token = false` → X-Pubkey dev-mode fallback active.
@@ -3375,9 +4057,9 @@ mod tests {
     /// - Redis pool points at the local dev instance for the admission check.
     ///
     /// Returns `None` when local Postgres is not reachable.
-    async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
+    pub(super) async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
         let mut config = crate::config::Config::from_env().ok()?;
-        config.database_url = TEST_DB_URL.to_string();
+        config.database_url = crate::test_support::database_url();
         // Use the real local Redis so enforce_http_admission can pass.
         config.redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
@@ -3385,7 +4067,9 @@ mod tests {
         config.require_auth_token = false;
         config.require_relay_membership = false;
 
-        let pool = sqlx::PgPool::connect(TEST_DB_URL).await.ok()?;
+        let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+            .await
+            .ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -3445,6 +4129,36 @@ mod tests {
             .await
             .expect("router oneshot")
             .status()
+    }
+
+    /// Like `post_events` but also returns the UTF-8 response body.
+    async fn post_events_with_body(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+    ) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let resp = crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/events")
+                    .header(header::HOST, host)
+                    .header("x-pubkey", pubkey_hex)
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Collect buzz_events_rejected_total with (transport, reason) labels from
@@ -3587,6 +4301,245 @@ mod tests {
             counts.get(&("http".to_owned(), "invalid".to_owned())),
             Some(&1),
             "IngestError::Rejected arm must increment transport=http,reason=invalid"
+        );
+    }
+
+    /// Canvas ingest wiring regression: the kind-40100-specific future-timestamp
+    /// guard in `ingest_event_inner` is actually wired to the shipping call path.
+    ///
+    /// Calls `post_events_with_body` → router → `submit_event` → `ingest_event_inner`:
+    /// - A canvas event with `created_at = relay_now + 600` is rejected 400 with
+    ///   the canvas-specific error "canvas event timestamp too far in the future".
+    ///
+    /// The +600 offset sits 300 s above the canvas ceiling (300 s) and 300 s
+    /// below the general drift bound (900 s). Scheduler latency between test
+    /// setup and production's independent `Utc::now()` re-sample would need to
+    /// exceed 300 s to erode the margin — not possible under any realistic load.
+    /// Exact 300/301 boundary coverage lives in the pure `validate_canvas_future_timestamp`
+    /// tests (`canvas_ingest_numeric_contract`, `canvas_ingest_future_timestamp_boundary`),
+    /// which pass fixed arguments and have no clock race.
+    ///
+    /// Discriminating: deleting the `if kind_u32 == KIND_CANVAS { … }` call in
+    /// `ingest_event_inner` removes the guard. The event then passes the general
+    /// ±900 s drift check (600 s < 900 s) and reaches the channel membership
+    /// check (no h-tag channel exists → "restricted: not a channel member"),
+    /// making the message assertion below fail with a different body.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn canvas_ingest_future_timestamp_guard_is_wired() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(bridge_handler_test_state()) else {
+            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+        };
+
+        let host = {
+            let h = format!(
+                "canvas-ingest-wiring-{}.local",
+                uuid::Uuid::new_v4().simple()
+            );
+            rt.block_on(state.db.ensure_configured_community(&h))
+                .expect("ensure community");
+            h
+        };
+
+        let client_keys = Keys::generate();
+        let pubkey_hex = client_keys.public_key().to_hex();
+
+        // A canvas event 600 s in the future. The +600 offset sits 300 s above
+        // the canvas ceiling and 300 s below the general ±900 s drift bound, so
+        // only the canvas guard can produce a rejection here. Scheduler latency
+        // between this Utc::now() call and production's independent re-sample
+        // would need to exceed 300 s to erode the margin — impossible in practice.
+        // Exact 300/301 boundary assertions live in the pure fixed-literal tests.
+        let relay_now = chrono::Utc::now().timestamp();
+        // Use a random channel UUID that does NOT exist in the DB. If the canvas
+        // guard is correctly wired, it fires first; if deleted, the event passes
+        // the general ±900 s check (600 < 900) and reaches the membership check,
+        // producing "not a channel member" instead of the canvas rejection.
+        let channel_id = uuid::Uuid::new_v4().to_string();
+        let event_past_ceiling =
+            EventBuilder::new(Kind::Custom(buzz_core::kind::KIND_CANVAS as u16), "")
+                .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+                .custom_created_at(nostr::Timestamp::from(
+                    (relay_now + 600).try_into().unwrap_or(0u64),
+                ))
+                .sign_with_keys(&client_keys)
+                .expect("sign canvas event past ceiling");
+        let body_bytes =
+            serde_json::to_vec(&event_past_ceiling).expect("serialize event past ceiling");
+
+        let (status, body) = rt.block_on(post_events_with_body(
+            state.clone(),
+            &host,
+            &pubkey_hex,
+            &body_bytes,
+        ));
+
+        // Must be 400 AND the body must name the canvas guard (not the membership check).
+        // Mutation oracle: deleting the `if kind_u32 == KIND_CANVAS { … }` guard
+        // makes the body say "not a channel member" instead, failing both assertions.
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "canvas event at relay_now+600 must be rejected 400; body: {body}",
+        );
+        assert!(
+            body.contains("canvas event timestamp too far in the future"),
+            "rejection body must name the canvas guard (not the membership check). \
+             Got: {body}; mutation oracle: delete the guard call site → body becomes \
+             'not a channel member'",
+        );
+    }
+
+    /// Wire-pinning test: a canvas CAS conflict must reach the HTTP client as
+    /// **409 CONFLICT**, not 400.
+    ///
+    /// The relay's `IngestError::CanvasConflict` variant maps to `409` via the
+    /// `bridge.rs` HTTP handler.  The CLI reconciliation branch gates on
+    /// `status == 409`; if the bridge emits `400` instead the reconciliation
+    /// path is dead code against the live relay.
+    ///
+    /// Scenario:
+    /// 1. POST canvas event A (no `expected-revision` tag) → 200, head = A.
+    /// 2. POST canvas event B with `expected-revision: <A-id>` → 200, head = B.
+    /// 3. POST canvas event C with `expected-revision: <A-id>` (stale, A ≠ B)
+    ///    → 409 with a body containing `"canvas changed since it was loaded"`.
+    ///
+    /// Mutation oracle: mapping `IngestError::CanvasConflict` to
+    /// `StatusCode::BAD_REQUEST` (reverting the fix) makes step 3 return 400
+    /// and fails the status assertion. The body assertion separately pins the
+    /// exact `error` envelope value.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn canvas_cas_conflict_yields_409_through_http_bridge() {
+        use buzz_core::kind::KIND_CANVAS;
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use uuid::Uuid;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let Some(state) = rt.block_on(bridge_handler_test_state()) else {
+            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+        };
+
+        let (host, channel_id) = rt.block_on(async {
+            let h = format!("canvas-cas-409-wiring-{}.local", Uuid::new_v4().simple());
+            let community = state
+                .db
+                .ensure_configured_community(&h)
+                .await
+                .expect("ensure community");
+            let creator_keys = Keys::generate();
+            let (channel, _) = state
+                .db
+                .create_channel_with_id(
+                    community.id,
+                    Uuid::new_v4(),
+                    &format!("canvas-cas-409-{}", Uuid::new_v4().simple()),
+                    ChannelType::Stream,
+                    ChannelVisibility::Open,
+                    None,
+                    creator_keys.public_key().to_bytes().as_slice(),
+                    None,
+                )
+                .await
+                .expect("create test channel");
+            (h, channel.id.to_string())
+        });
+
+        let author_keys = Keys::generate();
+        let pubkey_hex = author_keys.public_key().to_hex();
+
+        let relay_now = chrono::Utc::now().timestamp() as u64;
+
+        // Step 1: unconditional first write — establishes head A.
+        let event_a = EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# first canvas")
+            .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+            .custom_created_at(nostr::Timestamp::from(relay_now))
+            .sign_with_keys(&author_keys)
+            .expect("sign canvas event A");
+        let event_a_id = event_a.id.to_hex();
+        let body_a = serde_json::to_vec(&event_a).expect("serialize event A");
+
+        let (status_a, _) = rt.block_on(post_events_with_body(
+            state.clone(),
+            &host,
+            &pubkey_hex,
+            &body_a,
+        ));
+        assert_eq!(
+            status_a,
+            axum::http::StatusCode::OK,
+            "first canvas write must be accepted"
+        );
+
+        // Step 2: write B on top of A — advances head so A is no longer current.
+        let event_b = EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# second canvas (on A)")
+            .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+            .tag(
+                Tag::parse(["expected-revision", event_a_id.as_str()])
+                    .expect("expected-revision tag"),
+            )
+            .custom_created_at(nostr::Timestamp::from(relay_now + 1))
+            .sign_with_keys(&author_keys)
+            .expect("sign canvas event B");
+        let body_b = serde_json::to_vec(&event_b).expect("serialize event B");
+
+        let (status_b, _) = rt.block_on(post_events_with_body(
+            state.clone(),
+            &host,
+            &pubkey_hex,
+            &body_b,
+        ));
+        assert_eq!(
+            status_b,
+            axum::http::StatusCode::OK,
+            "second canvas write (B on A) must be accepted"
+        );
+
+        // Step 3: stale write C with the same `expected-revision: A` — A is no
+        // longer the head (B is), so this must be a CAS conflict → HTTP 409.
+        // Mutation oracle: reverting IngestError::CanvasConflict → BAD_REQUEST
+        // in bridge.rs makes this return 400 and fails the status assertion.
+        let event_c = EventBuilder::new(
+            Kind::Custom(KIND_CANVAS as u16),
+            "# stale write (still on A)",
+        )
+        .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+        .tag(Tag::parse(["expected-revision", event_a_id.as_str()]).expect("expected-revision tag"))
+        .custom_created_at(nostr::Timestamp::from(relay_now + 2))
+        .sign_with_keys(&author_keys)
+        .expect("sign canvas event C");
+        let body_c = serde_json::to_vec(&event_c).expect("serialize event C");
+
+        let (status_c, body_text) = rt.block_on(post_events_with_body(
+            state.clone(),
+            &host,
+            &pubkey_hex,
+            &body_c,
+        ));
+
+        assert_eq!(
+            status_c,
+            axum::http::StatusCode::CONFLICT,
+            "stale canvas CAS write must yield 409 CONFLICT (not 400); body: {body_text}"
+        );
+        // Parse the response body and assert the exact canonical `error` value to
+        // pin the byte-preservation contract. A substring check would pass even if
+        // the message were embedded elsewhere; this ensures the envelope is intact.
+        let body_json: serde_json::Value =
+            serde_json::from_str(&body_text).expect("response body must be valid JSON");
+        assert_eq!(
+            body_json.get("error").and_then(|v| v.as_str()),
+            Some("conflict: canvas changed since it was loaded"),
+            "409 body must carry the exact canonical error value. Got: {body_text}"
         );
     }
 
@@ -3771,5 +4724,460 @@ mod tests {
             log.contains(&pubkey_hex[..16]),
             "attribution line must carry the pubkey;\nlog:\n{log}"
         );
+    }
+
+    /// T3c — log fidelity for canvas CAS conflict: the terminal attribution line
+    /// must log `status=409`, not 400, when the relay emits a canvas CAS 409.
+    ///
+    /// Before the fix, `SubmitOutcome::Rejected` hardcoded `status = 400u16` in
+    /// its logging arm, so every canvas CAS conflict — which now correctly
+    /// returns HTTP 409 to the client — was misattributed as 400 in the relay
+    /// log.  This test pins both the log fidelity and the 400 control so the
+    /// distinction is exercised in the same run.
+    ///
+    /// - **CAS branch:** a stale canvas write (RevisionMismatch) must log `status=409`.
+    /// - **Generic-rejection control:** a relay-only-kind event must log `status=400`.
+    ///
+    /// Discriminating: restoring `status = 400u16` in bridge.rs's `Rejected` logging
+    /// arm causes the CAS `status=409` assertion to fail while the 400 control
+    /// continues to pass — the test is split so the regression direction is unambiguous.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn canvas_cas_conflict_logs_status_409_not_400() {
+        use buzz_core::kind::KIND_CANVAS;
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use uuid::Uuid;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let state = rt
+            .block_on(bridge_handler_test_state())
+            .expect("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+
+        let (host, channel_id) = rt.block_on(async {
+            let h = format!("canvas-cas-log-{}.local", Uuid::new_v4().simple());
+            let community = state
+                .db
+                .ensure_configured_community(&h)
+                .await
+                .expect("ensure community");
+            let creator_keys = nostr::Keys::generate();
+            let (channel, _) = state
+                .db
+                .create_channel_with_id(
+                    community.id,
+                    Uuid::new_v4(),
+                    &format!("log-test-{}", Uuid::new_v4().simple()),
+                    ChannelType::Stream,
+                    ChannelVisibility::Open,
+                    None,
+                    creator_keys.public_key().to_bytes().as_slice(),
+                    None,
+                )
+                .await
+                .expect("create test channel");
+            (h, channel.id.to_string())
+        });
+
+        let author_keys = Keys::generate();
+        let pubkey_hex = author_keys.public_key().to_hex();
+        let relay_now = chrono::Utc::now().timestamp() as u64;
+
+        // Establish head A with an unconditional write.
+        let event_a = EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# head")
+            .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+            .custom_created_at(nostr::Timestamp::from(relay_now))
+            .sign_with_keys(&author_keys)
+            .expect("sign event A");
+        let event_a_id = event_a.id.to_hex();
+        let body_a = serde_json::to_vec(&event_a).expect("serialize event A");
+        // Accept A silently (no log assertion here).
+        rt.block_on(post_events(state.clone(), &host, &pubkey_hex, &body_a));
+
+        // Advance head to B.
+        let event_b = EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# head B")
+            .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+            .tag(
+                Tag::parse(["expected-revision", event_a_id.as_str()])
+                    .expect("expected-revision tag"),
+            )
+            .custom_created_at(nostr::Timestamp::from(relay_now + 1))
+            .sign_with_keys(&author_keys)
+            .expect("sign event B");
+        let body_b = serde_json::to_vec(&event_b).expect("serialize event B");
+        rt.block_on(post_events(state.clone(), &host, &pubkey_hex, &body_b));
+
+        // Stale write C: still expects A, but B is now head → RevisionMismatch → 409.
+        // Capture the log to assert the logged status.
+        let event_c = EventBuilder::new(Kind::Custom(KIND_CANVAS as u16), "# stale")
+            .tag(Tag::parse(["h", channel_id.as_str()]).expect("h tag"))
+            .tag(
+                Tag::parse(["expected-revision", event_a_id.as_str()])
+                    .expect("expected-revision tag"),
+            )
+            .custom_created_at(nostr::Timestamp::from(relay_now + 2))
+            .sign_with_keys(&author_keys)
+            .expect("sign event C");
+        let body_c = serde_json::to_vec(&event_c).expect("serialize event C");
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let (status_cas, log_cas) = metrics::with_local_recorder(&recorder, || {
+            run_and_capture(&rt, state.clone(), &host, &pubkey_hex, &body_c)
+        });
+
+        assert_eq!(
+            status_cas,
+            axum::http::StatusCode::CONFLICT,
+            "canvas CAS conflict must yield HTTP 409"
+        );
+        // The log must record the real response status, not the former hardcoded 400.
+        // Discriminating: restoring `status = 400u16` in the Rejected logging arm
+        // makes this assertion fail while the generic-rejection control below still passes.
+        assert!(
+            log_cas.contains("status=409"),
+            "terminal attribution line must log status=409 for canvas CAS conflict;\nlog:\n{log_cas}"
+        );
+        assert_eq!(
+            count_attribution_lines(&log_cas),
+            1,
+            "exactly one attribution line for canvas CAS conflict;\nlog:\n{log_cas}"
+        );
+
+        // ── Generic-rejection control ────────────────────────────────────────
+        // A relay-only-kind event is still a Rejected outcome → HTTP 400.
+        // This control confirms the fix does not break generic-rejection logging.
+        let relay_only_event = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as u16),
+            "",
+        )
+        .sign_with_keys(&author_keys)
+        .expect("sign relay-only event");
+        let relay_only_json = serde_json::to_vec(&relay_only_event).expect("serialize");
+
+        let recorder2 = metrics_util::debugging::DebuggingRecorder::new();
+        let (status_generic, log_generic) = metrics::with_local_recorder(&recorder2, || {
+            run_and_capture(&rt, state.clone(), &host, &pubkey_hex, &relay_only_json)
+        });
+
+        assert_eq!(
+            status_generic,
+            axum::http::StatusCode::BAD_REQUEST,
+            "generic rejection must still yield HTTP 400"
+        );
+        assert!(
+            log_generic.contains("status=400"),
+            "generic rejection must log status=400;\nlog:\n{log_generic}"
+        );
+        assert_eq!(
+            count_attribution_lines(&log_generic),
+            1,
+            "exactly one attribution line for generic rejection;\nlog:\n{log_generic}"
+        );
+    }
+
+    /// Drive a single POST /query request through the router and return the
+    /// HTTP status code + body bytes.
+    async fn post_query(
+        state: Arc<crate::state::AppState>,
+        host: &str,
+        pubkey_hex: &str,
+        body: &[u8],
+    ) -> (axum::http::StatusCode, axum::body::Bytes) {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let resp = crate::router::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header(header::HOST, host)
+                    .header("x-pubkey", pubkey_hex)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_vec()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        (status, bytes)
+    }
+
+    // ── Bridge dispatch test: writer-pin routes to the writer pool ────────────
+    //
+    // Exercises the catchall dispatch loop's `ReadRoute` match at the shipping
+    // seam — the production `match read_route { Writer => db.query_events(...),
+    // Routed => db.query_events_routed(...) }` block.
+    //
+    // The test stages divergent data: a kind-40100 canvas event is inserted into
+    // the writer pool only. The replica pool starts empty for that channel. With
+    // the fence open and a bounded-staleness budget set, `query_events_routed`
+    // routes to the replica and sees nothing. `query_events` reads the writer
+    // and sees the event.
+    //
+    // DoD sequence:
+    //   1. Routed read (no consistency field) → replica → event absent. This
+    //      proves the replica path is genuinely live in this harness; otherwise
+    //      the strong-read probe proves nothing.
+    //   2. Strong read (consistency=strong) → writer → event present.
+    //   3. Malformed consistency value → 400.
+    //
+    // Mutation oracle: changing the `ReadRoute::Writer` arm to call
+    // `db.query_events_routed` makes probe 2 return empty (same as probe 1) →
+    // the `assert_eq!(strong_events.len(), 1)` assertion fails. This is the
+    // direct evidence Thufir required: the dispatch IS the seam, and breaking
+    // the arm breaks this test.
+    //
+    // Infrastructure: two scratch Postgres databases on the local instance.
+    // Requires the same local Postgres as the other `#[ignore]` bridge tests.
+    #[test]
+    #[ignore = "requires Postgres"]
+    fn strong_consistency_dispatches_to_writer_pool_not_replica() {
+        use buzz_core::CommunityId;
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use sqlx::PgPool;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+
+        let admin_url = std::env::var("TEST_DATABASE_URL")
+            .unwrap_or_else(|_| crate::test_support::database_url());
+
+        // Create a scratch database and run migrations on it.
+        async fn scratch_db(admin: &PgPool, admin_url: &str, suffix: &str) -> (PgPool, String) {
+            let name = format!(
+                "bridge_dispatch_{}_{}",
+                suffix,
+                uuid::Uuid::new_v4().simple()
+            );
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+                .execute(admin)
+                .await
+                .unwrap_or_else(|e| panic!("create scratch db {name}: {e}"));
+            let slash = admin_url
+                .rfind('/')
+                .expect("URL must have a path component");
+            let url = format!("{}/{name}", &admin_url[..slash]);
+            let pool = PgPool::connect(&url)
+                .await
+                .unwrap_or_else(|e| panic!("connect scratch db {name}: {e}"));
+            buzz_db::migration::run_migrations(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("migrate scratch db {name}: {e}"));
+            (pool, name)
+        }
+
+        async fn drop_scratch(admin: &PgPool, pool: PgPool, name: &str) {
+            drop(pool);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+            )))
+            .execute(admin)
+            .await;
+        }
+
+        // --- setup -----------------------------------------------------------
+        let admin = rt.block_on(PgPool::connect(&admin_url)).expect(
+            "connect admin pool — start local Postgres before running ignored bridge tests",
+        );
+
+        let (writer_pool, writer_name) = rt.block_on(scratch_db(&admin, &admin_url, "w"));
+        let (replica_pool, replica_name) = rt.block_on(scratch_db(&admin, &admin_url, "r"));
+
+        let community = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let host = format!("dispatch-test-{}.local", community.simple());
+        let author = Keys::generate();
+
+        // Seed community + open channel on both writer and replica.
+        rt.block_on(async {
+            for pool in [&writer_pool, &replica_pool] {
+                sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                    .bind(community)
+                    .bind(&host)
+                    .execute(pool)
+                    .await
+                    .expect("seed community");
+                buzz_db::channel::create_channel_with_id(
+                    pool,
+                    CommunityId::from_uuid(community),
+                    channel_id,
+                    &format!("canvas-{}", channel_id.simple()),
+                    ChannelType::Stream,
+                    ChannelVisibility::Open,
+                    None,
+                    author.public_key().to_bytes().as_slice(),
+                    None,
+                )
+                .await
+                .expect("create channel");
+            }
+        });
+
+        // Writer-only canvas event: inserted on writer, NOT replicated.
+        let canvas_ev = EventBuilder::new(
+            Kind::Custom(buzz_core::kind::KIND_CANVAS as u16),
+            "writer-only canvas content",
+        )
+        .tag(Tag::custom(
+            nostr::TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
+            [channel_id.to_string()],
+        ))
+        .sign_with_keys(&author)
+        .expect("sign canvas event");
+
+        rt.block_on(async {
+            let db_w = buzz_db::Db::from_pool(writer_pool.clone());
+            db_w.insert_event(
+                CommunityId::from_uuid(community),
+                &canvas_ev,
+                Some(channel_id),
+            )
+            .await
+            .expect("insert canvas event on writer");
+            // replica_pool deliberately receives no canvas events.
+        });
+
+        // --- build AppState with two-pool Db ---------------------------------
+        let state = rt.block_on(async {
+            let mut config = crate::config::Config::from_env()
+                .expect("Config::from_env required — set DATABASE_URL, REDIS_URL, etc.");
+            config.database_url = crate::test_support::database_url();
+            config.redis_url =
+                std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            config.relay_url = "wss://dispatch-test.local".to_string();
+            config.require_auth_token = false;
+            config.require_relay_membership = false;
+
+            let mut db = buzz_db::Db::from_pools(writer_pool.clone(), replica_pool.clone());
+            // Open the freshness fence and set a bounded-staleness budget so
+            // `query_events_routed` actually routes to the replica pool.
+            db.fence().force_open_for_tests(chrono::Utc::now());
+            db.set_replica_read_max_age_for_tests(Some(std::time::Duration::from_secs(5)));
+
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .expect("redis pool");
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .expect("pubsub manager"),
+            );
+            let audit = buzz_audit::AuditService::new(writer_pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(writer_pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage =
+                buzz_media::MediaStorage::new(&config.media).expect("media storage");
+
+            let (mut state, _audit_shutdown) = crate::state::AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                Keys::generate(),
+                media_storage,
+            );
+            state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
+            Arc::new(state)
+        });
+
+        let pubkey_hex = author.public_key().to_hex();
+        let channel_str = channel_id.to_string();
+
+        // Probe 1: routed read (no consistency) → replica → event absent.
+        // This proves the replica path is genuinely live in this harness.
+        let body = serde_json::to_vec(&serde_json::json!([{
+            "kinds": [buzz_core::kind::KIND_CANVAS as u64],
+            "#h": [&channel_str],
+            "limit": 10,
+        }]))
+        .expect("serialize routed filter");
+        let (status, resp_body) = rt.block_on(post_query(state.clone(), &host, &pubkey_hex, &body));
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "Probe 1: routed query must return 200: {}",
+            String::from_utf8_lossy(&resp_body)
+        );
+        let routed_events: Vec<serde_json::Value> =
+            serde_json::from_slice(&resp_body).expect("parse routed response");
+        assert!(
+            routed_events.is_empty(),
+            "Probe 1 FAIL — routed read must NOT see writer-only canvas event \
+             (replica pool is empty for this channel): {routed_events:?}"
+        );
+
+        // Probe 2: writer-pinned read (consistency=strong) → writer pool → event present.
+        // Mutation oracle: changing Writer arm to query_events_routed → probe 2 returns
+        // empty → assertion fails.
+        let body = serde_json::to_vec(&serde_json::json!([{
+            "kinds": [buzz_core::kind::KIND_CANVAS as u64],
+            "#h": [&channel_str],
+            "limit": 10,
+            "consistency": "strong",
+        }]))
+        .expect("serialize strong filter");
+        let (status, resp_body) = rt.block_on(post_query(state.clone(), &host, &pubkey_hex, &body));
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "Probe 2: strong query must return 200: {}",
+            String::from_utf8_lossy(&resp_body)
+        );
+        let strong_events: Vec<serde_json::Value> =
+            serde_json::from_slice(&resp_body).expect("parse strong response");
+        assert_eq!(
+            strong_events.len(),
+            1,
+            "Probe 2 FAIL — strong-consistency read MUST see the writer-only canvas event. \
+             Mutation oracle: if ReadRoute::Writer dispatches to query_events_routed instead \
+             of query_events, this returns empty and this assertion fails: {strong_events:?}"
+        );
+        assert_eq!(
+            strong_events[0].get("content").and_then(|v| v.as_str()),
+            Some("writer-only canvas content"),
+            "strong read must return the canvas event inserted into the writer pool"
+        );
+
+        // Probe 3: malformed consistency value must 400.
+        let body = serde_json::to_vec(&serde_json::json!([{
+            "kinds": [buzz_core::kind::KIND_CANVAS as u64],
+            "#h": [&channel_str],
+            "consistency": "weak",
+        }]))
+        .expect("serialize bad filter");
+        let (status, _) = rt.block_on(post_query(state.clone(), &host, &pubkey_hex, &body));
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "Probe 3 FAIL — unknown consistency value must be rejected with 400"
+        );
+
+        // --- teardown --------------------------------------------------------
+        rt.block_on(async {
+            let admin2 = PgPool::connect(&admin_url)
+                .await
+                .expect("reconnect admin for teardown");
+            drop_scratch(&admin2, writer_pool, &writer_name).await;
+            drop_scratch(&admin2, replica_pool, &replica_name).await;
+        });
     }
 }
