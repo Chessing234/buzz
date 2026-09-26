@@ -1,58 +1,61 @@
 # Pi adapter integration
 
-Buzz's Pi preset uses [salman1993/pi-acp](https://github.com/salman1993/pi-acp).
-Requires Node.js 22 or newer. Install Pi and configure its model provider,
-then install the adapter directly from the fork:
+Buzz uses the [buzz-pi-acp fork](https://github.com/salman1993/buzz-pi-acp).
+Install Node.js 22 or newer, configure Pi, and install the latest development
+adapter from the fork's `main` branch:
 
 ```sh
 npm install -g @earendil-works/pi-coding-agent
 pi
-npm install -g --install-links=true git+https://github.com/salman1993/pi-acp.git#main
+npm install -g --install-links=true 'git+https://github.com/salman1993/buzz-pi-acp.git#main'
 ```
 
-Restart Buzz, then select **Pi** as the agent harness. Buzz starts `buzz-pi-acp`
-automatically. Run the same adapter install command again to update it.
-The unscoped `npm install -g pi-acp` command installs the upstream package,
-without these extensions. Use fresh sessions to replace old user-framed
-standing instructions.
+This test setup intentionally tracks `main`; the Desktop runtime catalog pins a
+reviewed adapter revision for users.
 
-Buzz adds `-- --skill <harness-cwd>/.agents/skills` when launching `buzz-pi-acp`.
-An existing separator and explicit Pi options are preserved. Managed agents
-run from the Buzz nest (normally `~/.buzz`): Desktop sets the `buzz-acp` child
-CWD through `default_agent_workdir()`, and adapters inherit it. The default
-skill directory is that launch workspace's `.agents/skills`. Standalone CLI
-launches use the caller's working directory.
-The path is fixed at adapter launch and applies to every Pi subprocess.
+Make sure `pi` and `buzz-pi-acp` are on PATH, then restart Buzz.
 
-The full composed session prompt is sent as a replacement string through the
-provisional `session/new.params._meta.systemPrompt` field. Buzz recognizes
-`buzz-pi-acp` by the agent name returned during initialization, regardless of
-protocol version. Upstream `pi-acp` does not receive this fork-specific metadata.
-No custom capability negotiation or legacy Pi prompt fallback is used.
-Session titles continue to use `_meta.sessionTitle`.
-
-## Validation
-
-Activate Hermit from the Buzz repository root, then run the package tests:
+## Tests
 
 ```sh
-. ./bin/activate-hermit
 cargo test -p buzz-acp
 ```
 
-To exercise the real adapter through Buzz's production session composer:
+Managed agent sessions may already export harness options. Clear them when
+running the package suite: three CLI parsing tests assert the unset defaults,
+and inherited values would change the inputs those tests exercise. Running the
+package serially also avoids scheduling flakes in existing short-deadline tests.
 
 ```sh
-BUZZ_TEST_PI_ACP=/absolute/pi-acp/dist/index.js \
+env -u BUZZ_ACP_ALLOWED_RESPOND_TO \
+  -u BUZZ_ACP_LAZY_POOL \
+  -u BUZZ_ACP_IDLE_POOL_SLEEP \
+  cargo test -p buzz-acp -- --test-threads=1
+```
+
+Run the ignored real-adapter test with a built fork checkout:
+
+```sh
+BUZZ_TEST_PI_ACP=/absolute/buzz-pi-acp/dist/index.js \
   cargo test -p buzz-acp real_pi_preserves -- --ignored
 ```
 
-This test requires Node and Pi on PATH. It isolates HOME and Pi settings,
-disables extensions and context files, and uses a synthetic transcript without
-model calls. It inspects Pi's effective prompt through RPC HTML export after
-switching sessions and restarting the adapter. Base, persona, team, core memory,
-huddle, canvas, and the extra skill must each appear once, without another
-session's instructions or Pi's default coding preamble.
+## Git bootstrap
 
-HTML export reports the exporting process's current system prompt. It cannot
-recover a historical prompt from an old transcript alone.
+`cargo test -p buzz-acp --test git_bootstrap` starts the actual harness with a
+probe adapter, runs real signed commits/tags and scoped credential resolution,
+and verifies key cleanup on startup failure and SIGTERM. No relay is contacted.
+
+To exercise the real runtime boundaries on Unix:
+
+```sh
+cargo build -p buzz-acp -p buzz-agent -p buzz-dev-mcp
+BUZZ_TEST_BIN_DIR="$PWD/target/debug" cargo test -p buzz-acp git_runtime_tests -- --ignored --nocapture
+```
+
+The Buzz Agent test uses a deterministic local OpenAI-compatible response to
+invoke the actual MCP shell. The Goose test requires an installed, configured
+Goose and uses its provider to invoke the native developer shell. Both operate
+only on temporary local repositories, verify commit/tag signatures and identity,
+check unrelated-remote credential scoping, and assert keyfile removal. They do
+not replace authenticated relay clone/push/readback testing.
