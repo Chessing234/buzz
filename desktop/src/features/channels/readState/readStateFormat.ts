@@ -38,17 +38,10 @@ export const THREAD_PREFIX = "thread:";
 const EVENT_ID_PATTERN = /^[0-9a-f]{64}$/;
 
 // How far ahead of this machine's clock a read marker may plausibly land.
-// `created_at` is self-asserted by the sending client and the relay does not
-// bound it for ordinary messages, so an unbounded marker lets one future-dated
-// event mark every later message in the channel as already read — no badge, no
-// divider, no thread resume — until wall-clock time catches up with it.
-//
-// A tolerance rather than a hard `now` ceiling: ordinary skew between two
-// machines is seconds, and rejecting that would drop a marker a sibling device
-// legitimately wrote. 120s matches the relay's own `MAX_COMMAND_SKEW_SECS`
-// (`handlers/moderation_commands.rs`), the house number for "clock difference
-// we accept"; NIP-AB already says clients MUST NOT set `created_at` in the
-// future at all.
+// This is the desktop read-state policy, not the relay's message acceptance
+// bound. A future marker can hide later messages until this clock catches up.
+// The tolerance permits small clock differences between devices; reconciling
+// it with relay-accepted timestamps and slow local clocks remains separate.
 export const MAX_READ_MARKER_SKEW_SECONDS = 120;
 
 export function nowUnixSeconds(): number {
