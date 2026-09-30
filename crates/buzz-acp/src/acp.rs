@@ -2256,6 +2256,25 @@ pub fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<Str
     None
 }
 
+// Keep the fresh resolver and cached guard on the same actionable values.
+fn model_config_candidates(config_options: &[serde_json::Value]) -> Vec<(&str, &str)> {
+    config_options
+        .iter()
+        .flat_map(|option| {
+            let config_id = option
+                .get("configId")
+                .or_else(|| option.get("id"))
+                .and_then(|v| v.as_str());
+            option
+                .get("options")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(move |value| Some((config_id?, value.get("value")?.as_str()?)))
+        })
+        .collect()
+}
+
 /// Match a desired model ID against a fresh `session/new` response.
 ///
 /// Returns the correct ACP method to call, or `None` if no match.
@@ -2266,30 +2285,18 @@ pub fn resolve_model_switch_method(
     session_new_result: &serde_json::Value,
     desired_model: &str,
 ) -> Option<ModelSwitchMethod> {
-    // 1. Search stable configOptions for a "model"-category entry whose
-    //    options contain a value matching desired_model (exact or moving-family compatibility).
-    for config_opt in extract_model_config_options(session_new_result) {
-        // Adapters disagree on the key: the ACP spec says `configId`, but
-        // claude-agent-acp emits `id`. Accept both; the set request always
-        // uses `configId` on the wire.
-        let config_id = match config_opt
-            .get("configId")
-            .or_else(|| config_opt.get("id"))
-            .and_then(|v| v.as_str())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        if let Some(options) = config_opt.get("options").and_then(|v| v.as_array()) {
-            let values = options
-                .iter()
-                .filter_map(|opt| opt.get("value").and_then(|v| v.as_str()));
-            if let Some(option_value) = pick_matching_model_id(values, desired_model) {
-                return Some(ModelSwitchMethod::ConfigOption {
-                    config_id: config_id.to_string(),
-                    option_value,
-                });
-            }
+    // Resolve across all model options so exact IDs beat aliases even when
+    // advertised later, and aliases in different options remain ambiguous.
+    let config_options = extract_model_config_options(session_new_result);
+    let candidates = model_config_candidates(&config_options);
+    if let Some(option_value) =
+        pick_matching_model_id(candidates.iter().map(|(_, value)| *value), desired_model)
+    {
+        if let Some((config_id, _)) = candidates.iter().find(|(_, value)| *value == option_value) {
+            return Some(ModelSwitchMethod::ConfigOption {
+                config_id: (*config_id).to_string(),
+                option_value,
+            });
         }
     }
 
@@ -2320,15 +2327,8 @@ pub fn model_in_catalog(
     available_models: Option<&serde_json::Value>,
     desired_model: &str,
 ) -> bool {
-    let config_values = config_options.iter().flat_map(|config_opt| {
-        config_opt
-            .get("options")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|opt| opt.get("value").and_then(|v| v.as_str()))
-    });
-    if pick_matching_model_id(config_values, desired_model).is_some() {
+    let candidates = model_config_candidates(config_options);
+    if pick_matching_model_id(candidates.iter().map(|(_, value)| *value), desired_model).is_some() {
         return true;
     }
 
@@ -3041,6 +3041,45 @@ mod tests {
             Some("opus[1m]".to_string())
         );
         assert!(super::pick_matching_model_id(["opus[1m]", "opus[fast=true]"], "opus").is_none());
+    }
+
+    #[test]
+    fn model_selection_agrees_across_separate_config_options() {
+        for (second, expected) in [("opus[fast=true]", None), ("opus", Some("opus"))] {
+            let result = serde_json::json!({"configOptions": [
+                {"configId": "first", "category": "model", "options": [{"value": "opus[1m]"}]},
+                {"id": "second", "category": "model", "options": [{"value": second}]}
+            ]});
+            let resolved = super::resolve_model_switch_method(&result, "opus");
+            assert_eq!(
+                resolved,
+                expected.map(|value| super::ModelSwitchMethod::ConfigOption {
+                    config_id: "second".to_string(),
+                    option_value: value.to_string()
+                })
+            );
+            assert_eq!(
+                super::model_in_catalog(
+                    &super::extract_model_config_options(&result),
+                    None,
+                    "opus"
+                ),
+                resolved.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn model_catalog_excludes_options_without_a_config_id() {
+        let result = serde_json::json!({"configOptions": [
+            {"category": "model", "options": [{"value": "opus"}]}
+        ]});
+        assert!(super::resolve_model_switch_method(&result, "opus").is_none());
+        assert!(!super::model_in_catalog(
+            &super::extract_model_config_options(&result),
+            None,
+            "opus"
+        ));
     }
 
     #[test]
