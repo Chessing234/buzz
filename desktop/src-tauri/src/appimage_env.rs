@@ -36,8 +36,8 @@ const PATH_LIKE_KEYS: &[&str] = &["LD_LIBRARY_PATH", "PATH", "PYTHONPATH"];
 /// Apply a host-safe environment to `cmd` when running under an AppImage.
 ///
 /// No-op when `APPDIR` is unset (DMG / native installs). Prefer `ORIGINAL_*`
-/// values saved by AppRun when present; otherwise strip `$APPDIR` entries from
-/// path-like variables.
+/// values when a launcher supplies them; the current AppRun does not save them.
+/// Otherwise strip this app's mount entries from path-like variables.
 pub(crate) fn sanitize_appimage_env_for_child(cmd: &mut Command) {
     let Some(appdir) = std::env::var_os("APPDIR").map(PathBuf::from) else {
         return;
@@ -110,7 +110,15 @@ fn sibling_mount_pattern(appdir: &Path) -> Option<(&Path, &str)> {
     // `rfind`, not `find`: the random suffix is appended after the last dot.
     // Require a non-zero index so a plain dotfile name cannot degrade the
     // prefix to "." and match every hidden directory under the root.
-    let dot = name.rfind('.').filter(|dot| *dot > 0)?;
+    let app_name = name.strip_prefix(".mount_")?;
+    let (app_name, suffix) = app_name.rsplit_once('.')?;
+    if app_name.is_empty()
+        || suffix.is_empty()
+        || !suffix.bytes().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let dot = name.rfind('.')?;
     Some((root, &name[..=dot]))
 }
 
@@ -247,5 +255,42 @@ mod tests {
         assert!(sibling_mount_pattern(Path::new("/tmp/appdir")).is_none());
         // Leading dot only: a "." prefix would match every hidden directory.
         assert!(sibling_mount_pattern(Path::new("/tmp/.mount_Buzz_x")).is_none());
+        assert!(sibling_mount_pattern(Path::new("/opt/buzz.AppDir")).is_none());
+        assert!(sibling_mount_pattern(Path::new("/tmp/.mount_.ABC123")).is_none());
+        assert!(sibling_mount_pattern(Path::new("/tmp/.mount_Buzz.")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_child_keeps_user_pythonpath_and_excludes_both_mounts() {
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "tests::sanitized_child_environment_probe", "--nocapture"])
+            .env_clear()
+            .env("BUZZ_APPIMAGE_SANITIZER_TEST", "1")
+            .env("APPDIR", "/run/user/1000/.mount_Buzz.ABC123")
+            .env("PATH", "/usr/bin:/bin")
+            .env("PYTHONHOME", "/run/user/1000/.mount_Buzz.ABC123/usr")
+            .env("PYTHONPATH", "/run/user/1000/.mount_Buzz.ABC123/python:/run/user/1000/.mount_Buzz.XYZ789/python:/opt/user-python")
+            .env("LD_LIBRARY_PATH", "/run/user/1000/.mount_Buzz.ABC123/lib:/run/user/1000/.mount_Buzz.XYZ789/lib:/opt/user-libs")
+            .status()
+            .expect("run isolated environment probe");
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitized_child_environment_probe() {
+        if std::env::var_os("BUZZ_APPIMAGE_SANITIZER_TEST").is_none() {
+            return;
+        }
+        let mut child = Command::new("/usr/bin/env");
+        sanitize_appimage_env_for_child(&mut child);
+        let output = child.output().expect("spawn sanitized child");
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).expect("controlled environment is UTF-8");
+        let lines: Vec<_> = text.lines().collect();
+        assert!(lines.contains(&"PYTHONPATH=/opt/user-python"));
+        assert!(lines.contains(&"LD_LIBRARY_PATH=/opt/user-libs"));
+        assert!(!lines.iter().any(|line| line.starts_with("PYTHONHOME=")));
     }
 }
