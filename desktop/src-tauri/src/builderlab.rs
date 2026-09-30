@@ -253,16 +253,24 @@ impl BuilderlabSession {
     /// Returns the credential now in effect. If a login landed while the
     /// keyring was being read, that newer credential wins — hydration must
     /// never resurrect an older session over it, nor over a logout.
-    fn hydrate(&self, credential: String) -> Result<(String, u64), String> {
+    fn hydrate(
+        &self,
+        credential: String,
+        generation: u64,
+    ) -> Result<Option<(String, u64)>, String> {
         let mut state = self.lock()?;
         if let Some(stored) = state.stored.as_ref() {
-            return Ok((stored.credential.clone(), state.generation));
+            return Ok(Some((stored.credential.clone(), state.generation)));
+        }
+        if state.generation != generation {
+            // Logout won the race with the keyring read.
+            return Ok(None);
         }
         state.stored = Some(StoredSession {
             credential: credential.clone(),
         });
         state.generation += 1;
-        Ok((credential, state.generation))
+        Ok(Some((credential, state.generation)))
     }
 
     /// Drop the credential from memory and from the keyring.
@@ -271,25 +279,36 @@ impl BuilderlabSession {
     /// successful sign-out while the credential is still on disk means the next
     /// launch hydrates it and silently signs the user back in.
     fn clear(&self) -> Result<(), String> {
-        let mut state = self.lock()?;
-        state.stored = None;
-        state.generation += 1;
-        credential_store()
-            .delete(SESSION_CREDENTIAL_KEY)
-            .map_err(|error| format!("could not delete the stored Builderlab session: {error}"))
+        self.clear_with(None, || {
+            credential_store()
+                .delete(SESSION_CREDENTIAL_KEY)
+                .map_err(|error| format!("could not delete the stored Builderlab session: {error}"))
+        })
     }
 
     /// Drop the credential, but only if it is still the one that was checked.
     fn clear_if_current(&self, generation: u64) -> Result<(), String> {
-        {
-            let state = self.lock()?;
-            if state.generation != generation {
-                // A login or logout landed while the check was in flight; its
-                // verdict is about a credential that is no longer in use.
-                return Ok(());
-            }
+        self.clear_with(Some(generation), || {
+            credential_store()
+                .delete(SESSION_CREDENTIAL_KEY)
+                .map_err(|error| format!("could not delete the stored Builderlab session: {error}"))
+        })
+    }
+
+    fn clear_with(
+        &self,
+        generation: Option<u64>,
+        delete: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut state = self.lock()?;
+        if generation.is_some_and(|expected| state.generation != expected) {
+            return Ok(());
         }
-        self.clear()
+        // Keep the generation check, memory change and keyring deletion in
+        // one critical section, just like replacement.
+        state.stored = None;
+        state.generation += 1;
+        delete()
     }
 }
 
@@ -529,13 +548,26 @@ pub(crate) async fn get_builderlab_auth(
 ) -> Result<Option<BuilderlabAuthInfo>, String> {
     // A fresh process has nothing in memory; the credential from the last run
     // is in the keyring. Hydrate before deciding the page is signed out.
-    let (credential, generation) = match session.current()? {
-        Some(current) => current,
-        None => {
+    let snapshot = {
+        let state = session.lock()?;
+        (
+            state
+                .stored
+                .as_ref()
+                .map(|stored| stored.credential.clone()),
+            state.generation,
+        )
+    };
+    let (credential, generation) = match snapshot {
+        (Some(credential), generation) => (credential, generation),
+        (None, generation) => {
             let Some(persisted) = stored_credential()? else {
                 return Ok(None);
             };
-            session.hydrate(persisted)?
+            let Some(current) = session.hydrate(persisted, generation)? else {
+                return Ok(None);
+            };
+            current
         }
     };
     match authenticated_user(&app_state.http_client, &credential).await {
@@ -940,10 +972,78 @@ mod tests {
             state.generation += 1;
         }
 
-        let (credential, _) = session.hydrate("from-disk".into()).unwrap();
+        let (credential, _) = session.hydrate("from-disk".into(), 0).unwrap().unwrap();
         assert_eq!(
             credential, "new",
             "hydration must yield to the credential already in memory"
         );
+    }
+
+    #[test]
+    fn hydration_does_not_resurrect_a_session_after_logout() {
+        let session = BuilderlabSession::default();
+        let before_read = session.lock().unwrap().generation;
+        // The keyring read has captured its result, but logout lands before
+        // that result can be installed into memory.
+        session.clear_with(None, || Ok(())).unwrap();
+        assert!(session
+            .hydrate("from-disk".into(), before_read)
+            .unwrap()
+            .is_none());
+        assert!(session.current().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejected_session_is_deleted_under_the_session_lock() {
+        let session = BuilderlabSession::default();
+        session.lock().unwrap().stored = Some(StoredSession {
+            credential: "rejected".into(),
+        });
+        let (_, generation) = session.current().unwrap().unwrap();
+        let mut deleted = false;
+        session
+            .clear_with(Some(generation), || {
+                // A replacement cannot change either store during deletion.
+                assert!(matches!(
+                    session.0.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                deleted = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(deleted);
+        assert!(session.current().unwrap().is_none());
+        assert_eq!(session.lock().unwrap().generation, generation + 1);
+    }
+
+    #[test]
+    fn stale_rejection_does_not_touch_the_keyring() {
+        let session = BuilderlabSession::default();
+        {
+            let mut state = session.lock().unwrap();
+            state.stored = Some(StoredSession {
+                credential: "new-login".into(),
+            });
+            state.generation = 1;
+        }
+        session
+            .clear_with(Some(0), || panic!("stale rejection deleted the keyring"))
+            .unwrap();
+        assert_eq!(session.current().unwrap().unwrap().0, "new-login");
+    }
+
+    #[test]
+    fn deletion_failure_is_returned_and_invalidates_in_flight_hydration() {
+        let session = BuilderlabSession::default();
+        let before_read = session.lock().unwrap().generation;
+        assert_eq!(
+            session.clear_with(None, || Err("keyring unavailable".into())),
+            Err("keyring unavailable".into())
+        );
+        assert!(session
+            .hydrate("from-disk".into(), before_read)
+            .unwrap()
+            .is_none());
     }
 }
