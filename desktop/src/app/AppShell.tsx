@@ -112,6 +112,20 @@ export function AppShell() {
   useTauriWindowDrag();
   useWebviewScrollBoundaryLock();
   const communitiesHook = useCommunities();
+  // Each committed community lifetime gets a distinct token. An old callback
+  // keeps its token after unmount (or A -> B -> A), which cleanup invalidates.
+  const createScopeRef = React.useRef({ active: false });
+  React.useLayoutEffect(() => {
+    const scope = { active: true };
+    createScopeRef.current = scope;
+    return () => {
+      scope.active = false;
+    };
+  }, [
+    communitiesHook.activeCommunity?.id,
+    communitiesHook.activeCommunity?.relayUrl,
+  ]);
+
   const {
     handleHuddleCompanionOpen,
     handleHuddleEnded,
@@ -553,10 +567,9 @@ export function AppShell() {
       },
       onCreated?: (channelId: string) => void,
     ) => {
-      // Capture the community that initiated create. Closing the browser and
-      // switching communities while the mutation is in flight must not let the
-      // continuation applyCanvas / goChannel / agents against the new tenant.
-      const initiatingCommunityId = communitiesHook.activeCommunity?.id ?? null;
+      const scope = createScopeRef.current;
+      const isCurrent = () => scope.active && createScopeRef.current === scope;
+      if (!isCurrent()) return;
       const createdChannel = await createChannelMutation.mutateAsync({
         name,
         description,
@@ -564,15 +577,14 @@ export function AppShell() {
         visibility,
         ttlSeconds,
       });
-      if (
-        (communitiesHook.activeCommunity?.id ?? null) !== initiatingCommunityId
-      ) {
-        return;
-      }
+      if (!isCurrent()) return;
 
       await applyCanvas(templateId, createdChannel.id, name);
+      if (!isCurrent()) return;
       await goChannel(createdChannel.id);
+      if (!isCurrent()) return;
       onCreated?.(createdChannel.id);
+      if (!isCurrent()) return;
       void applyAgents(templateId, createdChannel.id);
     },
     [
@@ -597,7 +609,9 @@ export function AppShell() {
       ttlSeconds?: number;
       templateId?: string;
     }) => {
-      const initiatingCommunityId = communitiesHook.activeCommunity?.id ?? null;
+      const scope = createScopeRef.current;
+      const isCurrent = () => scope.active && createScopeRef.current === scope;
+      if (!isCurrent()) return;
       const createdForum = await createForumMutation.mutateAsync({
         name,
         description,
@@ -605,14 +619,12 @@ export function AppShell() {
         visibility,
         ttlSeconds,
       });
-      if (
-        (communitiesHook.activeCommunity?.id ?? null) !== initiatingCommunityId
-      ) {
-        return;
-      }
+      if (!isCurrent()) return;
 
       await applyCanvas(templateId, createdForum.id, name);
+      if (!isCurrent()) return;
       await goChannel(createdForum.id);
+      if (!isCurrent()) return;
       void applyAgents(templateId, createdForum.id);
     },
     [

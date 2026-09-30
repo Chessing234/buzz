@@ -276,15 +276,16 @@ fn pending_owner_mark_uses_signer_captured_before_identity_swap() {
     assert!(!state.is_pending_owned_channel(&post_swap_pubkey, "chan-1"));
 }
 
-
 #[test]
-fn signing_and_relay_scope_survives_interleaved_workspace_mutation() {
-    // Regression for the create_channel cross-community write Carl flagged:
-    // reading keys then relay under separate unlocked calls can mix tenants
-    // when `apply_workspace` lands between them. The helper locks both before
-    // returning either value.
+fn signing_and_relay_scope_snapshot_survives_later_workspace_mutation() {
+    // A captured pair remains stable when the workspace changes afterward.
+    // Writer lock acquisition is covered separately below.
     let state = crate::app_state::build_app_state();
-    let expected_pubkey = state.signing_keys().expect("signable").public_key().to_hex();
+    let expected_pubkey = state
+        .signing_keys()
+        .expect("signable")
+        .public_key()
+        .to_hex();
     let expected_relay = crate::relay::relay_api_base_url_with_override(&state);
 
     let (keys, relay) = state.signing_and_relay_scope().expect("scope");
@@ -298,7 +299,6 @@ fn signing_and_relay_scope_survives_interleaved_workspace_mutation() {
     assert_eq!(keys.public_key().to_hex(), expected_pubkey);
     assert_eq!(relay, expected_relay);
 }
-
 
 #[test]
 fn starter_channel_uuid_is_stable_and_scoped() {
@@ -536,4 +536,45 @@ fn profile_join_pubkeys_caps_in_roster_order() {
     assert_eq!(profile_join_pubkeys(&members, 3).len(), 3);
     assert_eq!(profile_join_pubkeys(&members, 10).len(), 3);
     assert!(profile_join_pubkeys(&[], 10).is_empty());
+}
+
+#[test]
+fn workspace_signing_scope_changes_relay_and_keys_together() {
+    let state = crate::app_state::build_app_state();
+    let next_keys = Keys::generate();
+    let expected_pubkey = next_keys.public_key();
+    state
+        .apply_signing_and_relay_scope("wss://next.example".to_string(), Some(next_keys))
+        .expect("apply workspace scope");
+    let (keys, relay) = state.signing_and_relay_scope().expect("capture scope");
+    assert_eq!(keys.public_key(), expected_pubkey);
+    assert_eq!(relay, "https://next.example");
+
+    state
+        .apply_signing_and_relay_scope("wss://another.example".to_string(), None)
+        .expect("apply relay without identity change");
+    let (keys, relay) = state.signing_and_relay_scope().expect("capture scope");
+    assert_eq!(keys.public_key(), expected_pubkey);
+    assert_eq!(relay, "https://another.example");
+}
+
+#[test]
+fn workspace_signing_scope_does_not_publish_relay_before_keys_lock() {
+    let state = crate::app_state::build_app_state();
+    *state.relay_url_override.lock().expect("relay lock") =
+        Some("wss://before.example".to_string());
+    // Force failure at the second lock. A writer that updates the relay before
+    // acquiring keys leaves a half-applied scope even though it returns Err.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _keys = state.keys.lock().expect("keys lock");
+        panic!("poison keys for the regression test");
+    }));
+    assert!(state
+        .apply_signing_and_relay_scope("wss://after.example".to_string(), Some(Keys::generate()))
+        .is_err());
+    let relay = state
+        .relay_url_override
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(relay.as_deref(), Some("wss://before.example"));
 }

@@ -67,15 +67,27 @@ impl AppState {
             .map(|k| k.clone())
     }
 
+    /// Install a workspace relay and optional identity under the same locks
+    /// used by `signing_and_relay_scope`, without exposing a half-applied pair.
+    pub fn apply_signing_and_relay_scope(
+        &self,
+        relay_url: String,
+        keys: Option<Keys>,
+    ) -> Result<(), String> {
+        let mut override_guard = self.relay_url_override.lock().map_err(|e| e.to_string())?;
+        let mut keys_guard = self.keys.lock().map_err(|e| e.to_string())?;
+        *override_guard = Some(relay_url);
+        if let Some(keys) = keys {
+            *keys_guard = keys;
+        }
+        Ok(())
+    }
 
     /// Capture the active signing identity and workspace relay as one coherent
     /// scope for a multi-await command.
     ///
-    /// `apply_workspace` mutates `relay_url_override` and `keys` under separate
-    /// mutexes. Reading them with two unlocked calls can therefore mix tenant
-    /// A's signer with tenant B's relay. Lock both in the same order
-    /// `apply_workspace` writes them (override, then keys) so the pair is
-    /// coherent for the command's submit + follow-up queries.
+    /// Readers and the workspace writer hold both mutexes together, in relay
+    /// then keys order, so the command cannot capture a half-applied workspace.
     pub fn signing_and_relay_scope(&self) -> Result<(Keys, String), String> {
         if self
             .identity_lost
@@ -88,10 +100,7 @@ impl AppState {
                  until the identity is restored and Buzz is relaunched"
                 .to_string());
         }
-        let override_guard = self
-            .relay_url_override
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let override_guard = self.relay_url_override.lock().map_err(|e| e.to_string())?;
         let keys_guard = self.keys.lock().map_err(|e| e.to_string())?;
         let relay_base = match override_guard.as_ref() {
             Some(url) => crate::relay::relay_http_base_url(url),
