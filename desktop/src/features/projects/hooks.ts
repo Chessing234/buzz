@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
 import { relayClient } from "@/shared/api/relayClient";
-import { projectCommentKindAndChannelTags } from "./projectCommentPublish";
+import { projectCommentKindAndChannelTags } from "./projectCommentPublish.mjs";
 import { getRelaySelf } from "@/features/moderation/lib/relaySelf";
 import { signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
