@@ -1,11 +1,14 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/filter_chip_bar.dart';
+import '../../shared/widgets/bee_refresh_indicator.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
 import 'agent_activity_card.dart';
@@ -22,6 +25,7 @@ class PulsePage extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final active = useState(PulseTab.everyone);
+    final isIos = defaultTargetPlatform == TargetPlatform.iOS;
     final currentPubkey = ref.watch(myPubkeyProvider);
     final contactsAsync = currentPubkey == null
         ? const AsyncValue<List<ContactEntry>>.data([])
@@ -53,8 +57,11 @@ class PulsePage extends HookConsumerWidget {
         reactions.asData?.value ?? const <String, PulseReactionState>{};
 
     return FrostedScaffold(
+      // Reset the native collapse state together with the new timeline.
+      key: isIos ? ValueKey(active.value) : null,
+      nativePinnedBody: true,
       resizeToAvoidBottomInset: true,
-      appBar: const FrostedAppBar(title: Text('Pulse')),
+      appBar: const FrostedAppBar(nativeLargeTitle: true, title: Text('Pulse')),
       floatingActionButton: FloatingActionButton(
         heroTag: 'pulse-compose-fab',
         onPressed: () => Navigator.of(context).push(
@@ -99,7 +106,7 @@ class PulsePage extends HookConsumerWidget {
             ],
           ),
           Expanded(
-            child: RefreshIndicator(
+            child: BeeRefreshIndicator(
               onRefresh: () async => _refresh(ref, active.value, currentPubkey),
               child: _PulseBody(
                 tab: active.value,
@@ -168,10 +175,19 @@ class _PulseBody extends ConsumerWidget {
             child: _EmptyState(message: _emptyMessage(tab)),
           );
         }
+        // Everyone the timeline names — authors, reply targets and mentions
+        // — is one comparison context, so two same-name targets on
+        // different notes are still told apart.
+        final names = watchIdentityNames(
+          ref,
+          pulseNamedIdentities(notes),
+          agentPubkeys: tab == PulseTab.agents
+              ? {for (final note in notes) note.pubkey.toLowerCase()}
+              : agentPubkeys,
+        );
         if (tab == PulseTab.agents) {
           final groups = groupAgentNotes(notes);
           return ListView.separated(
-            physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(
               Grid.gutter,
               Grid.xxs,
@@ -183,12 +199,12 @@ class _PulseBody extends ConsumerWidget {
             itemBuilder: (context, index) => AgentActivityCard(
               group: groups[index],
               reactions: reactions,
+              names: names,
               onReactionChanged: onReactionChanged,
             ),
           );
         }
         return ListView.separated(
-          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.fromLTRB(
             Grid.gutter,
             Grid.xxs,
@@ -208,6 +224,7 @@ class _PulseBody extends ConsumerWidget {
                     reactedByCurrentUser: false,
                   ),
               isAgent: agentPubkeys.contains(note.pubkey),
+              names: names,
               isFollowing: contactPubkeys.contains(note.pubkey),
               canFollow:
                   currentPubkey != null &&
@@ -243,7 +260,6 @@ class _MessageListShell extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.all(Grid.xs),
       children: [SizedBox(height: 260, child: Center(child: child))],
     );

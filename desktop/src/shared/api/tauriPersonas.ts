@@ -10,7 +10,10 @@ export type RawPersona = {
   id: string;
   display_name: string;
   avatar_url: string | null;
+  /** Optional short, PUBLIC description (max 280 chars). */
+  description?: string | null;
   system_prompt: string;
+  acp_command?: string | null;
   runtime?: string | null;
   model?: string | null;
   provider?: string | null;
@@ -29,6 +32,7 @@ export type RawPersona = {
   respond_to?: string | null;
   respond_to_allowlist?: string[];
   parallelism?: number | null;
+  session_policy?: "channel" | "thread";
   created_at: string;
   updated_at: string;
   /** Non-null when the pack `.persona.md` write-back failed (non-fatal). */
@@ -40,7 +44,9 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     id: persona.id,
     displayName: persona.display_name,
     avatarUrl: persona.avatar_url,
+    description: persona.description ?? null,
     systemPrompt: persona.system_prompt,
+    acpCommand: persona.acp_command ?? "buzz-acp",
     runtime: persona.runtime ?? null,
     model: persona.model ?? null,
     provider: persona.provider ?? null,
@@ -59,9 +65,26 @@ export function fromRawPersona(persona: RawPersona): AgentPersona {
     respondTo: (persona.respond_to as RespondToMode | undefined) ?? null,
     respondToAllowlist: persona.respond_to_allowlist ?? [],
     parallelism: persona.parallelism ?? null,
+    sessionPolicy: persona.session_policy ?? "channel",
     createdAt: persona.created_at,
     updatedAt: persona.updated_at,
   };
+}
+
+/**
+ * Normalize only the unambiguous empty/absent cases for the wire. The trusted
+ * Rust boundary validates the authored bytes before applying trim/empty
+ * storage normalization.
+ */
+function normalizeDescription(
+  description: string | null | undefined,
+): string | null {
+  if (description === null || description === undefined || description === "") {
+    return null;
+  }
+  // Preserve the authored bytes for the Rust boundary to validate. Trimming
+  // here could turn a prohibited edge control into apparently valid text.
+  return description;
 }
 
 export async function listPersonas(): Promise<AgentPersona[]> {
@@ -76,7 +99,9 @@ export async function createPersona(
       input: {
         displayName: input.displayName,
         avatarUrl: input.avatarUrl,
+        description: normalizeDescription(input.description),
         systemPrompt: input.systemPrompt,
+        acpCommand: input.acpCommand,
         runtime: input.runtime,
         model: input.model,
         provider: input.provider,
@@ -95,7 +120,9 @@ function updatePersonaPayload(input: UpdatePersonaInput) {
     id: input.id,
     displayName: input.displayName,
     avatarUrl: input.avatarUrl,
+    description: normalizeDescription(input.description),
     systemPrompt: input.systemPrompt,
+    acpCommand: input.acpCommand,
     runtime: input.runtime,
     model: input.model,
     provider: input.provider,
@@ -260,11 +287,32 @@ export type MintedAgentCard = {
 export const NO_OPENAI_KEY_PREFIX = "NO_OPENAI_KEY:";
 
 /**
- * Check whether an OpenAI key would resolve for a card mint of this agent
- * (same env layering as the mint itself). Never returns the key.
+ * Which env layer resolves the OpenAI key for a card mint of this agent.
+ *
+ * - `"none"` — no key configured anywhere; show the first-time setup panel.
+ * - `"global"` — key comes from global Agent Defaults env; writable from the
+ *   dialog via `cardMintSaveOpenaiKey`.
+ * - `"persona"` — key is set on the linked persona; cannot be updated from
+ *   the mint dialog (would be shadowed by the higher-priority layer).
+ * - `"agent"` — key is set directly on the agent record; same restriction.
+ * - `"process"` — key comes from the process environment (dev fallback);
+ *   same restriction.
  */
-export async function cardMintKeyStatus(id: string): Promise<boolean> {
-  return invokeTauri<boolean>("card_mint_key_status", { id });
+export type CardMintKeyLayer =
+  | "none"
+  | "global"
+  | "persona"
+  | "agent"
+  | "process";
+
+/**
+ * Report which env layer resolves the OpenAI key for a card mint of this agent
+ * (same layering as the mint itself). Returns a layer discriminant — never the
+ * key value itself. Use to decide whether to show a writable key input (none /
+ * global) or a read-only redirect (persona / agent / process).
+ */
+export async function cardMintKeyStatus(id: string): Promise<CardMintKeyLayer> {
+  return invokeTauri<CardMintKeyLayer>("card_mint_key_status", { id });
 }
 
 /**

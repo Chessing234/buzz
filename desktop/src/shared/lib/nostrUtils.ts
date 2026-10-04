@@ -33,7 +33,13 @@ export const HEX_64_REGEX = /^[0-9a-fA-F]{64}$/;
  * anything else (does NOT throw — intended for live form validation).
  *
  * The input is trimmed first; surrounding whitespace from copy-paste is
- * tolerated.
+ * tolerated. It is also case-normalized before matching and decoding —
+ * preexisting behavior — so a hex key in any casing resolves, and a
+ * mixed-case npub (invalid Bech32 as written) is accepted via its
+ * lowercased form. The identity payload itself stays strict: it must
+ * decode to exactly a 64-char hex identity key, because `npubEncode` also
+ * encodes degenerate short payloads (even `""`), which are never valid
+ * identities.
  */
 export function parsePubkeyInput(input: string): string | null {
   const trimmed = input.trim().toLowerCase();
@@ -43,7 +49,7 @@ export function parsePubkeyInput(input: string): string | null {
   if (trimmed.startsWith("npub1")) {
     try {
       const decoded = decode(trimmed);
-      if (decoded.type === "npub") {
+      if (decoded.type === "npub" && HEX_64_REGEX.test(decoded.data)) {
         return decoded.data;
       }
     } catch {
