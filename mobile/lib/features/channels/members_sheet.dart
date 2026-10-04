@@ -14,16 +14,19 @@ import '../profile/user_status_cache_provider.dart';
 import 'agent_activity/agent_activity_sheet.dart';
 import 'agent_activity/working_bots_provider.dart';
 import 'channel.dart';
+import 'channel_identity_names_provider.dart';
 import 'channel_management_provider.dart';
 
 class MembersSheet extends HookConsumerWidget {
   final Channel channel;
   final String? currentPubkey;
+  final void Function(BuildContext context, String pubkey)? onMemberTap;
 
   const MembersSheet({
     super.key,
     required this.channel,
     required this.currentPubkey,
+    this.onMemberTap,
   });
 
   @override
@@ -107,6 +110,9 @@ class MembersSheet extends HookConsumerWidget {
                         currentPubkey?.toLowerCase(),
                     channelId: channel.id,
                     userStatus: statusCache[member.pubkey.toLowerCase()],
+                    onActivityTap: onMemberTap == null
+                        ? null
+                        : () => onMemberTap!(context, member.pubkey),
                   ),
               ],
               if (bots.isNotEmpty) ...[
@@ -216,16 +222,17 @@ class _MemberTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final label = isSelf
+    final name = isSelf
         ? 'You'
         : (profile?.displayName?.trim().isNotEmpty == true
               ? profile!.displayName!.trim()
               : member.labelFor(currentPubkey));
+    final label = _watchContextualLabel(ref);
     // Named members initial from their name; unnamed ones stay keyed to the
     // hex public key so the compact-npub label doesn't render `N` for all.
     final hasName = profile?.displayName?.trim().isNotEmpty == true;
     final initial = isSelf || hasName
-        ? label[0].toUpperCase()
+        ? name[0].toUpperCase()
         : (member.pubkey.isNotEmpty ? member.pubkey[0].toUpperCase() : '?');
     final showManagementActions = canManage && !isSelf && !member.isOwner;
     final showMenu = showManagementActions || onViewActivity != null;
@@ -287,6 +294,10 @@ class _MemberTile extends ConsumerWidget {
     );
   }
 
+  /// 'You' for the viewer; otherwise the channel's contextual label.
+  String _watchContextualLabel(WidgetRef ref) =>
+      isSelf ? 'You' : watchChannelIdentityLabel(ref, channelId, member.pubkey);
+
   void _showMemberActions(
     BuildContext context,
     WidgetRef ref, {
@@ -294,9 +305,9 @@ class _MemberTile extends ConsumerWidget {
   }) {
     final label = isSelf
         ? 'You'
-        : (profile?.displayName?.trim().isNotEmpty == true
-              ? profile!.displayName!.trim()
-              : member.labelFor(currentPubkey));
+        : ref
+              .read(channelIdentityNamesProvider(channelId))
+              .labelFor(member.pubkey);
     final canChangeRole = showManagementActions && !member.isBot;
     showBuzzModalBottomSheet<void>(
       context: context,
