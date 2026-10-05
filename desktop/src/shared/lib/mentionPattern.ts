@@ -1,3 +1,4 @@
+import { mentionLabelPattern } from "./mentionBoundaries";
 /**
  * Escape special regex characters in a string.
  */
@@ -59,7 +60,11 @@ export function buildPrefixPattern(
     return NEVER_MATCH;
   }
 
-  const nameAlternatives = sorted.map((name) => escapeRegExp(name)).join("|");
+  const nameAlternatives = sorted
+    .map((name) =>
+      prefix === "@" ? mentionLabelPattern(name) : escapeRegExp(name),
+    )
+    .join("|");
   // A possessive still mentions the person, so the apostrophe closes a
   // mention — both the straight one and the curly U+2019 that macOS
   // substitutes while you type. `hasMention` (which decides the p-tag) uses
