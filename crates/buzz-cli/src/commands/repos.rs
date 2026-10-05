@@ -14,7 +14,7 @@ fn parse_events(json: &str) -> Result<Vec<Event>, CliError> {
         .map_err(|error| CliError::Other(format!("failed to parse relay response: {error}")))
 }
 
-async fn fetch_own_repo_announcement(
+pub(crate) async fn fetch_own_repo_announcement(
     client: &BuzzClient,
     repo_id: &str,
 ) -> Result<Option<Event>, CliError> {
@@ -209,7 +209,7 @@ async fn submit_repo_update(client: &BuzzClient, builder: EventBuilder) -> Resul
 /// UUID is shape-validated here and its existence/membership is the relay's
 /// authority at git-access time, same posture as `repos bind`.
 #[allow(clippy::too_many_arguments)]
-fn build_create_announcement(
+pub(crate) fn build_create_announcement(
     repo_id: &str,
     name: Option<&str>,
     description: Option<&str>,
@@ -267,6 +267,14 @@ pub async fn cmd_create_repo(
     // a chat message — agents announce repos with it (see base_prompt.md).
     let link = crate::links::repo_link(&owner, repo_id);
     crate::client::print_create_response(&resp, "link", &link);
+    if let Some(channel) = channel {
+        // Best-effort: a repo announced into a project home channel should
+        // join that project instead of rendering as a second project card.
+        let _ = crate::commands::projects::try_add_own_repo_to_channel_project(
+            client, channel, repo_id,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -416,10 +424,7 @@ pub fn build_rm_event(coord: &nostr::nips::nip01::Coordinate) -> Result<EventBui
     Ok(EventBuilder::new(nostr::Kind::EventDeletion, "").tags(vec![a_tag]))
 }
 
-fn repo_coord_for(
-    author: &nostr::PublicKey,
-    repo_id: &str,
-) -> nostr::nips::nip01::Coordinate {
+fn repo_coord_for(author: &nostr::PublicKey, repo_id: &str) -> nostr::nips::nip01::Coordinate {
     nostr::nips::nip01::Coordinate::new(
         nostr::Kind::Custom(KIND_GIT_REPO_ANNOUNCEMENT as u16),
         *author,
@@ -430,7 +435,10 @@ fn repo_coord_for(
 pub async fn cmd_rm(client: &BuzzClient, repo_id: &str) -> Result<(), CliError> {
     validate_repo_id(repo_id)?;
     let me = client.keys().public_key();
-    if fetch_own_repo_announcement(client, repo_id).await?.is_none() {
+    if fetch_own_repo_announcement(client, repo_id)
+        .await?
+        .is_none()
+    {
         return Err(CliError::NotFound(format!(
             "no repository {repo_id:?} found for you ({}); nothing to delete",
             me.to_hex()
@@ -491,6 +499,9 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
         ReposCmd::Bind { id, channel } => cmd_bind_repo(client, &id, &channel).await,
         ReposCmd::Rm { id } => cmd_rm(client, &id).await,
+        ReposCmd::DefaultBranch(command) => {
+            super::repo_default_branch::dispatch(command, client).await
+        }
         ReposCmd::Protect(command) => match command {
             ReposProtectCmd::List { id } => cmd_protect_list(client, &id).await,
             ReposProtectCmd::Set {
@@ -526,7 +537,7 @@ mod tests {
     use super::{
         build_create_announcement, build_protection_tag, build_rm_event,
         build_updated_repo_announcement, protection_rules_json, repo_coord_for,
-        validate_write_response, ProtectionChange, RepoChange,
+        validate_write_response, RepoChange,
     };
     use buzz_core::kind::KIND_GIT_REPO_ANNOUNCEMENT;
 
