@@ -6,6 +6,7 @@ class _ChannelsBody extends StatelessWidget {
   final bool showError;
   final SessionStatus sessionStatus;
   final bool showConnectionSkeleton;
+  final ValueChanged<bool> onReadyChanged;
   final String? currentPubkey;
   final double topSectionHeight;
   final bool usesPinnedGradient;
@@ -19,6 +20,7 @@ class _ChannelsBody extends StatelessWidget {
     required this.showError,
     required this.sessionStatus,
     required this.showConnectionSkeleton,
+    required this.onReadyChanged,
     required this.currentPubkey,
     required this.topSectionHeight,
     required this.usesPinnedGradient,
@@ -45,9 +47,10 @@ class _ChannelsBody extends StatelessWidget {
             onRefresh: onRefresh,
             child: CustomScrollView(
               controller: scrollController,
-              // The transparent gap shows the top section and must not absorb
-              // taps meant for the community or profile controls beneath it.
-              hitTestBehavior: HitTestBehavior.deferToChild,
+              // Transparent list gaps must remain hit-testable so a new drag
+              // can interrupt ballistic scrolling. The app bar is painted
+              // later and retains its community and profile controls.
+              hitTestBehavior: HitTestBehavior.translucent,
               slivers: [
                 SliverToBoxAdapter(child: SizedBox(height: barHeight)),
                 if (usesPinnedGradient)
@@ -75,6 +78,7 @@ class _ChannelsBody extends StatelessWidget {
           );
 
     return SkeletonReveal(
+      onReadyChanged: onReadyChanged,
       loading: loading,
       shimmerEnabled: sessionStatus != SessionStatus.disconnected,
       skeleton: _ChannelsSkeleton(
@@ -118,10 +122,25 @@ class _SliverChannelsList extends HookConsumerWidget {
     final streamChannels = visibleChannels
         .where((channel) => channel.isStream)
         .toList();
-    final dmChannels = sortDmChannelsByDisplayLabel(
-      visibleChannels.where((channel) => channel.isDm),
-      currentPubkey: currentPubkey,
+    final unsortedDms = visibleChannels.where((channel) => channel.isDm);
+    // Rebuild only when the DM order changes, not for every profile fetch.
+    final dmOrder = ref.watch(
+      identityNameSourcesProvider.select(
+        (names) => [
+          for (final channel in sortDmChannelsByDisplayLabel(
+            unsortedDms,
+            currentPubkey: currentPubkey,
+            names: names,
+          ))
+            channel.id,
+        ].join('\u0000'),
+      ),
     );
+    final dmRank = {
+      for (final (index, id) in dmOrder.split('\u0000').indexed) id: index,
+    };
+    final dmChannels = unsortedDms.toList()
+      ..sort((a, b) => dmRank[a.id]!.compareTo(dmRank[b.id]!));
 
     final starredExpanded = useState(true);
     final channelsExpanded = useState(true);
