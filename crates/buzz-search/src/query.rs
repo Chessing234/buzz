@@ -8,9 +8,11 @@
 //!
 //! See conformance row 50.
 
-use buzz_core::CommunityId;
 use sqlx::{PgPool, QueryBuilder, Row};
 use uuid::Uuid;
+
+use buzz_core::CommunityId;
+use buzz_datastore_tracing::datastore_span;
 
 use crate::error::SearchError;
 
@@ -213,6 +215,7 @@ fn normalized_search_text(q: &str) -> Option<String> {
 ///
 /// `community_id = $ctx` is the first predicate and is non-negotiable. There
 /// is no code path through this function that omits it.
+#[datastore_span(name = "search", system = "postgresql")]
 pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, SearchError> {
     let Some(search_text) = normalized_search_text(&query.q) else {
         return Ok(SearchResult {
@@ -248,6 +251,9 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
     qb.push(" AS query) AS search_query WHERE community_id = ");
     qb.push_bind(*query.community.as_uuid());
     qb.push(" AND deleted_at IS NULL AND search_tsv @@ search_query.query");
+
+    // Search is a current-state surface; old artifact snapshots cannot match.
+    qb.push(" AND (events.kind <> 45010 OR EXISTS (SELECT 1 FROM artifact_heads ah WHERE ah.community_id=events.community_id AND ah.event_id=events.id AND NOT ah.deleted))");
 
     // Channel scope — see `ChannelScope` doc for the four-case mapping. The
     // emitted SQL fragments are identical to the legacy 2x2 tuple for the
