@@ -1,10 +1,12 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../../shared/crypto/nip_oa.dart';
+import '../../../shared/identity_names/identity_names.dart';
+import '../../../shared/identity_names/identity_names_provider.dart';
 import '../../../shared/mentions/agent_identity_provider.dart';
 import '../../../shared/relay/relay.dart';
-import '../../profile/user_cache_provider.dart';
-import '../../profile/user_profile.dart';
+import '../../../shared/profile/user_cache_provider.dart';
+import '../../../shared/profile/user_profile.dart';
 import '../channel.dart';
 import '../channel_management_provider.dart';
 import '../channels_provider.dart';
@@ -73,15 +75,24 @@ final mentionCandidatesProvider = Provider.family
       ref,
       args,
     ) {
-      final members =
-          ref.watch(channelMembersProvider(args.channelId)).asData?.value ??
-          const <ChannelMember>[];
+      final channelsAsync = ref.watch(channelsProvider);
+      final membersAsync = ref.watch(channelMembersProvider(args.channelId));
+      final sessionStatus = ref.watch(relaySessionProvider).status;
+      final cachedMembers = channelsAsync.asData == null
+          ? const <ChannelMember>[]
+          : ref
+                .read(channelsProvider.notifier)
+                .cachedMembersForChannel(args.channelId);
+      final members = channelMembersForAutocomplete(
+        membersAsync: membersAsync,
+        sessionStatus: sessionStatus,
+        cachedMembers: cachedMembers,
+      );
       final relayAgents =
           ref.watch(agentDirectoryProvider).asData?.value ??
           const <AgentDirectoryEntry>[];
       final owners = ref.watch(agentOwnersProvider).asData?.value ?? const {};
-      final channels =
-          ref.watch(channelsProvider).asData?.value ?? const <Channel>[];
+      final channels = channelsAsync.asData?.value ?? const <Channel>[];
       final userCache = ref.watch(userCacheProvider);
       final currentPubkey = ref.watch(currentPubkeyProvider);
       final searchResults =
@@ -103,5 +114,37 @@ final mentionCandidatesProvider = Provider.family
         currentPubkey: currentPubkey,
       );
 
-      return rankMentionCandidates(candidates, args.query);
+      final names = mentionPickerNames(
+        ref.watch(identityNameSourcesProvider),
+        candidates,
+      );
+      loadIdentityNameOwners(ref, names);
+      return rankMentionCandidates([
+        for (final candidate in candidates)
+          candidate.withContextLabel(names.resolve(candidate.pubkey)?.name),
+      ], args.query);
     });
+
+/// Picker labels compare every selectable choice, before query ranking
+/// filters them, so a row's label does not change as the query narrows.
+IdentityNames mentionPickerNames(
+  IdentityNameSources sources,
+  List<MentionCandidate> candidates,
+) => sources.scope(
+  [for (final candidate in candidates) candidate.pubkey],
+  agentPubkeys: {
+    for (final candidate in candidates)
+      if (candidate.isAgent) candidate.pubkey,
+  },
+  fallbackNames: {
+    for (final candidate in candidates)
+      if (candidate.displayName?.trim().isNotEmpty == true)
+        candidate.pubkey: candidate.displayName!,
+  },
+  // A newly searched agent can carry its verified owner before its profile
+  // reaches the cache; that owner still decides mine-before-others.
+  ownerPubkeys: {
+    for (final candidate in candidates)
+      candidate.pubkey: ?candidate.ownerPubkey,
+  },
+);
