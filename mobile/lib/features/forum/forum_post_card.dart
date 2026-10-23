@@ -2,17 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/text/truncate.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/sheet_action_section.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/modal_presentation.dart';
+import '../channels/channel_identity_names_provider.dart';
 import '../channels/message_content.dart';
-import '../profile/user_cache_provider.dart';
+import '../../shared/profile/user_cache_provider.dart';
 import '../profile/user_profile_sheet.dart';
-import '../profile/user_profile.dart';
+import '../../shared/profile/user_profile.dart';
 import 'forum_models.dart';
 
 /// Card displaying a forum post preview in the posts list.
@@ -54,7 +56,10 @@ class ForumPostCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = profile?.label ?? _shortPubkey(post.pubkey);
+    final displayName = watchChannelIdentityLabel(ref, post.channelId, pk);
+    final isAgent =
+        ref.watch(agentMentionPubkeysProvider(post.channelId)).contains(pk) ||
+        profile?.ownerPubkey != null;
     final profileMentionNames = ref.watch(
       userCacheProvider.select(
         (cache) => _buildMentionNames(post.mentionPubkeys, cache),
@@ -86,6 +91,11 @@ class ForumPostCard extends HookConsumerWidget {
       directoryDisplayNames: ref.watch(agentDirectoryDisplayNamesProvider),
       agentMentionPubkeys: agentMentionPubkeys,
     );
+    final mentionLabels = watchChannelIdentityLabels(
+      ref,
+      post.channelId,
+      post.mentionPubkeys,
+    );
     final preview = truncateWithEllipsis(post.content, 200, '...');
     final summary = post.threadSummary;
 
@@ -110,14 +120,26 @@ class ForumPostCard extends HookConsumerWidget {
               children: [
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
-                  onTap: () => showUserProfileSheet(context, post.pubkey),
-                  child: _PostAvatar(profile: profile, pubkey: post.pubkey),
+                  onTap: () => showUserProfileSheet(
+                    context,
+                    post.pubkey,
+                    names: channelIdentityNamesProvider(post.channelId),
+                  ),
+                  child: _PostAvatar(
+                    profile: profile,
+                    pubkey: post.pubkey,
+                    isAgent: isAgent,
+                  ),
                 ),
                 const SizedBox(width: Grid.xxs),
                 Expanded(
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
-                    onTap: () => showUserProfileSheet(context, post.pubkey),
+                    onTap: () => showUserProfileSheet(
+                      context,
+                      post.pubkey,
+                      names: channelIdentityNamesProvider(post.channelId),
+                    ),
                     child: Text(
                       displayName,
                       maxLines: 1,
@@ -145,7 +167,7 @@ class ForumPostCard extends HookConsumerWidget {
                   child: IconButton(
                     onPressed: () => _showActions(context),
                     icon: Icon(
-                      LucideIcons.ellipsis,
+                      BuzzIcons.ellipsis,
                       size: 16,
                       color: context.colors.onSurfaceVariant,
                     ),
@@ -171,6 +193,7 @@ class ForumPostCard extends HookConsumerWidget {
                   child: MessageContent(
                     content: preview,
                     mentionNames: mentionNames,
+                    mentionLabels: mentionLabels,
                     agentMentionPubkeys: agentMentionPubkeys,
                     tags: post.tags,
                     baseStyle: messageBodyTextStyle.copyWith(
@@ -187,7 +210,7 @@ class ForumPostCard extends HookConsumerWidget {
               Row(
                 children: [
                   Icon(
-                    LucideIcons.messageSquare,
+                    BuzzIcons.messageSquare,
                     size: 14,
                     color: context.colors.onSurfaceVariant,
                   ),
@@ -243,11 +266,10 @@ class ForumPostCard extends HookConsumerWidget {
               Grid.gutter,
               Grid.xs,
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+            child: SheetActionSection(
               children: [
                 ListTile(
-                  leading: const Icon(LucideIcons.copy),
+                  leading: const Icon(BuzzIcons.copy),
                   title: const Text('Copy text'),
                   onTap: () {
                     Navigator.of(sheetContext).pop();
@@ -257,7 +279,7 @@ class ForumPostCard extends HookConsumerWidget {
                 if (isOwn && onDelete != null)
                   ListTile(
                     leading: Icon(
-                      LucideIcons.trash2,
+                      BuzzIcons.trash2,
                       color: sheetContext.colors.error,
                     ),
                     title: Text(
@@ -307,8 +329,13 @@ class ForumPostCard extends HookConsumerWidget {
 class _PostAvatar extends StatelessWidget {
   final UserProfile? profile;
   final String pubkey;
+  final bool isAgent;
 
-  const _PostAvatar({required this.profile, required this.pubkey});
+  const _PostAvatar({
+    required this.profile,
+    required this.pubkey,
+    required this.isAgent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -319,7 +346,7 @@ class _PostAvatar extends StatelessWidget {
     return AvatarImage(
       imageUrl: avatarUrl,
       radius: 14,
-      backgroundColor: context.colors.primaryContainer,
+      backgroundColor: context.controlSurface,
       fallback: Text(
         initial,
         style: context.textTheme.labelSmall?.copyWith(
@@ -327,13 +354,9 @@ class _PostAvatar extends StatelessWidget {
           fontWeight: FontWeight.w600,
         ),
       ),
+      isAgent: isAgent,
     );
   }
-}
-
-String _shortPubkey(String pubkey) {
-  if (pubkey.length > 12) return '${pubkey.substring(0, 8)}\u2026';
-  return pubkey;
 }
 
 Map<String, String> _buildMentionNames(

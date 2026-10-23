@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../../shared/text/truncate.dart';
 import '../../../shared/theme/theme.dart';
@@ -73,6 +73,10 @@ class _MessageItemWidget extends StatelessWidget {
               style: context.textTheme.bodyMedium?.copyWith(
                 color: context.colors.onSurface,
               ),
+              // No link handler here, so an autolinked URL would draw as a
+              // link and do nothing when tapped. Transcript URLs stay text,
+              // as they were before gpt_markdown started autolinking.
+              autolink: false,
             ),
         ],
       ),
@@ -113,7 +117,7 @@ class _ThoughtItemWidget extends HookWidget {
               Row(
                 children: [
                   Icon(
-                    LucideIcons.brain,
+                    BuzzIcons.brain,
                     size: 14,
                     color: context.colors.onSurfaceVariant,
                   ),
@@ -130,8 +134,8 @@ class _ThoughtItemWidget extends HookWidget {
                   ),
                   Icon(
                     expanded.value
-                        ? LucideIcons.chevronUp
-                        : LucideIcons.chevronDown,
+                        ? BuzzIcons.chevronUp
+                        : BuzzIcons.chevronDown,
                     size: 14,
                     color: context.colors.onSurfaceVariant,
                   ),
@@ -144,6 +148,8 @@ class _ThoughtItemWidget extends HookWidget {
                   style: context.textTheme.bodySmall?.copyWith(
                     color: context.colors.onSurfaceVariant,
                   ),
+                  // As above: no link handler on this surface either.
+                  autolink: false,
                 ),
               ],
             ],
@@ -209,7 +215,7 @@ class _MetadataItemWidget extends HookWidget {
               Row(
                 children: [
                   Icon(
-                    LucideIcons.fileText,
+                    BuzzIcons.fileText,
                     size: 14,
                     color: context.colors.onSurfaceVariant,
                   ),
@@ -226,8 +232,8 @@ class _MetadataItemWidget extends HookWidget {
                   ),
                   Icon(
                     expanded.value
-                        ? LucideIcons.chevronUp
-                        : LucideIcons.chevronDown,
+                        ? BuzzIcons.chevronUp
+                        : BuzzIcons.chevronDown,
                     size: 14,
                     color: context.colors.onSurfaceVariant,
                   ),
@@ -303,7 +309,7 @@ class _ToolItemWidget extends HookWidget {
             // Header: tool name + status badge
             Row(
               children: [
-                Icon(LucideIcons.wrench, size: 14, color: statusColor),
+                Icon(BuzzIcons.wrench, size: 14, color: statusColor),
                 const SizedBox(width: Grid.half),
                 Expanded(
                   child: Text(
@@ -356,8 +362,8 @@ class _ToolItemWidget extends HookWidget {
                     const SizedBox(width: Grid.half),
                     Icon(
                       argsExpanded.value
-                          ? LucideIcons.chevronUp
-                          : LucideIcons.chevronDown,
+                          ? BuzzIcons.chevronUp
+                          : BuzzIcons.chevronDown,
                       size: 12,
                       color: context.colors.onSurfaceVariant,
                     ),
@@ -387,8 +393,8 @@ class _ToolItemWidget extends HookWidget {
                     const SizedBox(width: Grid.half),
                     Icon(
                       resultExpanded.value
-                          ? LucideIcons.chevronUp
-                          : LucideIcons.chevronDown,
+                          ? BuzzIcons.chevronUp
+                          : BuzzIcons.chevronDown,
                       size: 12,
                       color: item.isError
                           ? context.colors.error
@@ -422,15 +428,15 @@ class _ToolItemWidget extends HookWidget {
   BuildContext context,
 ) {
   if (isError || status == ToolStatus.failed) {
-    return (context.colors.error, 'Error', LucideIcons.circleX);
+    return (context.colors.error, 'Error', BuzzIcons.circleX);
   }
   if (status == ToolStatus.completed) {
-    return (context.appColors.success, 'Done', LucideIcons.circleCheck);
+    return (context.appColors.success, 'Done', BuzzIcons.circleCheck);
   }
   if (status == ToolStatus.pending) {
-    return (context.colors.onSurfaceVariant, 'Pending', LucideIcons.circleDot);
+    return (context.colors.onSurfaceVariant, 'Pending', BuzzIcons.circleDot);
   }
-  return (context.appColors.warning, 'Running', LucideIcons.clock3);
+  return (context.appColors.warning, 'Running', BuzzIcons.clock3);
 }
 
 String _formatToolName(String toolName) {
