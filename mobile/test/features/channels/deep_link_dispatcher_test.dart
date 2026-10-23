@@ -9,11 +9,70 @@ import 'package:buzz/shared/deeplink/deep_link.dart';
 import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:nostr/nostr.dart' as nostr;
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/community/community_storage_test.dart';
 
 void main() {
+  for (final outcome in ['handled', 'declined', 'failed']) {
+    testWidgets('hosted handler drains queued links after $outcome setup', (
+      tester,
+    ) async {
+      final BuzzDeepLink first = outcome == 'declined'
+          ? const AddCommunityDeepLink(
+              relayUrl: 'wss://one.communities.buzz.xyz',
+              name: 'One',
+            )
+          : const InviteDeepLink(
+              relayUrl: 'wss://one.communities.buzz.xyz',
+              code: 'same',
+            );
+      final duplicate = outcome == 'declined'
+          ? first
+          : InviteDeepLink(
+              relayUrl: 'wss://one.communities.buzz.xyz',
+              code: 'same',
+            );
+      const second = InviteDeepLink(
+        relayUrl: 'wss://two.communities.buzz.xyz',
+        code: 'invite',
+      );
+      final pending = _QueuedPendingDeepLinkNotifier([
+        first,
+        duplicate,
+        second,
+      ]);
+      final handled = <BuzzDeepLink>[];
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            pendingDeepLinkProvider.overrideWith(() => pending),
+            inviteKeyGeneratorProvider.overrideWithValue(
+              () => throw StateError('must not generate'),
+            ),
+          ],
+          child: MaterialApp(
+            home: DeepLinkDispatcher(
+              dispatchMessageLinks: false,
+              onboardingHandler: (_, link) async {
+                handled.add(link);
+                if (link == first) {
+                  if (outcome == 'declined') return false;
+                  if (outcome == 'failed') throw StateError('setup failed');
+                }
+                return true;
+              },
+              child: const Scaffold(body: SizedBox()),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(handled, [first, duplicate, second]);
+      expect(pending.consumeCalls, 3);
+    });
+  }
   testWidgets('queues deep links in arrival order until acknowledged', (
     tester,
   ) async {
@@ -342,7 +401,7 @@ void main() {
           name: 'Relay',
           relayUrl: relayUrl,
           pubkey: 'pubkey',
-          nsec: 'nsec',
+          nsec: nostr.Keys.generate().nsec,
           addedAt: DateTime.utc(2026),
           starterSetupIncomplete: true,
         ),
@@ -416,7 +475,7 @@ void main() {
         name: 'Relay',
         relayUrl: relayUrl,
         pubkey: 'pubkey',
-        nsec: 'nsec',
+        nsec: nostr.Keys.generate().nsec,
         addedAt: DateTime.utc(2026),
         starterSetupIncomplete: true,
       ),
