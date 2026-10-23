@@ -2,7 +2,7 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../theme/theme.dart';
 import 'buzz_navigation_metrics.dart';
@@ -144,6 +144,10 @@ class FrostedAppBar extends StatelessWidget {
   /// surrounding scroll scope reports content beneath the controls.
   final bool frosted;
 
+  /// Keeps the backdrop stable regardless of scroll state on both platforms.
+  /// Conversation headers use this while their timeline and composer resize.
+  final bool alwaysFrosted;
+
   /// Opacity of the frosted surface above the blurred backdrop.
   final double frostedSurfaceOpacity;
 
@@ -216,6 +220,7 @@ class FrostedAppBar extends StatelessWidget {
     this.iconColor,
     this.gradient,
     this.frosted = true,
+    this.alwaysFrosted = false,
     this.frostedSurfaceOpacity = 0.5,
     this.frostedBlurSigma = 20,
     this.showBottomDivider = true,
@@ -280,6 +285,7 @@ class FrostedAppBar extends StatelessWidget {
                   titlePresenceColor: nativeTitlePresenceColor,
                   onTitlePressed: onNativeTitlePressed,
                   largeTitle: nativeLargeTitle,
+                  alwaysFrosted: alwaysFrosted,
                   foregroundColor: iconColor,
                   leading: nativeLeading ?? _nativeAction(leading),
                   onBack:
@@ -325,7 +331,8 @@ class FrostedAppBar extends StatelessWidget {
     }
     final topPadding = MediaQuery.paddingOf(context).top;
     final scrollUnder = FrostedScrollUnderScope.maybeOf(context);
-    final isScrolledUnder = scrollUnder?.isScrolledUnder ?? false;
+    final isScrolledUnder =
+        alwaysFrosted || (scrollUnder?.isScrolledUnder ?? false);
     final paintsFrost = frosted && isScrolledUnder;
     final paintsBottomDivider = showBottomDivider && isScrolledUnder;
     final canPop = Navigator.canPop(context);
@@ -361,7 +368,7 @@ class FrostedAppBar extends StatelessWidget {
                       child: IconButton(
                         onPressed: () => Navigator.of(context).pop(),
                         color: effectiveIconColor,
-                        icon: const Icon(LucideIcons.chevronLeft),
+                        icon: const Icon(BuzzIcons.chevronLeft),
                         tooltip: 'Back',
                       ),
                     )
@@ -590,6 +597,8 @@ IosNavigationAction? _nativeAction(Widget? widget) {
   }
   if (widget is IosGlassNavigationButton) {
     final symbol = switch (widget.icon) {
+      IosGlassNavigationIcon.more => 'ellipsis',
+      IosGlassNavigationIcon.reply => 'arrowshape.turn.up.left',
       IosGlassNavigationIcon.back => 'chevron.backward',
       IosGlassNavigationIcon.close => 'xmark',
       IosGlassNavigationIcon.camera => 'camera',
@@ -616,11 +625,11 @@ IosNavigationAction? _nativeAction(Widget? widget) {
   }
   if (widget is IconButton) {
     final icon = widget.icon is Icon ? (widget.icon as Icon).icon : null;
-    final symbol = icon == LucideIcons.x
+    final symbol = icon == BuzzIcons.x
         ? 'xmark'
-        : icon == LucideIcons.chevronLeft || icon == LucideIcons.arrowLeft
+        : icon == BuzzIcons.chevronLeft || icon == BuzzIcons.arrowLeft
         ? 'chevron.backward'
-        : icon == LucideIcons.users
+        : icon == BuzzIcons.users
         ? 'person.2'
         : 'ellipsis';
     return IosNavigationAction(

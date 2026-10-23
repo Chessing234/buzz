@@ -90,6 +90,28 @@ export function normalizePrivateKeyToNsec(input: string): string | null {
 }
 
 /**
+ * Parse a user-entered event reference — 64-char hex, `note1…` or
+ * `nevent1…` — into a lowercase hex event id. Relay hints in an `nevent`
+ * are ignored. Returns null for anything else (does NOT throw).
+ */
+export function parseEventIdInput(input: string): string | null {
+  const trimmed = input.trim().toLowerCase();
+  if (/^[0-9a-f]{64}$/.test(trimmed)) return trimmed;
+  try {
+    const decoded = decode(trimmed);
+    const id =
+      decoded.type === "note"
+        ? decoded.data
+        : decoded.type === "nevent"
+          ? decoded.data.id
+          : null;
+    return id && /^[0-9a-f]{64}$/.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Decode a private key (bech32 `nsec1…` or 64-char hex) and derive the
  * matching npub. Returns null if the input is not a syntactically valid
  * secret (does NOT throw — this is intended for live form validation where
