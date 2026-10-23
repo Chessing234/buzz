@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:hooks_riverpod/misc.dart' show ProviderListenable;
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/animated_avatar.dart';
 import '../../shared/identity_names/identity_names.dart';
@@ -28,8 +28,8 @@ import 'user_status_cache_provider.dart';
 /// Show a user profile bottom sheet for the given [pubkey].
 ///
 /// The sheet names [pubkey] as the opening surface did: within the live
-/// comparison context [names] (for example a channel's members or a Pulse
-/// timeline). Without it, the identity is compared only with itself.
+/// comparison context [names] (for example a channel's members). Without it,
+/// the identity is compared only with itself.
 void showUserProfileSheet(
   BuildContext context,
   String pubkey, {
@@ -117,8 +117,7 @@ class UserProfileSheet extends HookConsumerWidget {
     // never placed on the clipboard.
     final npub = fullNpub(pubkey);
 
-    // The contextual label from the opening surface, so the sheet names the
-    // identity exactly as the row that was tapped.
+    // Keep the opening surface's comparison context and qualified identity.
     final opener = names;
     final displayName =
         (opener != null ? ref.watch(opener) : watchIdentityNames(ref, {pk}))
@@ -274,7 +273,7 @@ class UserProfileSheet extends HookConsumerWidget {
                             child: BuzzActionTile(
                               icon: isOpeningDirectMessage.value
                                   ? null
-                                  : LucideIcons.messageSquare,
+                                  : BuzzIcons.messageSquare,
                               label: isOpeningDirectMessage.value
                                   ? 'Opening…'
                                   : 'Message',
@@ -288,8 +287,8 @@ class UserProfileSheet extends HookConsumerWidget {
                         Expanded(
                           child: BuzzActionTile(
                             icon: copied.value
-                                ? LucideIcons.check
-                                : LucideIcons.key,
+                                ? BuzzIcons.check
+                                : BuzzIcons.key,
                             label: copied.value ? 'Copied' : 'Copy public key',
                             isEnabled: npub != null,
                             onTap: copyPublicKey,
@@ -337,7 +336,7 @@ void _showProfileCopyToast(BuildContext context) {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(LucideIcons.check, size: 18, color: colors.onInverseSurface),
+              Icon(BuzzIcons.check, size: 18, color: colors.onInverseSurface),
               const SizedBox(width: Grid.xxs),
               Text('Public key copied', style: textStyle),
             ],
@@ -453,7 +452,12 @@ class _ProfileAvatar extends HookWidget {
               borderRadius: BorderRadius.circular(
                 constraints.biggest.shortestSide * 0.3,
               ),
-              child: avatar,
+              child: !usesInsetAgentArtwork(avatarUrl)
+                  ? avatar
+                  : Transform.scale(
+                      scale: animatedAvatarArtworkScale,
+                      child: avatar,
+                    ),
             );
           },
         ),
@@ -470,7 +474,7 @@ class _AvatarFallback extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: context.colors.primaryContainer,
+      color: context.controlSurface,
       alignment: Alignment.center,
       child: Text(
         initial,
